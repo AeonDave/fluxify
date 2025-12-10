@@ -28,6 +28,7 @@ type Server struct {
 	ctrlPort  int
 	ifaceName string
 	pki       common.PKIPaths
+	verbose   bool
 
 	sessions    map[uint32]*serverSession
 	ipToSession map[string]*serverSession // Map "10.8.0.x" or "fd00::x" -> Session
@@ -50,16 +51,23 @@ type outboundJob struct {
 	data []byte
 }
 
-func NewServer(port, ctrlPort int, iface string, pki common.PKIPaths) *Server {
+func NewServer(port, ctrlPort int, iface string, pki common.PKIPaths, verbose bool) *Server {
 	return &Server{
 		port:        port,
 		ctrlPort:    ctrlPort,
 		ifaceName:   iface,
 		pki:         pki,
+		verbose:     verbose,
 		sessions:    make(map[uint32]*serverSession),
 		ipToSession: make(map[string]*serverSession),
 		tunWriteCh:  make(chan []byte, 512),
 		outboundCh:  make(chan *outboundJob, 512),
+	}
+}
+
+func (s *Server) logDebug(format string, v ...interface{}) {
+	if s.verbose {
+		log.Printf("[DEBUG] "+format, v...)
 	}
 }
 
@@ -158,6 +166,7 @@ func (s *Server) tunReadLoop() {
 
 		pkt := buf[:n]
 		dstIP := extractDstIP(pkt)
+		s.logDebug("TUN read: %d bytes dest=%s", n, dstIP)
 		if len(dstIP) == 0 {
 			common.PutBuffer(buf)
 			continue
@@ -184,6 +193,7 @@ func (s *Server) outboundWorker() {
 	for job := range s.outboundCh {
 		best := job.sess.pickBestConn()
 		if best != nil {
+			s.logDebug("UDP send: %d bytes to %s", len(job.data), best.addr)
 			job.sess.touch()
 			// Compress & Encrypt & Send
 			// This might allocate new buffers for encryption.
@@ -269,7 +279,7 @@ func (s *Server) handlePacket(sess *serverSession, addr *net.UDPAddr, h common.P
 		if err := hb.Unmarshal(payload); err == nil {
 			rtt := common.CalcRTT(hb.SendTime)
 			conn.lastRTT.Store(int64(rtt))
-			log.Printf("Debug: heartbeat from %s (rtt=%v)", addr, rtt)
+			s.logDebug("Heartbeat from %s (rtt=%v)", addr, rtt)
 		}
 		// Echo back immediately (using session write)
 		// Payload is small, we can just send it back.
@@ -278,6 +288,7 @@ func (s *Server) handlePacket(sess *serverSession, addr *net.UDPAddr, h common.P
 			log.Printf("Debug: failed to echo heartbeat to %s: %v", addr, err)
 		}
 	case common.PacketIP:
+		s.logDebug("IP packet from %s len=%d", addr, len(payload))
 		// Handle decompression
 		data := payload
 		if len(h.Reserved) > 0 && h.Reserved[0] == common.CompressionGzip {

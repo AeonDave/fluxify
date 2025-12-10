@@ -19,6 +19,7 @@ func main() {
 	tuiMode := flag.Bool("tui", false, "run server with TUI for cert management")
 	regen := flag.Bool("regen", false, "regenerate CA/server certs on start")
 	hosts := flag.String("hosts", "127.0.0.1,localhost", "comma-separated SANs for server cert")
+	verbose := flag.Bool("v", false, "enable verbose debug logging")
 	flag.Parse()
 
 	if os.Geteuid() != 0 {
@@ -39,7 +40,7 @@ func main() {
 		return
 	}
 
-	srv := NewServer(*port, *ctrlPort, *ifaceName, pki)
+	srv := NewServer(*port, *ctrlPort, *ifaceName, pki, *verbose)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("server start error: %v", err)
 	}

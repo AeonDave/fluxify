@@ -8,7 +8,7 @@ import (
 )
 
 func TestAssignClientIPsStartsAtTwo(t *testing.T) {
-	s := NewServer(0, 0, "", common.DefaultPKI("./pki"))
+	s := NewServer(0, 0, "", common.DefaultPKI("./pki"), false)
 	s.nextIPOctet.Store(0)
 
 	ip4, ip6 := s.assignClientIPs()
@@ -22,7 +22,7 @@ func TestAssignClientIPsStartsAtTwo(t *testing.T) {
 }
 
 func TestAssignClientIPsWrapsAfter250(t *testing.T) {
-	s := NewServer(0, 0, "", common.DefaultPKI("./pki"))
+	s := NewServer(0, 0, "", common.DefaultPKI("./pki"), false)
 	s.nextIPOctet.Store(250)
 
 	ip4, ip6 := s.assignClientIPs()
@@ -35,7 +35,7 @@ func TestAssignClientIPsWrapsAfter250(t *testing.T) {
 }
 
 func TestRegisterSessionSkipsNilIPs(t *testing.T) {
-	s := NewServer(0, 0, "", common.DefaultPKI("./pki"))
+	s := NewServer(0, 0, "", common.DefaultPKI("./pki"), false)
 	sess := newServerSession(1, []byte("k"), net.IPv4(10, 8, 0, 2), nil)
 	s.registerSession(sess)
 

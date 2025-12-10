@@ -43,7 +43,7 @@ func TestControlServerIssuesSession(t *testing.T) {
 		t.Fatalf("gen client: %v", err)
 	}
 
-	st := NewServer(9999, 0, "", pki) // Use constructor to init maps
+	st := NewServer(9999, 0, "", pki, false) // Use constructor to init maps
 	addr, stop := startTestControlServer(t, st, pki)
 	defer stop()
 
