@@ -8,12 +8,15 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/rivo/tview"
 	"github.com/songgao/water"
 
 	"fluxify/common"
@@ -26,7 +29,6 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	// Bonding requires TUN device which needs root
 	if common.NeedsElevation() {
 		log.Printf("bonding: TUN requires root, requesting elevation...")
-		// Pass current config as CLI args so the elevated process starts with same settings
 		pkiPath := expandPath(cfg.PKI)
 		extraArgs := []string{
 			"-b", // force bonding mode
@@ -38,7 +40,6 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		if err := common.RelaunchWithPkexec(extraArgs...); err != nil {
 			return nil, nil, fmt.Errorf("elevation required for TUN: %w", err)
 		}
-		// RelaunchWithPkexec uses syscall.Exec, so we won't reach here on success
 		return nil, nil, fmt.Errorf("elevation failed")
 	}
 	log.Printf("bonding: starting with client=%s server=%s pki=%s", cfg.Client, cfg.Server, cfg.PKI)
@@ -60,7 +61,14 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		return nil, nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	state := &clientState{serverUDP: serverUDP, sessionID: sessID, sessionKey: key, mode: cfg.Mode, ctx: ctx, cancel: cancel}
+	state := &clientState{
+		serverUDP:  serverUDP,
+		sessionID:  sessID,
+		sessionKey: key,
+		mode:       cfg.Mode,
+		ctx:        ctx,
+		cancel:     cancel,
+	}
 
 	log.Printf("bonding: creating TUN device")
 	conf := water.Config{DeviceType: water.TUN}
@@ -78,13 +86,9 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		return nil, nil, err
 	}
 
-	// Determine if the server is a loopback address. In that case we should NOT
-	// manipulate routing or bind sockets to specific interfaces, otherwise
-	// localhost testing breaks (SO_BINDTODEVICE cannot reach 127.0.0.1).
 	isLoopback := serverUDP.IP != nil && serverUDP.IP.IsLoopback()
 	if !isLoopback {
 		log.Printf("bonding: setting up routing")
-		// Ensure server control address remains reachable after changing default route.
 		oldRoute, via, dev, err := common.GetDefaultRoute()
 		if err != nil {
 			_ = state.tun.Close()
@@ -102,13 +106,11 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		if serverHost == "" {
 			serverHost = serverIP
 		}
-		// host route to control/server via current default so TLS/UDP stay reachable.
 		if serverUDP.IP.To4() != nil {
 			_ = common.EnsureHostRoute(serverHost, via, dev)
 		} else {
 			_ = common.EnsureHostRoute6(serverHost, via6, dev6)
 		}
-		// Replace default routes to go via TUN device.
 		if err := common.SetDefaultRouteDev(tun.Name()); err != nil {
 			if serverUDP.IP.To4() != nil {
 				_ = common.DeleteHostRoute(serverHost)
@@ -123,7 +125,6 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 			log.Printf("bonding: warning: failed to set IPv6 default via TUN: %v", err)
 		}
 		state.revertRoute = func() {
-			// best-effort restore
 			_ = common.ReplaceDefaultRoute(oldRoute)
 			if oldRoute6 != "" {
 				_ = common.ReplaceDefaultRoute6(oldRoute6)
@@ -142,8 +143,6 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		iface := pickIndex(cfg.Ifaces, i)
 		ip := pickIndex(cfg.IPs, i)
 		if isLoopback {
-			// Do not bind to a specific device or local IP when talking to 127.0.0.1
-			// or ::1 — binding breaks loopback delivery.
 			iface = ""
 			ip = ""
 		}
@@ -160,28 +159,32 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		state.sendHandshake(cc)
 	}
 
+	// Worker pool for TUN -> UDP
+	numWorkers := runtime.NumCPU()
+	workCh := make(chan []byte, numWorkers*10)
+
 	state.wg.Add(1)
-	go state.tunToServer()
+	go state.tunReader(workCh)
+
+	for i := 0; i < numWorkers; i++ {
+		state.wg.Add(1)
+		go state.workerLoop(workCh)
+	}
+
 	state.wg.Add(1)
 	go state.heartbeat()
 
 	stop := func() {
-		// Signal goroutines to stop first
 		cancel()
-		// Proactively close dataplane sockets to unblock any blocking I/O:
-		// - Close UDP conns so readLoop exits immediately (without waiting for read deadlines)
 		state.connMu.Lock()
 		for _, c := range state.conns {
 			_ = c.udp.Close()
 		}
 		state.connMu.Unlock()
-		// - Close TUN so tunToServer unblocks from Read and exits promptly
 		if state.tun != nil {
 			_ = state.tun.Close()
 		}
-		// Wait for all goroutines to finish after resources are closed
 		state.wg.Wait()
-		// Finally, revert any route changes
 		if state.revertRoute != nil {
 			state.revertRoute()
 		}
@@ -189,10 +192,240 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	return state, stop, nil
 }
 
+func (c *clientState) readLoop(cc *clientConn) {
+	defer c.wg.Done()
+	// Reuse buffer for reading UDP packets.
+	buf := common.GetBuffer()
+	defer common.PutBuffer(buf)
+
+	for {
+		_ = cc.udp.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, err := cc.udp.Read(buf)
+		if err != nil {
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				select {
+				case <-c.ctx.Done():
+					return
+				default:
+					continue
+				}
+			}
+			cc.alive.Store(false)
+			return
+		}
+
+		// Decrypt into a separate buffer to avoid invalid overlap (panic).
+		plainBuf := common.GetBuffer()
+		h, payload, err := common.DecryptPacketInto(plainBuf, c.sessionKey, buf[:n])
+		if err != nil {
+			common.PutBuffer(plainBuf)
+			continue
+		}
+		cc.bytesRecv.Add(uint64(len(payload)))
+
+		switch h.Type {
+		case common.PacketHeartbeat:
+			var hb common.HeartbeatPayload
+			if err := hb.Unmarshal(payload); err == nil {
+				cc.rttNano.Store(int64(common.CalcRTT(hb.SendTime)))
+			}
+			common.PutBuffer(plainBuf)
+		case common.PacketIP:
+			pay := payload
+			// Handle compression
+			if h.Reserved[0] == common.CompressionGzip {
+				// Decompress into yet another buffer
+				outBuf := common.GetBuffer()
+				dec, err := common.DecompressPayloadInto(outBuf, payload, common.MaxPacketSize)
+				if err == nil {
+					_, _ = c.tun.Write(dec)
+					common.PutBuffer(outBuf)
+				} else {
+					log.Printf("decompress err: %v", err)
+					common.PutBuffer(outBuf)
+				}
+				common.PutBuffer(plainBuf) // Release compressed payload buffer
+			} else {
+				_, _ = c.tun.Write(pay)
+				common.PutBuffer(plainBuf) // Release payload buffer
+			}
+		default:
+			common.PutBuffer(plainBuf)
+		}
+	}
+}
+
+func (c *clientState) tunReader(workCh chan<- []byte) {
+	defer c.wg.Done()
+	defer close(workCh)
+	for {
+		// Allocate buffer for new packet
+		buf := common.GetBuffer()
+		n, err := c.tun.Read(buf)
+		if err != nil {
+			common.PutBuffer(buf)
+			select {
+			case <-c.ctx.Done():
+				return
+			default:
+				log.Printf("tun read err: %v", err)
+				continue
+			}
+		}
+		// Send valid slice to worker
+		select {
+		case workCh <- buf[:n]:
+		case <-c.ctx.Done():
+			common.PutBuffer(buf)
+			return
+		}
+	}
+}
+
+func (c *clientState) workerLoop(workCh <-chan []byte) {
+	defer c.wg.Done()
+	for payload := range workCh {
+		c.processAndSend(payload)
+		// Return buffer to pool after processing
+		// payload is a slice of the buffer from GetBuffer (resliced in tunReader)
+		// We need to recover the original capacity-sized slice to Put properly?
+		// common.PutBuffer handles checking capacity.
+		// But payload is `buf[:n]`. `cap(payload)` should be `PoolBufSize`.
+		// So passing payload to PutBuffer is fine.
+		common.PutBuffer(payload)
+	}
+}
+
+func (c *clientState) processAndSend(data []byte) {
+	// Compression
+	compressed := data
+	compressFlag := common.CompressionNone
+	
+	// Try compression into a new buffer
+	compBuf := common.GetBuffer()
+	if comp, err := common.CompressPayloadInto(compBuf, data); err == nil {
+		if len(comp) < len(data) {
+			compressed = comp
+			compressFlag = common.CompressionGzip
+		}
+	}
+	// If we didn't use compBuf (compression failed or larger), return it.
+	// If we used it, we must return it later.
+	usedComp := (compressFlag == common.CompressionGzip)
+	if !usedComp {
+		common.PutBuffer(compBuf)
+	} else {
+		defer common.PutBuffer(compBuf) // Return compressed buffer at end
+	}
+
+	seq := c.nextSeqSend.Add(1)
+	cc := c.pickBestConn()
+	if cc == nil {
+		return
+	}
+
+	head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketIP, SessionID: c.sessionID, SeqNum: seq, Length: uint16(len(compressed))}
+	head.Reserved[0] = byte(compressFlag)
+	
+	// Encrypt into new packet buffer
+	pktBuf := common.GetBuffer()
+	defer common.PutBuffer(pktBuf)
+	
+	pkt, err := common.EncryptPacketInto(pktBuf, c.sessionKey, head, compressed)
+	if err != nil {
+		return
+	}
+	
+	cc.mu.Lock()
+	_, _ = cc.udp.Write(pkt)
+	cc.mu.Unlock()
+	cc.bytesSent.Add(uint64(len(data)))
+}
+
+func (c *clientState) pickBestConn() *clientConn {
+	c.connMu.RLock()
+	defer c.connMu.RUnlock()
+	if len(c.conns) == 0 {
+		return nil
+	}
+	if c.mode == modeBonding {
+		// simple round-robin over alive
+		start := rand.Intn(len(c.conns))
+		for i := 0; i < len(c.conns); i++ {
+			cand := c.conns[(start+i)%len(c.conns)]
+			if cand.alive.Load() {
+				return cand
+			}
+		}
+		return c.conns[start]
+	}
+	// load-balance: pick lowest RTT alive
+	var best *clientConn
+	bestRTT := time.Duration(1<<63 - 1)
+	for _, cand := range c.conns {
+		if !cand.alive.Load() {
+			continue
+		}
+		rtt := time.Duration(cand.rttNano.Load())
+		if rtt == 0 {
+			rtt = 500 * time.Millisecond
+		}
+		if rtt < bestRTT {
+			bestRTT = rtt
+			best = cand
+		}
+	}
+	if best != nil {
+		return best
+	}
+	return c.conns[0]
+}
+
+func (c *clientState) sendHandshake(cc *clientConn) {
+	head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketHandshake, SessionID: c.sessionID, SeqNum: 0, Length: 0}
+	pkt, err := common.EncryptPacket(c.sessionKey, head, nil)
+	if err != nil {
+		return
+	}
+	cc.mu.Lock()
+	_, _ = cc.udp.Write(pkt)
+	cc.mu.Unlock()
+}
+
+func (c *clientState) heartbeat() {
+	defer c.wg.Done()
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		hb := common.HeartbeatPayload{SendTime: common.NowMonoNano()}
+		payload := hb.Marshal()
+		c.connMu.RLock()
+		for _, cc := range c.conns {
+			if !cc.alive.Load() {
+				// try one ping to see if it comes back
+				// or maybe we rely on generic traffic? 
+				// The original code sent heartbeat to all.
+			}
+			head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketHeartbeat, SessionID: c.sessionID, SeqNum: 0, Length: uint16(len(payload))}
+			if pkt, err := common.EncryptPacket(c.sessionKey, head, payload); err == nil {
+				cc.mu.Lock()
+				_, _ = cc.udp.Write(pkt)
+				cc.mu.Unlock()
+			}
+		}
+		c.connMu.RUnlock()
+	}
+}
+
 func parseServerAddr(server string, ctrlPort int) (host string, port int, err error) {
 	host, portStr, err := net.SplitHostPort(server)
 	if err != nil {
-		// if missing port, use provided ctrlPort
 		if strings.Contains(err.Error(), "missing port") {
 			return server, ctrlPort, nil
 		}
@@ -213,16 +446,11 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 	if err != nil {
 		return nil, 0, 0, "", "", err
 	}
-
-	// Ensure ServerName is set for SNI/verification when using tls.Client.
 	if host, _, herr := net.SplitHostPort(ctrlAddr); herr == nil {
-		// Clone to avoid mutating shared config
 		c := tlsCfg.Clone()
 		c.ServerName = host
 		tlsCfg = c
 	}
-
-	// Establish TCP with a context timeout, then perform TLS handshake with a deadline.
 	ctx, cancel := context.WithTimeout(context.Background(), controlTimeout)
 	defer cancel()
 
@@ -230,8 +458,6 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 	if err != nil {
 		return nil, 0, 0, "", "", classifyTLSError(err)
 	}
-
-	// Wrap with TLS client and perform handshake explicitly so we can apply deadlines and classify errors.
 	conn := tls.Client(tcpConn, tlsCfg)
 	deadline := time.Now().Add(controlTimeout)
 	_ = conn.SetDeadline(deadline)
@@ -240,7 +466,6 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 		_ = conn.Close()
 		return nil, 0, 0, "", "", classifyTLSError(err)
 	}
-
 	defer func(conn *tls.Conn) {
 		_ = conn.Close()
 	}(conn)
@@ -250,7 +475,6 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 	if _, err := conn.Write(buf); err != nil {
 		return nil, 0, 0, "", "", err
 	}
-	// Ensure the server sees EOF so it can finish io.ReadAll.
 	_ = conn.CloseWrite()
 	respData, err := io.ReadAll(conn)
 	if err != nil {
@@ -267,7 +491,6 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 	return key, resp.SessionID, resp.UDPPort, resp.ClientIP, resp.ClientIPv6, nil
 }
 
-// addIPv6CIDR appends /64 to a bare IPv6 address.
 func addIPv6CIDR(ip string) string {
 	if ip == "" {
 		return ""
@@ -278,27 +501,21 @@ func addIPv6CIDR(ip string) string {
 	return ip + "/64"
 }
 
-// classifyTLSError maps low-level TLS/x509/timeout errors to user-friendly messages.
 func classifyTLSError(err error) error {
-	// Deadline/timeout
 	if errors.Is(err, context.DeadlineExceeded) || strings.Contains(err.Error(), "i/o timeout") {
 		return fmt.Errorf("timeout nella connessione/handshake TLS con il server di controllo: %v", err)
 	}
-	// Server rejected client cert during handshake
 	if strings.Contains(err.Error(), "tls: bad certificate") {
 		return fmt.Errorf("il server ha rifiutato il certificato client (bad certificate): verifica che il client .pem contenga cert e key corretti e siano firmati dalla CA")
 	}
-	// Unknown CA
 	var ua *x509.UnknownAuthorityError
 	if errors.As(err, &ua) {
 		return fmt.Errorf("CA sconosciuta: verifica il certificato CA nel bundle .pem e il server usato")
 	}
-	// Hostname mismatch
 	var hn *x509.HostnameError
 	if errors.As(err, &hn) {
 		return fmt.Errorf("il nome del server non corrisponde al certificato (%s)", hn.Error())
 	}
-	// Certificate invalid/expired
 	var ci x509.CertificateInvalidError
 	if errors.As(err, &ci) {
 		switch ci.Reason {
@@ -308,7 +525,6 @@ func classifyTLSError(err error) error {
 			return fmt.Errorf("certificato non valido: %v", ci)
 		}
 	}
-	// Generic handshake failure
 	if strings.Contains(err.Error(), "handshake failure") {
 		return fmt.Errorf("handshake TLS fallita: %v", err)
 	}
@@ -342,4 +558,54 @@ func dialConn(server *net.UDPAddr, iface, ip string) (*clientConn, error) {
 	cc := &clientConn{udp: udp, addr: server, iface: iface}
 	cc.alive.Store(true)
 	return cc, nil
+}
+
+func startBondingClientWithStats(cfg clientConfig, statsView *tview.TextView, app *tview.Application) (func(), error) {
+	state, stop, err := startBondingClientCore(cfg)
+	if err != nil {
+		return nil, err
+	}
+	state.statsView = statsView
+	if statsView != nil && app != nil {
+		go func() {
+			ticker := time.NewTicker(1 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-state.ctx.Done():
+					return
+				case <-ticker.C:
+					app.QueueUpdateDraw(func() {
+						state.updateStats()
+					})
+				}
+			}
+		}()
+	}
+	return stop, nil
+}
+
+func (c *clientState) updateStats() {
+	if c.statsView == nil {
+		return
+	}
+	c.connMu.RLock()
+	defer c.connMu.RUnlock()
+	var lines []string
+	lines = append(lines, "[yellow]Bonding Stats:[white]")
+	var totalTx, totalRx uint64
+	for _, cc := range c.conns {
+		tx := cc.bytesSent.Load()
+		rx := cc.bytesRecv.Load()
+		totalTx += tx
+		totalRx += rx
+		alive := "[red]DOWN"
+		if cc.alive.Load() {
+			alive = "[green]UP"
+		}
+		rtt := time.Duration(cc.rttNano.Load())
+		lines = append(lines, fmt.Sprintf("  %s %s | TX: %s | RX: %s | RTT: %v", cc.iface, alive, fmtBytes(tx), fmtBytes(rx), rtt.Round(time.Millisecond)))
+	}
+	lines = append(lines, fmt.Sprintf("\n[cyan]Total TX:[white] %s  [cyan]Total RX:[white] %s", fmtBytes(totalTx), fmtBytes(totalRx)))
+	c.statsView.SetText(strings.Join(lines, "\n"))
 }

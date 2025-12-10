@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,6 +59,7 @@ func (u *uplinkSet) update(index int, fn func(*uplink)) {
 type cmdRunner interface {
 	Run(name string, args ...string) error
 	Output(name string, args ...string) ([]byte, error)
+	OutputSafe(name string, args ...string) ([]byte, error)
 }
 
 type sysRunner struct{}
@@ -68,6 +70,10 @@ func (sysRunner) Run(name string, args ...string) error {
 
 func (sysRunner) Output(name string, args ...string) ([]byte, error) {
 	return common.RunPrivilegedOutput(name, args...)
+}
+
+func (sysRunner) OutputSafe(name string, args ...string) ([]byte, error) {
+	return exec.Command(name, args...).Output()
 }
 
 var runner cmdRunner = sysRunner{}
@@ -288,7 +294,7 @@ func discoverGateways(ifaces []string) ([]uplink, error) {
 }
 
 func gatewayForIface(iface string) (string, error) {
-	out, err := runner.Output("ip", "route", "get", "8.8.8.8", "oif", iface)
+	out, err := runner.OutputSafe("ip", "route", "get", "8.8.8.8", "oif", iface)
 	if err != nil {
 		return "", err
 	}
@@ -302,7 +308,7 @@ func gatewayForIface(iface string) (string, error) {
 }
 
 func gatewayForIface6(iface string) (string, error) {
-	out, err := runner.Output("ip", "-6", "route", "get", "2001:4860:4860::8888", "oif", iface)
+	out, err := runner.OutputSafe("ip", "-6", "route", "get", "2001:4860:4860::8888", "oif", iface)
 	if err != nil {
 		return "", err
 	}

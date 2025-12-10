@@ -301,10 +301,19 @@ func runTUI(initial clientConfig, autoStart bool) {
 		}
 		cfg := state.buildConfig()
 
-		// If bonding needs elevation, suspend TUI before pkexec/sudo to avoid garbled screen.
-		if state.mode == modeBonding && common.NeedsElevation() {
-			// Use --tui-autostart so the elevated process returns to TUI with auto-start
-			extraArgs := []string{"--tui-autostart", "-server", cfg.Server, "-ifaces", strings.Join(cfg.Ifaces, ","), "-client", cfg.Client, "-pki", cfg.PKI}
+		// If elevation is needed (bonding or load-balance), relaunch with pkexec.
+		// Bonding needs TUN access; Load-balance needs route/iptables access.
+		if common.NeedsElevation() {
+			var extraArgs []string
+			if state.mode == modeBonding {
+				extraArgs = []string{"--tui-autostart", "-server", cfg.Server, "-ifaces", strings.Join(cfg.Ifaces, ","), "-client", cfg.Client, "-pki", cfg.PKI}
+			} else {
+				// Load-balance mode
+				extraArgs = []string{"--tui-autostart", "-l", "-ifaces", strings.Join(cfg.Ifaces, ","), "-pki", cfg.PKI}
+			}
+			// Append conns to match TUI behavior (ensure consistent count after elevation)
+			extraArgs = append(extraArgs, "-conns", fmt.Sprintf("%d", cfg.Conns))
+
 			var elevErr error
 			app.Suspend(func() {
 				elevErr = common.RelaunchWithPkexec(extraArgs...)

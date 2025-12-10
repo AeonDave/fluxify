@@ -54,6 +54,8 @@ func TestSendToSessionSelectsLowestRTT(t *testing.T) {
 	slowConn := &serverConn{udp: sendSlow, addr: recvSlow.LocalAddr().(*net.UDPAddr)}
 	fastConn.alive.Store(true)
 	slowConn.alive.Store(true)
+	fastConn.lastSeen.Store(time.Now().UnixNano())
+	slowConn.lastSeen.Store(time.Now().UnixNano())
 	fastConn.lastRTT.Store(int64(10 * time.Millisecond))
 	slowConn.lastRTT.Store(int64(300 * time.Millisecond))
 

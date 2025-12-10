@@ -119,6 +119,10 @@ func (s *Server) Start() error {
 		go s.outboundWorker()
 	}
 
+	// 5. Cleanup Loop
+	s.wg.Add(1)
+	go s.cleanupLoop()
+
 	return nil
 }
 
@@ -180,6 +184,7 @@ func (s *Server) outboundWorker() {
 	for job := range s.outboundCh {
 		best := job.sess.pickBestConn()
 		if best != nil {
+			job.sess.touch()
 			// Compress & Encrypt & Send
 			// This might allocate new buffers for encryption.
 			// The input 'job.data' is from pool, we must free it after use.
@@ -247,6 +252,8 @@ func (s *Server) handlePacket(sess *serverSession, addr *net.UDPAddr, h common.P
 		}
 	}()
 
+	sess.touch()
+
 	// Update connection state
 	// Optimization: Only lock if we need to update?
 	// updateOrAddConn locks internally.
@@ -260,12 +267,16 @@ func (s *Server) handlePacket(sess *serverSession, addr *net.UDPAddr, h common.P
 	case common.PacketHeartbeat:
 		var hb common.HeartbeatPayload
 		if err := hb.Unmarshal(payload); err == nil {
-			conn.lastRTT.Store(int64(common.CalcRTT(hb.SendTime)))
+			rtt := common.CalcRTT(hb.SendTime)
+			conn.lastRTT.Store(int64(rtt))
+			log.Printf("Debug: heartbeat from %s (rtt=%v)", addr, rtt)
 		}
 		// Echo back immediately (using session write)
 		// Payload is small, we can just send it back.
 		// We use sess.encryptAndSend which allocates new packet.
-		_ = sess.encryptAndSend(conn, common.PacketHeartbeat, payload, false)
+		if err := sess.encryptAndSend(conn, common.PacketHeartbeat, payload, false); err != nil {
+			log.Printf("Debug: failed to echo heartbeat to %s: %v", addr, err)
+		}
 	case common.PacketIP:
 		// Handle decompression
 		data := payload
@@ -436,6 +447,39 @@ func (s *Server) assignClientIPs() (net.IP, net.IP) {
 	v4 := net.IPv4(10, 8, 0, byte(n))
 	v6 := net.ParseIP(fmt.Sprintf("%s%d", clientIPv6Prefix, byte(n)))
 	return v4, v6
+}
+
+func (s *Server) cleanupLoop() {
+	defer s.wg.Done()
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for s.running.Load() {
+		select {
+		case <-ticker.C:
+			s.pruneSessions()
+		}
+	}
+}
+
+func (s *Server) pruneSessions() {
+	s.sessMu.Lock()
+	defer s.sessMu.Unlock()
+
+	for id, sess := range s.sessions {
+		if sess.isIdle() {
+			log.Printf("Session idle/expired: %d (IP: %s)", id, sess.clientIP)
+			delete(s.sessions, id)
+			if sess.clientIP != nil {
+				delete(s.ipToSession, sess.clientIP.String())
+			}
+			if sess.clientIPv6 != nil {
+				delete(s.ipToSession, sess.clientIPv6.String())
+			}
+		} else {
+			sess.pruneStaleConns()
+		}
+	}
 }
 
 // Helper functions (moved from main.go)

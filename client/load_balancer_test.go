@@ -34,6 +34,10 @@ func (f *fakeRunner) Output(name string, args ...string) ([]byte, error) {
 	return nil, errors.New("unexpected command")
 }
 
+func (f *fakeRunner) OutputSafe(name string, args ...string) ([]byte, error) {
+	return f.Output(name, args...)
+}
+
 func TestHealthMonitorFlapsAndUpdatesRoutes(t *testing.T) {
 	// ping fails twice then succeeds, toggling an uplink down then up and causing route refresh
 	seq := 0
