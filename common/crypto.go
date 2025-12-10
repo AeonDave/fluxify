@@ -26,6 +26,11 @@ func GenerateSessionKey() ([]byte, error) {
 // The returned packet is header || nonce || ciphertext. Header.Length is set to len(nonce)+len(ciphertext).
 // The header bytes are used as AAD to protect metadata integrity.
 func EncryptPacket(key []byte, h PacketHeader, plaintext []byte) ([]byte, error) {
+	return EncryptPacketInto(nil, key, h, plaintext)
+}
+
+// EncryptPacketInto seals plaintext into dst (if capacity allows, otherwise allocates).
+func EncryptPacketInto(dst []byte, key []byte, h PacketHeader, plaintext []byte) ([]byte, error) {
 	if len(key) != SessionKeySize {
 		return nil, fmt.Errorf("invalid key length %d", len(key))
 	}
@@ -52,18 +57,30 @@ func EncryptPacket(key []byte, h PacketHeader, plaintext []byte) ([]byte, error)
 		return nil, err
 	}
 
-	ciphertext := gcm.Seal(nil, nonce, plaintext, hdrBytes)
+	// Output format: Header || Nonce || Ciphertext
+	needed := len(hdrBytes) + len(nonce) + len(plaintext) + gcm.Overhead()
+	var pkt []byte
+	if cap(dst) >= needed {
+		pkt = dst[:0]
+	} else {
+		pkt = make([]byte, 0, needed)
+	}
 
-	pkt := make([]byte, 0, HeaderSize+len(nonce)+len(ciphertext))
 	pkt = append(pkt, hdrBytes...)
 	pkt = append(pkt, nonce...)
-	pkt = append(pkt, ciphertext...)
+	// Seal appends ciphertext to the provided buffer
+	pkt = gcm.Seal(pkt, nonce, plaintext, hdrBytes)
 	return pkt, nil
 }
 
 // DecryptPacket authenticates and decrypts a packet produced by EncryptPacket.
 // Returns the header and plaintext payload.
 func DecryptPacket(key []byte, packet []byte) (PacketHeader, []byte, error) {
+	return DecryptPacketInto(nil, key, packet)
+}
+
+// DecryptPacketInto authenticates and decrypts into dst.
+func DecryptPacketInto(dst []byte, key []byte, packet []byte) (PacketHeader, []byte, error) {
 	var h PacketHeader
 	if len(key) != SessionKeySize {
 		return h, nil, fmt.Errorf("invalid key length %d", len(key))
@@ -93,7 +110,7 @@ func DecryptPacket(key []byte, packet []byte) (PacketHeader, []byte, error) {
 		return h, nil, err
 	}
 
-	plaintext, err := gcm.Open(nil, nonce, ciphertext, packet[:HeaderSize])
+	plaintext, err := gcm.Open(dst[:0], nonce, ciphertext, packet[:HeaderSize])
 	if err != nil {
 		return h, nil, err
 	}

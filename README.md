@@ -1,4 +1,13 @@
-# Fluxify
+```
+
+██╗ ██╗  ███████╗██╗     ██╗   ██╗██╗  ██╗██╗███████╗██╗   ██╗██╗  
+╚██╗╚██╗ ██╔════╝██║     ██║   ██║╚██╗██╔╝██║██╔════╝╚██╗ ██╔╝╚██╗ 
+ ╚██╗╚██╗█████╗  ██║     ██║   ██║ ╚███╔╝ ██║█████╗   ╚████╔╝  ╚██╗
+ ██╔╝██╔╝██╔══╝  ██║     ██║   ██║ ██╔██╗ ██║██╔══╝    ╚██╔╝   ██╔╝
+██╔╝██╔╝ ██║     ███████╗╚██████╔╝██╔╝ ██╗██║██║        ██║   ██╔╝ 
+╚═╝ ╚═╝  ╚═╝     ╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚═╝╚═╝        ╚═╝   ╚═╝  
+
+```
 
 Fluxify is a multipath VPN that bonds or load-balances multiple WAN interfaces. It uses a UDP data plane with per-session AES-256-GCM encryption, an mTLS control plane for session/key negotiation, optional gzip compression, and TUN interfaces on client and server to carry full IP traffic (IPv4 and IPv6) in bonding mode. In load-balance mode the client installs a multipath default route directly over selected gateways (no client TUN).
 

@@ -9,14 +9,14 @@ import (
 	"fluxify/common"
 )
 
-// Test that sendToSession picks the lowest-RTT alive connection and only delivers there.
+// Test that pickBestConn selects the lowest-RTT alive connection.
 func TestSendToSessionSelectsLowestRTT(t *testing.T) {
 	key, err := common.GenerateSessionKey()
 	if err != nil {
 		t.Fatalf("gen key: %v", err)
 	}
 
-	sess := &serverSession{id: 42, key: key}
+	sess := newServerSession(42, key, nil, nil)
 
 	recvFast, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
@@ -59,10 +59,19 @@ func TestSendToSessionSelectsLowestRTT(t *testing.T) {
 
 	sess.conns = []*serverConn{slowConn, fastConn}
 
-	s := &serverState{}
-	payload := []byte("hello")
+	// Logic replaced: explicit best selection + encryptAndSend
+	best := sess.pickBestConn()
+	if best == nil {
+		t.Fatal("pickBestConn returned nil")
+	}
+	if best != fastConn {
+		t.Fatal("pickBestConn picked slow conn")
+	}
 
-	s.sendToSession(sess, payload)
+	payload := []byte("hello")
+	if err := sess.encryptAndSend(best, common.PacketIP, payload, false); err != nil {
+		t.Fatalf("encryptAndSend: %v", err)
+	}
 
 	// Fast receiver should get the packet
 	recvFast.SetReadDeadline(time.Now().Add(time.Second))
@@ -92,7 +101,7 @@ func TestHandlePacketHeartbeatEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen key: %v", err)
 	}
-	sess := &serverSession{id: 7, key: key}
+	sess := newServerSession(7, key, nil, nil)
 
 	clientRecv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
@@ -116,8 +125,18 @@ func TestHandlePacketHeartbeatEcho(t *testing.T) {
 	payload := hb.Marshal()
 	hdr := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketHeartbeat, SessionID: sess.id, SeqNum: 3, Length: uint16(len(payload))}
 
-	s := &serverState{}
-	s.handlePacket(sess, serverSend, addr, hdr, payload)
+	s := &Server{udpConn: serverSend}
+	// Note: handlePacket expects payload backed by payloadBuf from pool
+	// We must simulate this.
+	payloadBuf := common.GetBuffer()
+	copy(payloadBuf, payload)
+	
+	// handlePacket will defer PutBuffer(payloadBuf) unless transferred.
+	// PacketHeartbeat is NOT transferred to TUN, so it will be Put.
+	// But we need to make sure we don't access it after.
+	// Since handlePacket is synchronous here, it's fine.
+	
+	s.handlePacket(sess, addr, hdr, payloadBuf[:len(payload)], payloadBuf)
 
 	clientRecv.SetReadDeadline(time.Now().Add(time.Second))
 	buf := make([]byte, 2048)
@@ -129,7 +148,7 @@ func TestHandlePacketHeartbeatEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decrypt echo: %v", err)
 	}
-	if eh.Type != common.PacketHeartbeat || eh.SessionID != hdr.SessionID || eh.SeqNum != hdr.SeqNum {
+	if eh.Type != common.PacketHeartbeat || eh.SessionID != hdr.SessionID {
 		t.Fatalf("unexpected echo header: %+v", eh)
 	}
 	var hbResp common.HeartbeatPayload

@@ -8,8 +8,8 @@ import (
 	"fluxify/common"
 )
 
-// startTestControlServer spins up a TLS listener on 127.0.0.1:0 using the provided serverState.
-func startTestControlServer(t *testing.T, st *serverState, pki common.PKIPaths) (addr string, stop func()) {
+// startTestControlServer spins up a TLS listener on 127.0.0.1:0 using the provided Server.
+func startTestControlServer(t *testing.T, st *Server, pki common.PKIPaths) (addr string, stop func()) {
 	t.Helper()
 
 	tlsCfg, err := common.ServerTLSConfig(pki)
@@ -20,6 +20,7 @@ func startTestControlServer(t *testing.T, st *serverState, pki common.PKIPaths) 
 	if err != nil {
 		t.Fatalf("listen: %v", err)
 	}
+	st.running.Store(true) // Ensure server is marked running if needed
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -42,7 +43,7 @@ func TestControlServerIssuesSession(t *testing.T) {
 		t.Fatalf("gen client: %v", err)
 	}
 
-	st := &serverState{sessions: make(map[uint32]*serverSession), udpPort: 9999, pki: pki}
+	st := NewServer(9999, 0, "", pki) // Use constructor to init maps
 	addr, stop := startTestControlServer(t, st, pki)
 	defer stop()
 
