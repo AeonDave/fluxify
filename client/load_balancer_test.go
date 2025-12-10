@@ -53,7 +53,7 @@ func TestHealthMonitorFlapsAndUpdatesRoutes(t *testing.T) {
 	runner = fr
 	defer func() { runner = old }()
 
-	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw: "10.0.0.1", alive: true, fail: 2}}}
+	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw: "10.0.0.1", alive: true, alive4: true, fail: 2}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		// allow enough ticks for down->up transition
@@ -84,7 +84,7 @@ func TestInstallMultipathDefaultBuildsArgs(t *testing.T) {
 	runner = fr
 	defer func() { runner = old }()
 
-	uplinks := []uplink{{iface: "eth0", gw: "10.0.0.1", alive: true}, {iface: "eth1", gw: "10.0.1.1", alive: true}}
+	uplinks := []uplink{{iface: "eth0", gw: "10.0.0.1", alive: true, alive4: true}, {iface: "eth1", gw: "10.0.1.1", alive: true, alive4: true}}
 	if err := installMultipathDefault(uplinks); err != nil {
 		t.Fatalf("installMultipathDefault error: %v", err)
 	}
@@ -109,6 +109,37 @@ func TestInstallMultipathDefaultNoAlive(t *testing.T) {
 	}
 }
 
+func TestInstallMultipathDefault6BuildsArgs(t *testing.T) {
+	fr := &fakeRunner{outputs: make(map[string][]byte)}
+	old := runner
+	runner = fr
+	defer func() { runner = old }()
+
+	uplinks := []uplink{{iface: "eth0", gw6: "fe80::1", alive: true, alive6: true}}
+	if err := installMultipathDefault6(uplinks); err != nil {
+		t.Fatalf("installMultipathDefault6 error: %v", err)
+	}
+	if len(fr.runs) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(fr.runs))
+	}
+	got := strings.Join(fr.runs[0], " ")
+	want := "ip -6 route replace default nexthop via fe80::1 dev eth0 weight 1"
+	if got != want {
+		t.Fatalf("unexpected args\n got: %s\nwant: %s", got, want)
+	}
+}
+
+func TestInstallMultipathDefault6NoAlive(t *testing.T) {
+	fr := &fakeRunner{outputs: make(map[string][]byte)}
+	old := runner
+	runner = fr
+	defer func() { runner = old }()
+
+	if err := installMultipathDefault6([]uplink{}); err == nil {
+		t.Fatalf("expected error when no alive ipv6 uplinks")
+	}
+}
+
 func TestGatewayForIfaceParsesVia(t *testing.T) {
 	fr := &fakeRunner{outputs: map[string][]byte{"ip route get 8.8.8.8 oif eth0": []byte("8.8.8.8 via 10.0.0.1 dev eth0")}}
 	old := runner
@@ -121,6 +152,76 @@ func TestGatewayForIfaceParsesVia(t *testing.T) {
 	}
 	if gw != "10.0.0.1" {
 		t.Fatalf("unexpected gw: %s", gw)
+	}
+}
+
+func TestGatewayForIface6ParsesVia(t *testing.T) {
+	fr := &fakeRunner{outputs: map[string][]byte{"ip -6 route get 2001:4860:4860::8888 oif eth0": []byte("2001:4860:4860::8888 via fe80::1 dev eth0")}}
+	old := runner
+	runner = fr
+	defer func() { runner = old }()
+
+	gw, err := gatewayForIface6("eth0")
+	if err != nil {
+		t.Fatalf("gatewayForIface6 error: %v", err)
+	}
+	if gw != "fe80::1" {
+		t.Fatalf("unexpected gw6: %s", gw)
+	}
+}
+
+func TestAddMasqueradeRules6(t *testing.T) {
+	fr := &fakeRunner{outputs: make(map[string][]byte)}
+	old := runner
+	runner = fr
+	defer func() { runner = old }()
+
+	if err := addMasqueradeRules6([]uplink{{iface: "eth0", gw6: "fe80::1"}}); err != nil {
+		t.Fatalf("addMasqueradeRules6 error: %v", err)
+	}
+	if len(fr.runs) != 1 {
+		t.Fatalf("expected 1 run, got %d", len(fr.runs))
+	}
+	if run := strings.Join(fr.runs[0], " "); run != "ip6tables -t nat -A POSTROUTING -o eth0 -j MASQUERADE" {
+		t.Fatalf("unexpected run: %s", run)
+	}
+}
+
+func TestHealthMonitorTracksIPv6(t *testing.T) {
+	fr := &fakeRunner{outputs: make(map[string][]byte)}
+	old := runner
+	runner = fr
+	defer func() { runner = old }()
+
+	// First ping -6 fails then succeeds to trigger route updates
+	call := 0
+	fr.runHook = func(name string, args ...string) error {
+		if name == "ping" && len(args) > 0 && args[0] == "-6" {
+			call++
+			if call == 1 {
+				return errors.New("fail")
+			}
+		}
+		fr.runs = append(fr.runs, append([]string{name}, args...))
+		return nil
+	}
+
+	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw6: "fe80::1", alive: true, alive6: true, fail6: 2}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(12 * time.Second)
+		cancel()
+	}()
+	healthMonitor(ctx, ups)
+
+	callsV6 := 0
+	for _, run := range fr.runs {
+		if len(run) >= 3 && run[0] == "ip" && run[1] == "-6" && run[2] == "route" {
+			callsV6++
+		}
+	}
+	if callsV6 == 0 {
+		t.Fatalf("expected ipv6 route updates, got %d", callsV6)
 	}
 }
 

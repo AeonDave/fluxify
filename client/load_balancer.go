@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,8 +18,12 @@ import (
 type uplink struct {
 	iface   string
 	gw      string
+	gw6     string
 	alive   bool
+	alive4  bool
+	alive6  bool
 	fail    int
+	fail6   int
 	bytesTx uint64
 	bytesRx uint64
 	lastTx  uint64
@@ -77,6 +80,10 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 	if err != nil {
 		return nil, fmt.Errorf("get default route: %w", err)
 	}
+	oldRoute6, _, _, err := common.GetDefaultRoute6()
+	if err != nil {
+		return nil, fmt.Errorf("get default route v6: %w", err)
+	}
 	log.Printf("Saved old route: %s", oldRoute)
 
 	rawUplinks, err := discoverGateways(cfg.Ifaces)
@@ -89,19 +96,51 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 	log.Printf("Discovered %d uplinks", len(rawUplinks))
 
 	ups := &uplinkSet{list: rawUplinks, statsView: statsView}
+	hasV4 := false
+	hasV6 := false
+	for _, u := range rawUplinks {
+		if u.gw != "" {
+			hasV4 = true
+		}
+		if u.gw6 != "" {
+			hasV6 = true
+		}
+	}
 
 	snapshot := ups.snapshot()
-	if err := addMasqueradeRules(snapshot); err != nil {
-		return nil, err
+	if hasV4 {
+		if err := addMasqueradeRules(snapshot); err != nil {
+			return nil, err
+		}
+		log.Printf("Added MASQUERADE rules")
 	}
-	log.Printf("Added MASQUERADE rules")
+	if hasV6 {
+		if err := addMasqueradeRules6(snapshot); err != nil {
+			_ = removeMasqueradeRules(snapshot)
+			return nil, err
+		}
+		log.Printf("Added IPv6 MASQUERADE rules")
+	}
 
 	// Install multipath default route directly (no TUN needed for simple load-balance)
-	if err := installMultipathDefault(snapshot); err != nil {
-		_ = removeMasqueradeRules(snapshot)
-		return nil, err
+	if hasV4 {
+		if err := installMultipathDefault(snapshot); err != nil {
+			_ = removeMasqueradeRules(snapshot)
+			if hasV6 {
+				_ = removeMasqueradeRules6(snapshot)
+			}
+			return nil, err
+		}
+		log.Printf("Installed multipath default route")
 	}
-	log.Printf("Installed multipath default route")
+	if hasV6 {
+		if err := installMultipathDefault6(snapshot); err != nil {
+			_ = removeMasqueradeRules(snapshot)
+			_ = removeMasqueradeRules6(snapshot)
+			return nil, err
+		}
+		log.Printf("Installed IPv6 multipath default route")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go healthMonitor(ctx, ups)
@@ -113,8 +152,18 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 		cancel()
 		log.Printf("Restoring old route: %s", oldRoute)
 		snapshot := ups.snapshot()
-		_ = common.ReplaceDefaultRoute(oldRoute)
-		_ = removeMasqueradeRules(snapshot)
+		if oldRoute != "" {
+			_ = common.ReplaceDefaultRoute(oldRoute)
+		}
+		if oldRoute6 != "" {
+			_ = common.ReplaceDefaultRoute6(oldRoute6)
+		}
+		if hasV4 {
+			_ = removeMasqueradeRules(snapshot)
+		}
+		if hasV6 {
+			_ = removeMasqueradeRules6(snapshot)
+		}
 		log.Printf("Load-balancer stopped")
 	}
 	return stop, nil
@@ -152,10 +201,25 @@ func updateLBStats(ups *uplinkSet) {
 		if u.alive {
 			status = "[green]UP"
 		}
-		lines = append(lines, fmt.Sprintf("  %s (%s) %s | TX: %s (%.1f kbps) | RX: %s (%.1f kbps)", u.iface, u.gw, status, fmtBytes(u.bytesTx), u.rateTxK, fmtBytes(u.bytesRx), u.rateRxK))
+		gwLabel := u.gw
+		if u.gw6 != "" {
+			if gwLabel != "" {
+				gwLabel += " / "
+			}
+			gwLabel += u.gw6
+		}
+		fam := fmt.Sprintf("(v4:%s v6:%s)", upDown(u.alive4), upDown(u.alive6))
+		lines = append(lines, fmt.Sprintf("  %s (%s) %s %s | TX: %s (%.1f kbps) | RX: %s (%.1f kbps)", u.iface, gwLabel, status, fam, fmtBytes(u.bytesTx), u.rateTxK, fmtBytes(u.bytesRx), u.rateRxK))
 	}
 	lines = append(lines, fmt.Sprintf("\n[cyan]Total TX:[white] %s  [cyan]Total RX:[white] %s", fmtBytes(totalTx), fmtBytes(totalRx)))
 	ups.statsView.SetText(strings.Join(lines, "\n"))
+}
+
+func upDown(b bool) string {
+	if b {
+		return "up"
+	}
+	return "down"
 }
 
 func refreshInterfaceStats(ups *uplinkSet) {
@@ -210,18 +274,35 @@ func discoverGateways(ifaces []string) ([]uplink, error) {
 			log.Printf("gateway lookup failed for %s: %v", ifc, err)
 			continue
 		}
-		if gw == "" {
+		gw6, err := gatewayForIface6(ifc)
+		if err != nil {
+			log.Printf("gateway6 lookup failed for %s: %v", ifc, err)
+		}
+		if gw == "" && gw6 == "" {
 			log.Printf("no gateway found for %s", ifc)
 			continue
 		}
-		uplinks = append(uplinks, uplink{iface: ifc, gw: gw, alive: true})
+		uplinks = append(uplinks, uplink{iface: ifc, gw: gw, gw6: gw6, alive: gw != "" || gw6 != "", alive4: gw != "", alive6: gw6 != ""})
 	}
 	return uplinks, nil
 }
 
 func gatewayForIface(iface string) (string, error) {
-	cmd := exec.Command("ip", "route", "get", "8.8.8.8", "oif", iface)
-	out, err := cmd.Output()
+	out, err := runner.Output("ip", "route", "get", "8.8.8.8", "oif", iface)
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(string(out))
+	for i := 0; i < len(fields)-1; i++ {
+		if fields[i] == "via" {
+			return fields[i+1], nil
+		}
+	}
+	return "", nil
+}
+
+func gatewayForIface6(iface string) (string, error) {
+	out, err := runner.Output("ip", "-6", "route", "get", "2001:4860:4860::8888", "oif", iface)
 	if err != nil {
 		return "", err
 	}
@@ -237,13 +318,27 @@ func gatewayForIface(iface string) (string, error) {
 func installMultipathDefault(uplinks []uplink) error {
 	args := []string{"route", "replace", "default", "scope", "global"}
 	for _, u := range uplinks {
-		if !u.alive || u.gw == "" {
+		if !u.alive4 || u.gw == "" {
 			continue
 		}
 		args = append(args, "nexthop", "via", u.gw, "dev", u.iface, "weight", "1")
 	}
 	if len(args) == 5 { // no nexthops added
 		return fmt.Errorf("no alive uplinks to install")
+	}
+	return runner.Run("ip", args...)
+}
+
+func installMultipathDefault6(uplinks []uplink) error {
+	args := []string{"-6", "route", "replace", "default"}
+	for _, u := range uplinks {
+		if !u.alive6 || u.gw6 == "" {
+			continue
+		}
+		args = append(args, "nexthop", "via", u.gw6, "dev", u.iface, "weight", "1")
+	}
+	if len(args) == 4 {
+		return fmt.Errorf("no alive ipv6 uplinks to install")
 	}
 	return runner.Run("ip", args...)
 }
@@ -257,9 +352,31 @@ func addMasqueradeRules(uplinks []uplink) error {
 	return nil
 }
 
+func addMasqueradeRules6(uplinks []uplink) error {
+	for _, u := range uplinks {
+		if u.gw6 == "" {
+			continue
+		}
+		if err := runner.Run("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-o", u.iface, "-j", "MASQUERADE"); err != nil {
+			return fmt.Errorf("ip6tables add %s: %w", u.iface, err)
+		}
+	}
+	return nil
+}
+
 func removeMasqueradeRules(uplinks []uplink) error {
 	for _, u := range uplinks {
 		_ = runner.Run("iptables", "-t", "nat", "-D", "POSTROUTING", "-o", u.iface, "-j", "MASQUERADE")
+	}
+	return nil
+}
+
+func removeMasqueradeRules6(uplinks []uplink) error {
+	for _, u := range uplinks {
+		if u.gw6 == "" {
+			continue
+		}
+		_ = runner.Run("ip6tables", "-t", "nat", "-D", "POSTROUTING", "-o", u.iface, "-j", "MASQUERADE")
 	}
 	return nil
 }
@@ -270,32 +387,68 @@ func healthMonitor(ctx context.Context, ups *uplinkSet) {
 	for {
 		select {
 		case <-ticker.C:
-			changed := false
+			changed4 := false
+			changed6 := false
 			snap := ups.snapshot()
 			for i := range snap {
 				idx := i
-				err := runner.Run("ping", "-c", "1", "-W", "1", "-I", snap[i].iface, "1.1.1.1")
-				if err != nil {
-					ups.update(idx, func(u *uplink) {
-						u.fail++
-						if u.fail >= 3 && u.alive {
-							u.alive = false
-							changed = true
-						}
-					})
-				} else {
-					ups.update(idx, func(u *uplink) {
-						u.fail = 0
-						if !u.alive {
-							u.alive = true
-							changed = true
-						}
-					})
+				if snap[i].gw != "" {
+					err := runner.Run("ping", "-c", "1", "-W", "1", "-I", snap[i].iface, "1.1.1.1")
+					if err != nil {
+						ups.update(idx, func(u *uplink) {
+							prev := u.alive4
+							u.fail++
+							if u.fail >= 3 && u.alive4 {
+								u.alive4 = false
+								changed4 = changed4 || prev
+							}
+							u.alive = u.alive4 || u.alive6
+						})
+					} else {
+						ups.update(idx, func(u *uplink) {
+							prev := u.alive4
+							u.fail = 0
+							u.alive4 = true
+							if !prev {
+								changed4 = true
+							}
+							u.alive = u.alive4 || u.alive6
+						})
+					}
+				}
+				if snap[i].gw6 != "" {
+					err := runner.Run("ping", "-6", "-c", "1", "-W", "1", "-I", snap[i].iface, "2606:4700:4700::1111")
+					if err != nil {
+						ups.update(idx, func(u *uplink) {
+							prev := u.alive6
+							u.fail6++
+							if u.fail6 >= 3 && u.alive6 {
+								u.alive6 = false
+								changed6 = changed6 || prev
+							}
+							u.alive = u.alive4 || u.alive6
+						})
+					} else {
+						ups.update(idx, func(u *uplink) {
+							prev := u.alive6
+							u.fail6 = 0
+							u.alive6 = true
+							if !prev {
+								changed6 = true
+							}
+							u.alive = u.alive4 || u.alive6
+						})
+					}
 				}
 			}
-			if changed {
+			if changed4 {
 				if err := installMultipathDefault(ups.snapshot()); err != nil {
-					log.Printf("multipath update failed: %v", err)
+					log.Printf("multipath update failed (ipv4): %v", err)
+				}
+			}
+			if changed6 {
+				if err := installMultipathDefault6(ups.snapshot()); err != nil {
+					log.Printf("multipath update failed (ipv6): %v", err)
 				}
 			}
 		case <-ctx.Done():

@@ -19,6 +19,12 @@ import (
 	"fluxify/common"
 )
 
+const (
+	serverIPv4CIDR   = "10.8.0.1/24"
+	serverIPv6CIDR   = "fd00:8:0::1/64"
+	clientIPv6Prefix = "fd00:8:0::"
+)
+
 type serverConn struct {
 	udp       *net.UDPConn
 	addr      *net.UDPAddr
@@ -33,6 +39,7 @@ type serverSession struct {
 	conns       []*serverConn
 	connMu      sync.RWMutex
 	clientIP    net.IP // 10.8.0.X assigned
+	clientIPv6  net.IP
 	key         []byte
 	nextSeqSend atomic.Uint32
 }
@@ -53,7 +60,7 @@ func (s *serverState) getSession(id uint32) *serverSession {
 	return sess
 }
 
-func (s *serverState) assignClientIP() net.IP {
+func (s *serverState) assignClientIPs() (net.IP, net.IP) {
 	// start at 10.8.0.2 and increment last octet
 	n := s.nextIPOctet.Add(1)
 	if n < 2 {
@@ -62,7 +69,9 @@ func (s *serverState) assignClientIP() net.IP {
 	if n > 250 {
 		n = 2
 	}
-	return net.IPv4(10, 8, 0, byte(n))
+	v4 := net.IPv4(10, 8, 0, byte(n))
+	v6 := net.ParseIP(fmt.Sprintf("%s%d", clientIPv6Prefix, byte(n)))
+	return v4, v6
 }
 
 func main() {
@@ -112,10 +121,12 @@ func runServer(port int, ctrlPort int, ifaceName string, pki common.PKIPaths) er
 	state.tun = tun
 	log.Printf("TUN up: %s", tun.Name())
 
-	if err := common.ConfigureTUN(common.TUNConfig{IfaceName: tun.Name(), CIDR: "10.8.0.1/24", MTU: common.MTU}); err != nil {
+	if err := common.ConfigureTUN(common.TUNConfig{IfaceName: tun.Name(), CIDR: serverIPv4CIDR, IPv6CIDR: serverIPv6CIDR, MTU: common.MTU}); err != nil {
 		return err
 	}
 	_ = ensureNatRule()
+	_ = ensureNatRule6()
+	enableIPv6Forwarding()
 
 	udpAddr := &net.UDPAddr{Port: port}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
@@ -231,11 +242,28 @@ func (s *serverState) tunToClients() {
 			continue
 		}
 		pkt := buf[:n]
-		dstIP := net.IP(pkt[16:20])
-		// map to session by IP
+		if len(pkt) == 0 {
+			continue
+		}
+		ver := pkt[0] >> 4
+		var dstIP net.IP
+		if ver == 4 {
+			if len(pkt) < 20 {
+				continue
+			}
+			dstIP = net.IP(pkt[16:20])
+		} else if ver == 6 {
+			if len(pkt) < 40 {
+				continue
+			}
+			dstIP = net.IP(pkt[24:40])
+		} else {
+			continue
+		}
+		// map to session by IP (v4 or v6)
 		s.sessMu.RLock()
 		for _, sess := range s.sessions {
-			if sess.clientIP.Equal(dstIP) {
+			if (ver == 4 && sess.clientIP.Equal(dstIP)) || (ver == 6 && sess.clientIPv6 != nil && sess.clientIPv6.Equal(dstIP)) {
 				s.sendToSession(sess, pkt)
 			}
 		}
@@ -356,8 +384,8 @@ func (s *serverState) handleControl(conn net.Conn) {
 		log.Printf("gen key err: %v", err)
 		return
 	}
-	clientIP := s.assignClientIP()
-	sess := &serverSession{id: sessID, conns: []*serverConn{}, clientIP: clientIP, key: key}
+	clientIP, clientIPv6 := s.assignClientIPs()
+	sess := &serverSession{id: sessID, conns: []*serverConn{}, clientIP: clientIP, clientIPv6: clientIPv6, key: key}
 	s.sessMu.Lock()
 	s.sessions[sessID] = sess
 	s.sessMu.Unlock()
@@ -367,6 +395,7 @@ func (s *serverState) handleControl(conn net.Conn) {
 		SessionKey: common.EncodeKeyBase64(key),
 		UDPPort:    s.udpPort,
 		ClientIP:   clientIP.String(),
+		ClientIPv6: clientIPv6.String(),
 	}
 	b, _ := resp.Marshal()
 	_, _ = peer.Write(b)
@@ -384,6 +413,24 @@ func ensureNatRule() error {
 	}
 	cmd := exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.8.0.0/24", "-j", "MASQUERADE")
 	return cmd.Run()
+}
+
+func ensureNatRule6() error {
+	if _, err := exec.LookPath("ip6tables"); err != nil {
+		return err
+	}
+	check := exec.Command("ip6tables", "-t", "nat", "-C", "POSTROUTING", "-s", "fd00:8:0::/64", "-j", "MASQUERADE")
+	if err := check.Run(); err == nil {
+		return nil
+	}
+	cmd := exec.Command("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-s", "fd00:8:0::/64", "-j", "MASQUERADE")
+	return cmd.Run()
+}
+
+func enableIPv6Forwarding() {
+	if err := exec.Command("sysctl", "-w", "net.ipv6.conf.all.forwarding=1").Run(); err != nil {
+		log.Printf("enable ipv6 forwarding failed: %v", err)
+	}
 }
 
 // splitCSV splits a comma-separated string into trimmed, non-empty parts.

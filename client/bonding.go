@@ -49,11 +49,11 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	ctrlAddr := net.JoinHostPort(ctrlHost, fmt.Sprintf("%d", ctrlPort))
 
 	log.Printf("bonding: fetching session from %s", ctrlAddr)
-	key, sessID, udpPort, clientIP, err := fetchSession(ctrlAddr, cfg)
+	key, sessID, udpPort, clientIP, clientIPv6, err := fetchSession(ctrlAddr, cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("control: %w", err)
 	}
-	log.Printf("bonding: session id=%d udp=%d ip=%s", sessID, udpPort, clientIP)
+	log.Printf("bonding: session id=%d udp=%d ip4=%s ip6=%s", sessID, udpPort, clientIP, clientIPv6)
 
 	serverUDP, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ctrlHost, fmt.Sprintf("%d", udpPort)))
 	if err != nil {
@@ -71,8 +71,8 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	}
 	state.tun = tun
 	log.Printf("TUN up: %s", tun.Name())
-	log.Printf("bonding: configuring TUN with %s/24", clientIP)
-	if err := common.ConfigureTUN(common.TUNConfig{IfaceName: tun.Name(), CIDR: clientIP + "/24", MTU: common.MTU}); err != nil {
+	log.Printf("bonding: configuring TUN with %s/24 (IPv4) and %s (IPv6)", clientIP, addIPv6CIDR(clientIPv6))
+	if err := common.ConfigureTUN(common.TUNConfig{IfaceName: tun.Name(), CIDR: clientIP + "/24", IPv6CIDR: addIPv6CIDR(clientIPv6), MTU: common.MTU}); err != nil {
 		_ = state.tun.Close()
 		cancel()
 		return nil, nil, err
@@ -91,20 +91,48 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 			cancel()
 			return nil, nil, fmt.Errorf("get default route: %w", err)
 		}
+		oldRoute6, via6, dev6, err := common.GetDefaultRoute6()
+		if err != nil {
+			_ = state.tun.Close()
+			cancel()
+			return nil, nil, fmt.Errorf("get default route v6: %w", err)
+		}
 		serverHost, _, _ := net.SplitHostPort(cfg.Server)
+		serverIP := serverUDP.IP.String()
+		if serverHost == "" {
+			serverHost = serverIP
+		}
 		// host route to control/server via current default so TLS/UDP stay reachable.
-		_ = common.EnsureHostRoute(serverHost, via, dev)
-		// Replace default route to go via TUN device.
+		if serverUDP.IP.To4() != nil {
+			_ = common.EnsureHostRoute(serverHost, via, dev)
+		} else {
+			_ = common.EnsureHostRoute6(serverHost, via6, dev6)
+		}
+		// Replace default routes to go via TUN device.
 		if err := common.SetDefaultRouteDev(tun.Name()); err != nil {
-			_ = common.DeleteHostRoute(serverHost)
+			if serverUDP.IP.To4() != nil {
+				_ = common.DeleteHostRoute(serverHost)
+			} else {
+				_ = common.DeleteHostRoute6(serverHost)
+			}
 			_ = state.tun.Close()
 			cancel()
 			return nil, nil, fmt.Errorf("set default route: %w", err)
 		}
+		if err := common.SetDefaultRouteDev6(tun.Name()); err != nil {
+			log.Printf("bonding: warning: failed to set IPv6 default via TUN: %v", err)
+		}
 		state.revertRoute = func() {
 			// best-effort restore
 			_ = common.ReplaceDefaultRoute(oldRoute)
-			_ = common.DeleteHostRoute(serverHost)
+			if oldRoute6 != "" {
+				_ = common.ReplaceDefaultRoute6(oldRoute6)
+			}
+			if serverUDP.IP.To4() != nil {
+				_ = common.DeleteHostRoute(serverHost)
+			} else {
+				_ = common.DeleteHostRoute6(serverHost)
+			}
 		}
 	} else {
 		log.Printf("bonding: loopback server detected (%s); skipping route changes and iface binding for testing", serverUDP.String())
@@ -180,10 +208,10 @@ func parseServerAddr(server string, ctrlPort int) (host string, port int, err er
 	return host, p, nil
 }
 
-func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, string, error) {
+func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, string, string, error) {
 	tlsCfg, err := clientTLSConfig(cfg)
 	if err != nil {
-		return nil, 0, 0, "", err
+		return nil, 0, 0, "", "", err
 	}
 
 	// Ensure ServerName is set for SNI/verification when using tls.Client.
@@ -200,7 +228,7 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 
 	tcpConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", ctrlAddr)
 	if err != nil {
-		return nil, 0, 0, "", classifyTLSError(err)
+		return nil, 0, 0, "", "", classifyTLSError(err)
 	}
 
 	// Wrap with TLS client and perform handshake explicitly so we can apply deadlines and classify errors.
@@ -210,7 +238,7 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 
 	if err := conn.Handshake(); err != nil {
 		_ = conn.Close()
-		return nil, 0, 0, "", classifyTLSError(err)
+		return nil, 0, 0, "", "", classifyTLSError(err)
 	}
 
 	defer func(conn *tls.Conn) {
@@ -220,23 +248,34 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 	req := common.ControlRequest{ClientName: cfg.Client}
 	buf, _ := req.Marshal()
 	if _, err := conn.Write(buf); err != nil {
-		return nil, 0, 0, "", err
+		return nil, 0, 0, "", "", err
 	}
 	// Ensure the server sees EOF so it can finish io.ReadAll.
 	_ = conn.CloseWrite()
 	respData, err := io.ReadAll(conn)
 	if err != nil {
-		return nil, 0, 0, "", err
+		return nil, 0, 0, "", "", err
 	}
 	var resp common.ControlResponse
 	if err := resp.Unmarshal(respData); err != nil {
-		return nil, 0, 0, "", err
+		return nil, 0, 0, "", "", err
 	}
 	key, err := common.DecodeKeyBase64(resp.SessionKey)
 	if err != nil {
-		return nil, 0, 0, "", err
+		return nil, 0, 0, "", "", err
 	}
-	return key, resp.SessionID, resp.UDPPort, resp.ClientIP, nil
+	return key, resp.SessionID, resp.UDPPort, resp.ClientIP, resp.ClientIPv6, nil
+}
+
+// addIPv6CIDR appends /64 to a bare IPv6 address.
+func addIPv6CIDR(ip string) string {
+	if ip == "" {
+		return ""
+	}
+	if strings.Contains(ip, "/") {
+		return ip
+	}
+	return ip + "/64"
 }
 
 // classifyTLSError maps low-level TLS/x509/timeout errors to user-friendly messages.

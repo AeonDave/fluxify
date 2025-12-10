@@ -20,15 +20,12 @@ func CompressPayload(data []byte) (out []byte, err error) {
 	if err != nil {
 		return nil, err
 	}
-	// Ensure the writer is always closed to avoid resource leaks; propagate Close error
-	// only if no previous error occurred.
-	defer func() {
-		if e := zw.Close(); err == nil && e != nil {
-			err = e
-		}
-	}()
-
 	if _, err = zw.Write(data); err != nil {
+		_ = zw.Close()
+		return nil, err
+	}
+	// Close before reading buffer to ensure trailer is flushed into the slice we return.
+	if err := zw.Close(); err != nil {
 		return nil, err
 	}
 	return buf.Bytes(), nil

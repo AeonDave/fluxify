@@ -11,6 +11,8 @@ type TUNConfig struct {
 	CIDR        string
 	MTU         int
 	GatewayCIDR string // optional for server
+	IPv6CIDR    string
+	IPv6Gateway string
 }
 
 // ConfigureTUN brings up the TUN interface with IP/MTU. Linux only; Windows/mac not supported in this minimal pass.
@@ -20,12 +22,22 @@ func ConfigureTUN(cfg TUNConfig) error {
 	}
 	commands := [][]string{
 		{"ip", "addr", "flush", "dev", cfg.IfaceName},
-		{"ip", "addr", "add", cfg.CIDR, "dev", cfg.IfaceName},
-		{"ip", "link", "set", "dev", cfg.IfaceName, "up"},
-		{"ip", "link", "set", "dev", cfg.IfaceName, "mtu", fmt.Sprintf("%d", cfg.MTU)},
 	}
+	if cfg.CIDR != "" {
+		commands = append(commands, []string{"ip", "addr", "add", cfg.CIDR, "dev", cfg.IfaceName})
+	}
+	if cfg.IPv6CIDR != "" {
+		commands = append(commands, []string{"ip", "-6", "addr", "add", cfg.IPv6CIDR, "dev", cfg.IfaceName})
+	}
+	commands = append(commands,
+		[]string{"ip", "link", "set", "dev", cfg.IfaceName, "up"},
+		[]string{"ip", "link", "set", "dev", cfg.IfaceName, "mtu", fmt.Sprintf("%d", cfg.MTU)},
+	)
 	if cfg.GatewayCIDR != "" {
 		commands = append(commands, []string{"ip", "route", "replace", cfg.GatewayCIDR, "dev", cfg.IfaceName})
+	}
+	if cfg.IPv6Gateway != "" {
+		commands = append(commands, []string{"ip", "-6", "route", "replace", cfg.IPv6Gateway, "dev", cfg.IfaceName})
 	}
 	for _, cmd := range commands {
 		out, err := RunPrivilegedCombined(cmd[0], cmd[1:]...)

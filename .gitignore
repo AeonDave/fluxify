@@ -1,8 +1,8 @@
 .idea
+.env
 *.iml
 *.ipr
 *.iws
-out/
 *.exe
 *.exe~
 *.dll
@@ -12,4 +12,6 @@ out/
 *.out
 go.work
 go.work.sum
-.env
+out/
+client/client
+server/server

@@ -103,6 +103,83 @@ func SetDefaultRouteDev(dev string) error {
 	return RunPrivileged("ip", "route", "replace", "default", "dev", dev)
 }
 
+// GetDefaultRoute6 returns the IPv6 default route line along with via/dev (Linux only).
+// If no default route is found, via/dev are empty.
+func GetDefaultRoute6() (line, via, dev string, err error) {
+	if runtime.GOOS != "linux" {
+		return "", "", "", nil
+	}
+	out, err := exec.Command("ip", "-6", "route", "show", "default").Output()
+	if err != nil {
+		return "", "", "", err
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		return "", "", "", nil
+	}
+	line = strings.TrimSpace(lines[0])
+	fields := strings.Fields(line)
+	for i := 0; i < len(fields)-1; i++ {
+		if fields[i] == "via" {
+			via = fields[i+1]
+		}
+		if fields[i] == "dev" {
+			dev = fields[i+1]
+		}
+	}
+	return line, via, dev, nil
+}
+
+// ReplaceDefaultRoute6 replaces the IPv6 default route using the full route fields (Linux only).
+func ReplaceDefaultRoute6(line string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return fmt.Errorf("empty route line")
+	}
+	args := append([]string{"-6", "route", "replace"}, strings.Fields(line)...)
+	return RunPrivileged("ip", args...)
+}
+
+// SetDefaultRouteDev6 replaces the IPv6 default route to point to the given device (Linux only).
+func SetDefaultRouteDev6(dev string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if dev == "" {
+		return fmt.Errorf("device required")
+	}
+	return RunPrivileged("ip", "-6", "route", "replace", "default", "dev", dev)
+}
+
+// EnsureHostRoute6 ensures a host route via the given gateway/device (Linux only).
+func EnsureHostRoute6(ip, via, dev string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if ip == "" || dev == "" {
+		return fmt.Errorf("ip and dev required")
+	}
+	args := []string{"-6", "route", "replace", ip, "dev", dev}
+	if via != "" {
+		args = []string{"-6", "route", "replace", ip, "via", via, "dev", dev}
+	}
+	return RunPrivileged("ip", args...)
+}
+
+// DeleteHostRoute6 removes an IPv6 host route if present (best-effort, Linux only).
+func DeleteHostRoute6(ip string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if ip == "" {
+		return nil
+	}
+	return RunPrivileged("ip", "-6", "route", "del", ip)
+}
+
 // EnsureHostRoute ensures a host route via the given gateway/device (Linux only).
 func EnsureHostRoute(ip, via, dev string) error {
 	if runtime.GOOS != "linux" {

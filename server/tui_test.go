@@ -48,6 +48,9 @@ func TestDownloadClientCertFallsBackToAny(t *testing.T) {
 	if err := os.MkdirAll(pki.ClientsDir, 0o700); err != nil {
 		t.Fatalf("mkdir clients: %v", err)
 	}
+	if err := os.WriteFile(pki.CACert, []byte("dummy-ca"), 0o600); err != nil {
+		t.Fatalf("write ca: %v", err)
+	}
 	certPath := filepath.Join(pki.ClientsDir, "bob.pem")
 	keyPath := filepath.Join(pki.ClientsDir, "bob-key.pem")
 	if err := os.WriteFile(certPath, []byte("dummy-cert"), 0o600); err != nil {

@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"fluxify/common"
@@ -54,6 +55,7 @@ func startTempControlServer(t *testing.T, pki common.PKIPaths) (addr string, sto
 					SessionKey: common.EncodeKeyBase64(key),
 					UDPPort:    7777,
 					ClientIP:   "10.8.0.2",
+					ClientIPv6: "fd00:8:0::2",
 				}
 				b, _ := resp.Marshal()
 				_, _ = conn.Write(b)
@@ -90,12 +92,17 @@ func TestFetchSessionEndToEnd(t *testing.T) {
 	defer stop()
 
 	cfg := clientConfig{Server: addr, PKI: pki.Dir, Client: "bob", Ctrl: 0}
-	key, sessID, udpPort, clientIP, err := fetchSession(addr, cfg)
+	key, sessID, udpPort, clientIP, clientIPv6, err := fetchSession(addr, cfg)
 	if err != nil {
 		t.Fatalf("fetchSession: %v", err)
 	}
 	if sessID == 0 || udpPort != 7777 || clientIP == "" {
 		t.Fatalf("unexpected response: id=%d udp=%d ip=%s", sessID, udpPort, clientIP)
+	}
+	if clientIPv6 != "" {
+		if !strings.HasPrefix(clientIPv6, "fd00:") {
+			t.Fatalf("unexpected ipv6: %s", clientIPv6)
+		}
 	}
 	if len(key) != common.SessionKeySize {
 		t.Fatalf("key size mismatch: %d", len(key))
@@ -113,7 +120,7 @@ func TestFetchSessionRejectsWithoutCert(t *testing.T) {
 
 	// Missing client cert/key should fail during tls.Dial
 	cfg := clientConfig{Server: addr, PKI: pki.Dir, Client: "missing", Ctrl: 0}
-	if _, _, _, _, err := fetchSession(addr, cfg); err == nil {
+	if _, _, _, _, _, err := fetchSession(addr, cfg); err == nil {
 		t.Fatalf("expected error without client cert")
 	}
 }

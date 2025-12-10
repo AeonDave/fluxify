@@ -14,6 +14,7 @@ type ControlResponse struct {
 	SessionKey string `json:"session_key"`
 	UDPPort    int    `json:"udp_port"`
 	ClientIP   string `json:"client_ip"`
+	ClientIPv6 string `json:"client_ip6,omitempty"`
 }
 
 func (r ControlRequest) Marshal() ([]byte, error) {
