@@ -25,6 +25,7 @@ type serverConn struct {
 
 type serverSession struct {
 	id          uint32
+	name        string
 	conns       []*serverConn
 	connMu      sync.RWMutex
 	clientIP    net.IP // 10.8.0.X assigned
@@ -34,9 +35,10 @@ type serverSession struct {
 	lastSeen    atomic.Int64 // nanos
 }
 
-func newServerSession(id uint32, key []byte, ip4, ip6 net.IP) *serverSession {
+func newServerSession(id uint32, name string, key []byte, ip4, ip6 net.IP) *serverSession {
 	sess := &serverSession{
 		id:         id,
+		name:       name,
 		key:        key,
 		clientIP:   ip4,
 		clientIPv6: ip6,

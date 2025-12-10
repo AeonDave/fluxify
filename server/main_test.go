@@ -16,7 +16,7 @@ func TestSendToSessionSelectsLowestRTT(t *testing.T) {
 		t.Fatalf("gen key: %v", err)
 	}
 
-	sess := newServerSession(42, key, nil, nil)
+	sess := newServerSession(42, "test", key, nil, nil)
 
 	recvFast, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
@@ -103,7 +103,7 @@ func TestHandlePacketHeartbeatEcho(t *testing.T) {
 	if err != nil {
 		t.Fatalf("gen key: %v", err)
 	}
-	sess := newServerSession(7, key, nil, nil)
+	sess := newServerSession(7, "test", key, nil, nil)
 
 	clientRecv, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {

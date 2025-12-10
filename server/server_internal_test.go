@@ -36,7 +36,7 @@ func TestAssignClientIPsWrapsAfter250(t *testing.T) {
 
 func TestRegisterSessionSkipsNilIPs(t *testing.T) {
 	s := NewServer(0, 0, "", common.DefaultPKI("./pki"), false)
-	sess := newServerSession(1, []byte("k"), net.IPv4(10, 8, 0, 2), nil)
+	sess := newServerSession(1, "test", []byte("k"), net.IPv4(10, 8, 0, 2), nil)
 	s.registerSession(sess)
 
 	if len(s.ipToSession) != 1 {

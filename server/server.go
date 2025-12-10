@@ -30,9 +30,10 @@ type Server struct {
 	pki       common.PKIPaths
 	verbose   bool
 
-	sessions    map[uint32]*serverSession
-	ipToSession map[string]*serverSession // Map "10.8.0.x" or "fd00::x" -> Session
-	sessMu      sync.RWMutex
+	sessions       map[uint32]*serverSession
+	ipToSession    map[string]*serverSession // Map "10.8.0.x" or "fd00::x" -> Session
+	clientSessions map[string]*serverSession // Map "clientName" -> Session
+	sessMu         sync.RWMutex
 
 	nextIPOctet atomic.Uint32
 
@@ -53,15 +54,16 @@ type outboundJob struct {
 
 func NewServer(port, ctrlPort int, iface string, pki common.PKIPaths, verbose bool) *Server {
 	return &Server{
-		port:        port,
-		ctrlPort:    ctrlPort,
-		ifaceName:   iface,
-		pki:         pki,
-		verbose:     verbose,
-		sessions:    make(map[uint32]*serverSession),
-		ipToSession: make(map[string]*serverSession),
-		tunWriteCh:  make(chan []byte, 512),
-		outboundCh:  make(chan *outboundJob, 512),
+		port:           port,
+		ctrlPort:       ctrlPort,
+		ifaceName:      iface,
+		pki:            pki,
+		verbose:        verbose,
+		sessions:       make(map[uint32]*serverSession),
+		ipToSession:    make(map[string]*serverSession),
+		clientSessions: make(map[string]*serverSession),
+		tunWriteCh:     make(chan []byte, 512),
+		outboundCh:     make(chan *outboundJob, 512),
 	}
 }
 
@@ -91,7 +93,7 @@ func (s *Server) Start() error {
 	}
 	_ = ensureNatRule()
 	_ = ensureNatRule6()
-	enableIPv6Forwarding()
+	enableForwarding()
 
 	// Setup UDP
 	udpAddr := &net.UDPAddr{Port: s.port}
@@ -137,6 +139,7 @@ func (s *Server) Start() error {
 func (s *Server) tunWriteLoop() {
 	defer s.wg.Done()
 	for data := range s.tunWriteCh {
+		s.logDebug("TUN write: %d bytes", len(data))
 		if _, err := s.tun.Write(data); err != nil {
 			log.Printf("tun write error: %v", err)
 		}
@@ -349,6 +352,9 @@ func (s *Server) registerSession(sess *serverSession) {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 	s.sessions[sess.id] = sess
+	if sess.name != "" {
+		s.clientSessions[sess.name] = sess
+	}
 	if sess.clientIP != nil {
 		s.ipToSession[sess.clientIP.String()] = sess
 	}
@@ -432,8 +438,28 @@ func (s *Server) handleControl(conn net.Conn) {
 		return
 	}
 
-	clientIP, clientIPv6 := s.assignClientIPs()
-	sess := newServerSession(sessID, key, clientIP, clientIPv6)
+	var clientIP, clientIPv6 net.IP
+
+	s.sessMu.Lock()
+	if old, ok := s.clientSessions[req.ClientName]; ok {
+		clientIP = old.clientIP
+		clientIPv6 = old.clientIPv6
+		// Delete old session to prevent ghosts
+		delete(s.sessions, old.id)
+		delete(s.clientSessions, req.ClientName)
+		if old.clientIP != nil {
+			delete(s.ipToSession, old.clientIP.String())
+		}
+		if old.clientIPv6 != nil {
+			delete(s.ipToSession, old.clientIPv6.String())
+		}
+		log.Printf("Replaced session for %s (old_id=%d) reusing IP=%s", req.ClientName, old.id, clientIP)
+	} else {
+		clientIP, clientIPv6 = s.assignClientIPs()
+	}
+	s.sessMu.Unlock()
+
+	sess := newServerSession(sessID, req.ClientName, key, clientIP, clientIPv6)
 	s.registerSession(sess)
 
 	resp := common.ControlResponse{
@@ -479,8 +505,11 @@ func (s *Server) pruneSessions() {
 
 	for id, sess := range s.sessions {
 		if sess.isIdle() {
-			log.Printf("Session idle/expired: %d (IP: %s)", id, sess.clientIP)
+			log.Printf("Session idle/expired: %s (id=%d) IP=%s", sess.name, id, sess.clientIP)
 			delete(s.sessions, id)
+			if sess.name != "" {
+				delete(s.clientSessions, sess.name)
+			}
 			if sess.clientIP != nil {
 				delete(s.ipToSession, sess.clientIP.String())
 			}
@@ -515,6 +544,7 @@ func ensureNatRule6() error {
 	return exec.Command("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-s", "fd00:8:0::/64", "-j", "MASQUERADE").Run()
 }
 
-func enableIPv6Forwarding() {
+func enableForwarding() {
+	_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
 	_ = exec.Command("sysctl", "-w", "net.ipv6.conf.all.forwarding=1").Run()
 }
