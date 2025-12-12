@@ -7,12 +7,22 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
+
+	"os/user"
+	"runtime"
+
+	"fluxify/common"
+
+	"runtime/debug"
+	"time"
 
 	"github.com/rivo/tview"
 )
@@ -34,13 +44,28 @@ func splitCSV(s string) []string {
 }
 
 func main() {
+	// Global panic handler to keep window open and log error
+	defer func() {
+		if r := recover(); r != nil {
+			msg := fmt.Sprintf("PANIC: %v\nStack:\n%s", r, debug.Stack())
+			fmt.Fprintln(os.Stderr, msg)
+			// Try to write to a file in the same directory
+			if exe, err := os.Executable(); err == nil {
+				logFile := filepath.Join(filepath.Dir(exe), "client_panic.log")
+				_ = os.WriteFile(logFile, []byte(msg), 0644)
+			}
+			fmt.Println("Application crashed. Keeping window open for 60s...")
+			time.Sleep(60 * time.Second)
+			os.Exit(1)
+		}
+	}()
+
 	server := flag.String("server", "", "server host:port (optional, overridden by TUI)")
 	ifacesStr := flag.String("ifaces", "", "comma-separated interface names (optional)")
 	localIPs := flag.String("ips", "", "comma-separated source IPs (optional)")
 	nconns := flag.Int("conns", 2, "number of parallel UDP conns")
 	bondingFlag := flag.Bool("b", false, "force bonding mode")
 	loadBalanceFlag := flag.Bool("l", false, "force load-balance mode")
-	tuiAutoStart := flag.Bool("tui-autostart", false, "internal: launch TUI and auto-start (used after elevation)")
 	pkiDir := flag.String("pki", "", "PKI directory (defaults to ~/.fluxify)")
 	clientName := flag.String("client", "", "client certificate name (CN)")
 	ctrlPort := flag.Int("ctrl", 8443, "control TLS port")
@@ -65,7 +90,7 @@ func main() {
 		Gateways:      splitCSV(*gateways),
 	}
 
-	// If -pki was explicitly provided, don't let stored config override it (important for elevated relaunch)
+	// If -pki was explicitly provided, don't let stored config override it.
 	pkiFromCLI := *pkiDir != ""
 	initialCfg = mergeWithStoredConfig(initialCfg, pkiFromCLI)
 	if *loadBalanceFlag {
@@ -74,19 +99,21 @@ func main() {
 		initialCfg.Mode = modeBonding
 	}
 
+	// Client must be started with elevated privileges on supported platforms.
+	if runtime.GOOS == "windows" && !common.IsRoot() {
+		log.Fatalf("run the client as administrator on windows")
+	}
+	if runtime.GOOS == "linux" && !common.IsRoot() {
+		log.Fatalf("run the client with sudo/root on linux")
+	}
+
 	if err := ensureConfigAndPKI(initialCfg.PKI); err != nil {
 		log.Fatalf("ensure base dirs: %v", err)
 	}
 
-	// If launched with --tui-autostart (after elevation), go to TUI with auto-start
-	if *tuiAutoStart {
-		runTUI(initialCfg, true)
-		return
-	}
-
 	autoMode := *loadBalanceFlag || *bondingFlag
 	if !autoMode {
-		runTUI(initialCfg, false)
+		runTUI(initialCfg)
 		return
 	}
 
@@ -138,7 +165,7 @@ func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI bool) clientConfig {
 		if stored.Client != "" {
 			cfg.Client = stored.Client
 		}
-		// Only use stored PKI if CLI didn't explicitly provide one (crucial for elevated relaunch)
+		// Only use stored PKI if CLI didn't explicitly provide one.
 		if stored.PKI != "" && !pkiFromCLI {
 			cfg.PKI = stored.PKI
 		}
@@ -151,7 +178,7 @@ func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI bool) clientConfig {
 	}
 	// Normalize legacy /pki suffix to flat layout
 	cfg.PKI = normalizePKIPath(cfg.PKI)
-	// Expand to absolute path so pkexec relaunch continues to use the original user's PKI dir.
+	// Expand to absolute path for consistent config usage.
 	cfg.PKI = expandPath(cfg.PKI)
 	return cfg
 }
@@ -188,6 +215,7 @@ func saveStoredConfig(sc storedConfig) {
 		return
 	}
 	_ = os.WriteFile(path, b, 0o600)
+	chownToSudoUser(path)
 }
 
 func configFilePath() (string, error) {
@@ -199,6 +227,15 @@ func configFilePath() (string, error) {
 }
 
 func userConfigDir() (string, error) {
+	// If running as root on Linux via sudo, preserve the original user's config dir
+	if runtime.GOOS == "linux" && common.IsRoot() {
+		if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+			if u, err := user.Lookup(sudoUser); err == nil {
+				return filepath.Join(u.HomeDir, ".fluxify"), nil
+			}
+		}
+	}
+
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
@@ -240,7 +277,81 @@ func ensureConfigAndPKI(pkiDir string) error {
 	if pkiDir == "" {
 		pkiDir = defaultPKIDir()
 	}
-	return os.MkdirAll(expandPath(pkiDir), 0o700)
+	pkiPath := expandPath(pkiDir)
+	if err := os.MkdirAll(pkiPath, 0o700); err != nil {
+		return err
+	}
+	chownToSudoUser(base, pkiPath)
+	return nil
+}
+
+// chownToSudoUser makes config/PKI paths owned by the original sudo user.
+// It is best-effort and only applies on Linux when running as root via sudo.
+func chownToSudoUser(paths ...string) {
+	if runtime.GOOS != "linux" || !common.IsRoot() {
+		return
+	}
+	sudoUser := os.Getenv("SUDO_USER")
+	if sudoUser == "" {
+		return
+	}
+	u, err := user.Lookup(sudoUser)
+	if err != nil {
+		log.Printf("chown: lookup sudo user %s failed: %v", sudoUser, err)
+		return
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		log.Printf("chown: invalid uid %q: %v", u.Uid, err)
+		return
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		log.Printf("chown: invalid gid %q: %v", u.Gid, err)
+		return
+	}
+	home := filepath.Clean(u.HomeDir)
+	seen := make(map[string]bool)
+	for _, p := range paths {
+		if p == "" {
+			continue
+		}
+		cp := filepath.Clean(p)
+		if seen[cp] {
+			continue
+		}
+		seen[cp] = true
+		if !pathWithinHome(cp, home) {
+			log.Printf("chown: skipping %s (outside %s)", cp, home)
+			continue
+		}
+		if _, err := os.Stat(cp); err != nil {
+			continue
+		}
+		_ = filepath.WalkDir(cp, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if derr := os.Chown(path, uid, gid); derr != nil {
+				log.Printf("chown: %s: %v", path, derr)
+			}
+			return nil
+		})
+	}
+}
+
+func pathWithinHome(p, home string) bool {
+	rel, err := filepath.Rel(home, p)
+	if err != nil {
+		return false
+	}
+	if rel == "." {
+		return true
+	}
+	if rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
 // detectClientCertName scans pkiDir for a single bundle .pem containing cert+key.

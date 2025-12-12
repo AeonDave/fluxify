@@ -23,24 +23,14 @@ import (
 )
 
 func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
+	if runtime.GOOS == "windows" && !common.IsRoot() {
+		return nil, nil, fmt.Errorf("run the client as administrator on windows to create the TUN interface")
+	}
+	if runtime.GOOS == "linux" && !common.IsRoot() {
+		return nil, nil, fmt.Errorf("run the client with sudo/root on linux to create the TUN interface")
+	}
 	if cfg.Client == "" {
 		return nil, nil, fmt.Errorf("client name required")
-	}
-	// Bonding requires TUN device which needs root
-	if common.NeedsElevation() {
-		log.Printf("bonding: TUN requires root, requesting elevation...")
-		pkiPath := expandPath(cfg.PKI)
-		extraArgs := []string{
-			"-b", // force bonding mode
-			"-server", cfg.Server,
-			"-ifaces", strings.Join(cfg.Ifaces, ","),
-			"-client", cfg.Client,
-			"-pki", pkiPath,
-		}
-		if err := common.RelaunchWithPkexec(extraArgs...); err != nil {
-			return nil, nil, fmt.Errorf("elevation required for TUN: %w", err)
-		}
-		return nil, nil, fmt.Errorf("elevation failed")
 	}
 	log.Printf("bonding: starting with client=%s server=%s pki=%s", cfg.Client, cfg.Server, cfg.PKI)
 	ctrlHost, ctrlPort, err := parseServerAddr(cfg.Server, cfg.Ctrl)
@@ -301,7 +291,7 @@ func (c *clientState) processAndSend(data []byte) {
 	// Compression
 	compressed := data
 	compressFlag := common.CompressionNone
-	
+
 	// Try compression into a new buffer
 	compBuf := common.GetBuffer()
 	if comp, err := common.CompressPayloadInto(compBuf, data); err == nil {
@@ -327,16 +317,16 @@ func (c *clientState) processAndSend(data []byte) {
 
 	head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketIP, SessionID: c.sessionID, SeqNum: seq, Length: uint16(len(compressed))}
 	head.Reserved[0] = byte(compressFlag)
-	
+
 	// Encrypt into new packet buffer
 	pktBuf := common.GetBuffer()
 	defer common.PutBuffer(pktBuf)
-	
+
 	pkt, err := common.EncryptPacketInto(pktBuf, c.sessionKey, head, compressed)
 	if err != nil {
 		return
 	}
-	
+
 	cc.mu.Lock()
 	_, _ = cc.udp.Write(pkt)
 	cc.mu.Unlock()
@@ -409,7 +399,7 @@ func (c *clientState) heartbeat() {
 		for _, cc := range c.conns {
 			if !cc.alive.Load() {
 				// try one ping to see if it comes back
-				// or maybe we rely on generic traffic? 
+				// or maybe we rely on generic traffic?
 				// The original code sent heartbeat to all.
 			}
 			head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketHeartbeat, SessionID: c.sessionID, SeqNum: 0, Length: uint16(len(payload))}

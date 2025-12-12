@@ -131,12 +131,13 @@ Notes on PKI layout and server vs client:
 
 - The server maintains a PKI tree (default `./pki`) and can store multiple client certs; the server TUI and tooling manage multiple client entries.
 - The client expects a simple, flat PKI directory (`~/.fluxify`) with ca+cert+key bundle.
-- If you pass `-pki` on the client CLI, that explicit value takes precedence and will not be overwritten by any stored config when the client is relaunched under elevation.
+- If you pass `-pki` on the client CLI, that explicit value takes precedence over stored config.
 
 ## Operational Notes
 
-- Linux will prompt for elevation (sudo) when configuring routes/TUN/iptables if not already root.
-  - Elevation flow: when you start the client without flags the TUI runs unprivileged. If you click Start for bonding and root privileges are required, the TUI will suspend and the client will relaunch via `pkexec`/`sudo` to perform privileged actions. The elevated process will return to the TUI (auto-start mode) so you continue to see stats in the UI — the client no longer forces a terminal-only CLI mode after elevation.
+- Client and server must be started with elevated privileges; no automatic relaunch/elevation is performed.
+  - Linux: run with `sudo` (e.g., `sudo ./client`, `sudo ./server`).
+  - Windows: run as Administrator (UAC prompt at launch).
 - The data plane is UDP; TCP-over-UDP avoids TCP-over-TCP head-of-line issues. AES-GCM protects both header integrity (as AAD) and payload confidentiality.
 - No reorder buffer is implemented; higher-layer TCP handles reordering. Heartbeats run every 2s to update RTT for scheduling.
 - Compression is opportunistic; large incompressible payloads are sent uncompressed.
@@ -155,7 +156,7 @@ Notes on PKI layout and server vs client:
 3. **Client run (TUI recommended):**
 
    ```bash
-   ./client -server SERVER_IP:8443 -client alice -pki ~/.fluxify -conns 2
+   sudo ./client -server SERVER_IP:8443 -client alice -pki ~/.fluxify -conns 2
    ```
 
    In the TUI, select mode (bonding/load-balance), pick at least two interfaces, ensure server is set for bonding, then Start.

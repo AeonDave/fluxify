@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package main
 
 import (
@@ -92,5 +95,56 @@ func TestControlServerIssuesSession(t *testing.T) {
 	// session stored
 	if got := st.getSession(resp.SessionID); got == nil {
 		t.Fatalf("session not stored")
+	}
+}
+
+func TestControlServerUsesCertCNWhenClientNameEmpty(t *testing.T) {
+	dir := t.TempDir()
+	pki := common.DefaultPKI(filepath.Join(dir, "pki"))
+	if err := common.EnsureBasePKI(pki, []string{"127.0.0.1", "localhost"}, false); err != nil {
+		t.Fatalf("ensure pki: %v", err)
+	}
+	if _, _, err := common.GenerateClientCert(pki, "alice", false); err != nil {
+		t.Fatalf("gen client: %v", err)
+	}
+
+	st := NewServer(9999, 0, "", pki, false)
+	addr, stop := startTestControlServer(t, st, pki)
+	defer stop()
+
+	tlsCfg, err := common.ClientTLSConfig(pki,
+		filepath.Join(pki.ClientsDir, "alice.pem"),
+		filepath.Join(pki.ClientsDir, "alice-key.pem"))
+	if err != nil {
+		t.Fatalf("client tls config: %v", err)
+	}
+	conn, err := tls.Dial("tcp", addr, tlsCfg)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Empty ClientName should fall back to certificate CN.
+	req := common.ControlRequest{}
+	b, _ := req.Marshal()
+	if _, err := conn.Write(b); err != nil {
+		t.Fatalf("write req: %v", err)
+	}
+	_ = conn.CloseWrite()
+
+	respBytes := make([]byte, 4096)
+	n, err := conn.Read(respBytes)
+	if err != nil {
+		t.Fatalf("read resp: %v", err)
+	}
+	var resp common.ControlResponse
+	if err := resp.Unmarshal(respBytes[:n]); err != nil {
+		t.Fatalf("unmarshal resp: %v", err)
+	}
+	if resp.SessionID == 0 {
+		t.Fatalf("expected session id")
+	}
+	if st.clientSessions["alice"] == nil {
+		t.Fatalf("expected session registered under CN alice")
 	}
 }

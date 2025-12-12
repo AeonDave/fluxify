@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package main
 
 import (
@@ -22,8 +25,8 @@ func main() {
 	verbose := flag.Bool("v", false, "enable verbose debug logging")
 	flag.Parse()
 
-	if os.Geteuid() != 0 {
-		log.Println("Run as root for TUN/NAT setup")
+	if !common.IsRoot() {
+		log.Fatalf("run the server with sudo/root on linux for TUN/NAT setup")
 	}
 
 	pki := common.DefaultPKI(*pkiDir)

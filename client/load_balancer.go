@@ -5,16 +5,39 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
-	"strconv"
+	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/rivo/tview"
 
+	"fluxify/client/platform"
 	"fluxify/common"
 )
+
+// recoverPanic is a helper to recover from panics in goroutines
+func recoverPanic(name string) {
+	if r := recover(); r != nil {
+		msg := fmt.Sprintf("PANIC in %s: %v\nStack:\n%s", name, r, debug.Stack())
+		log.Printf("%s", msg) // Attempt to log to TUI/stderr
+		// Try to write to a file
+		if exe, err := os.Executable(); err == nil {
+			logFile := filepath.Join(filepath.Dir(exe), "client_panic.log")
+			f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if f != nil {
+				fmt.Fprintf(f, "\n%s\n%s\n", time.Now().Format(time.RFC3339), msg)
+				f.Close()
+			}
+		}
+		// We can't keep the window open easily from a background goroutine panic,
+		// but at least we logged it.
+		// Force exit to ensure we don't hang in undefined state
+		os.Exit(1)
+	}
+}
 
 type uplink struct {
 	iface   string
@@ -65,7 +88,7 @@ type cmdRunner interface {
 type sysRunner struct{}
 
 func (sysRunner) Run(name string, args ...string) error {
-	return common.RunPrivileged(name, args...)
+	return common.RunPrivilegedSilent(name, args...)
 }
 
 func (sysRunner) Output(name string, args ...string) ([]byte, error) {
@@ -73,12 +96,23 @@ func (sysRunner) Output(name string, args ...string) ([]byte, error) {
 }
 
 func (sysRunner) OutputSafe(name string, args ...string) ([]byte, error) {
-	return exec.Command(name, args...).Output()
+	return common.RunPrivilegedOutput(name, args...)
 }
 
 var runner cmdRunner = sysRunner{}
 
+var (
+	// healthCheckInterval controls how often uplinks are probed.
+	// Tests override this to keep suites fast.
+	healthCheckInterval = 5 * time.Second
+	// healthFailThreshold is the consecutive-failure count to mark a family down.
+	healthFailThreshold = 3
+)
+
 func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, app *tview.Application) (func(), error) {
+	if runtime.GOOS == "windows" && !common.IsRoot() {
+		return nil, fmt.Errorf("run the client as administrator on windows to configure routes")
+	}
 	if len(cfg.Ifaces) < 2 {
 		return nil, fmt.Errorf("need at least 2 interfaces for load-balance")
 	}
@@ -149,6 +183,8 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// Show initial stats immediately so the UI doesn't stay on the placeholder.
+	updateLBStats(ups)
 	go healthMonitor(ctx, ups)
 	if statsView != nil && app != nil {
 		go statsUpdater(ctx, ups, app)
@@ -176,6 +212,7 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 }
 
 func statsUpdater(ctx context.Context, ups *uplinkSet, app *tview.Application) {
+	defer recoverPanic("statsUpdater")
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -232,7 +269,7 @@ func refreshInterfaceStats(ups *uplinkSet) {
 	ups.mu.Lock()
 	defer ups.mu.Unlock()
 	for i := range ups.list {
-		rx, tx, err := readInterfaceBytes(ups.list[i].iface)
+		rx, tx, err := platform.ReadInterfaceBytes(ups.list[i].iface)
 		if err != nil {
 			continue
 		}
@@ -249,38 +286,18 @@ func refreshInterfaceStats(ups *uplinkSet) {
 	}
 }
 
-func readInterfaceBytes(iface string) (rx, tx uint64, err error) {
-	read := func(path string) (uint64, error) {
-		b, e := os.ReadFile(path)
-		if e != nil {
-			return 0, e
-		}
-		v, e := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
-		if e != nil {
-			return 0, e
-		}
-		return v, nil
-	}
-	rx, err = read(fmt.Sprintf("/sys/class/net/%s/statistics/rx_bytes", iface))
-	if err != nil {
-		return
-	}
-	tx, err = read(fmt.Sprintf("/sys/class/net/%s/statistics/tx_bytes", iface))
-	return
-}
-
 func discoverGateways(ifaces []string) ([]uplink, error) {
 	uplinks := make([]uplink, 0)
 	for _, ifc := range ifaces {
 		if strings.TrimSpace(ifc) == "" {
 			continue
 		}
-		gw, err := gatewayForIface(ifc)
+		gw, err := platform.GatewayForIface(runner, ifc)
 		if err != nil {
 			log.Printf("gateway lookup failed for %s: %v", ifc, err)
 			continue
 		}
-		gw6, err := gatewayForIface6(ifc)
+		gw6, err := platform.GatewayForIface6(runner, ifc)
 		if err != nil {
 			log.Printf("gateway6 lookup failed for %s: %v", ifc, err)
 		}
@@ -293,102 +310,90 @@ func discoverGateways(ifaces []string) ([]uplink, error) {
 	return uplinks, nil
 }
 
-func gatewayForIface(iface string) (string, error) {
-	out, err := runner.OutputSafe("ip", "route", "get", "8.8.8.8", "oif", iface)
-	if err != nil {
-		return "", err
+func toPlatformUplinks(us []uplink) []platform.Uplink {
+	out := make([]platform.Uplink, 0, len(us))
+	for _, u := range us {
+		out = append(out, platform.Uplink{
+			Iface:  u.iface,
+			Gw:     u.gw,
+			Gw6:    u.gw6,
+			Alive4: u.alive4,
+			Alive6: u.alive6,
+		})
 	}
-	fields := strings.Fields(string(out))
-	for i := 0; i < len(fields)-1; i++ {
-		if fields[i] == "via" {
-			return fields[i+1], nil
-		}
-	}
-	return "", nil
-}
-
-func gatewayForIface6(iface string) (string, error) {
-	out, err := runner.OutputSafe("ip", "-6", "route", "get", "2001:4860:4860::8888", "oif", iface)
-	if err != nil {
-		return "", err
-	}
-	fields := strings.Fields(string(out))
-	for i := 0; i < len(fields)-1; i++ {
-		if fields[i] == "via" {
-			return fields[i+1], nil
-		}
-	}
-	return "", nil
+	return out
 }
 
 func installMultipathDefault(uplinks []uplink) error {
-	args := []string{"route", "replace", "default", "scope", "global"}
-	for _, u := range uplinks {
-		if !u.alive4 || u.gw == "" {
-			continue
-		}
-		args = append(args, "nexthop", "via", u.gw, "dev", u.iface, "weight", "1")
-	}
-	if len(args) == 5 { // no nexthops added
-		return fmt.Errorf("no alive uplinks to install")
-	}
-	return runner.Run("ip", args...)
+	return platform.InstallMultipathDefault(runner, toPlatformUplinks(uplinks))
 }
 
 func installMultipathDefault6(uplinks []uplink) error {
-	args := []string{"-6", "route", "replace", "default"}
-	for _, u := range uplinks {
-		if !u.alive6 || u.gw6 == "" {
-			continue
-		}
-		args = append(args, "nexthop", "via", u.gw6, "dev", u.iface, "weight", "1")
-	}
-	if len(args) == 4 {
-		return fmt.Errorf("no alive ipv6 uplinks to install")
-	}
-	return runner.Run("ip", args...)
+	return platform.InstallMultipathDefault6(runner, toPlatformUplinks(uplinks))
 }
 
 func addMasqueradeRules(uplinks []uplink) error {
-	for _, u := range uplinks {
-		if err := runner.Run("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", u.iface, "-j", "MASQUERADE"); err != nil {
-			return fmt.Errorf("iptables add %s: %w", u.iface, err)
-		}
-	}
-	return nil
+	return platform.AddMasqueradeRules(runner, toPlatformUplinks(uplinks))
 }
 
 func addMasqueradeRules6(uplinks []uplink) error {
-	for _, u := range uplinks {
-		if u.gw6 == "" {
-			continue
-		}
-		if err := runner.Run("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-o", u.iface, "-j", "MASQUERADE"); err != nil {
-			return fmt.Errorf("ip6tables add %s: %w", u.iface, err)
-		}
-	}
-	return nil
+	return platform.AddMasqueradeRules6(runner, toPlatformUplinks(uplinks))
 }
 
 func removeMasqueradeRules(uplinks []uplink) error {
-	for _, u := range uplinks {
-		_ = runner.Run("iptables", "-t", "nat", "-D", "POSTROUTING", "-o", u.iface, "-j", "MASQUERADE")
-	}
-	return nil
+	return platform.RemoveMasqueradeRules(runner, toPlatformUplinks(uplinks))
 }
 
 func removeMasqueradeRules6(uplinks []uplink) error {
-	for _, u := range uplinks {
-		if u.gw6 == "" {
-			continue
+	return platform.RemoveMasqueradeRules6(runner, toPlatformUplinks(uplinks))
+}
+
+// updateUplinkAfterPing updates a single uplink's health for v4 or v6 based on ping success.
+// It returns true if the health transition requires a route refresh for that family.
+func updateUplinkAfterPing(u *uplink, ok bool, v6 bool) bool {
+	changed := false
+	if v6 {
+		prev := u.alive6
+		if !ok {
+			u.fail6++
+			if u.fail6 >= healthFailThreshold && u.alive6 {
+				u.alive6 = false
+				if prev {
+					changed = true
+				}
+			}
+		} else {
+			u.fail6 = 0
+			u.alive6 = true
+			if !prev {
+				changed = true
+			}
 		}
-		_ = runner.Run("ip6tables", "-t", "nat", "-D", "POSTROUTING", "-o", u.iface, "-j", "MASQUERADE")
+	} else {
+		prev := u.alive4
+		if !ok {
+			u.fail++
+			if u.fail >= healthFailThreshold && u.alive4 {
+				u.alive4 = false
+				if prev {
+					changed = true
+				}
+			}
+		} else {
+			u.fail = 0
+			u.alive4 = true
+			if !prev {
+				changed = true
+			}
+		}
 	}
-	return nil
+	u.alive = u.alive4 || u.alive6
+	return changed
 }
 
 func healthMonitor(ctx context.Context, ups *uplinkSet) {
-	ticker := time.NewTicker(5 * time.Second)
+	defer recoverPanic("healthMonitor")
+	ticker := time.NewTicker(healthCheckInterval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -399,52 +404,16 @@ func healthMonitor(ctx context.Context, ups *uplinkSet) {
 			for i := range snap {
 				idx := i
 				if snap[i].gw != "" {
-					err := runner.Run("ping", "-c", "1", "-W", "1", "-I", snap[i].iface, "1.1.1.1")
-					if err != nil {
-						ups.update(idx, func(u *uplink) {
-							prev := u.alive4
-							u.fail++
-							if u.fail >= 3 && u.alive4 {
-								u.alive4 = false
-								changed4 = changed4 || prev
-							}
-							u.alive = u.alive4 || u.alive6
-						})
-					} else {
-						ups.update(idx, func(u *uplink) {
-							prev := u.alive4
-							u.fail = 0
-							u.alive4 = true
-							if !prev {
-								changed4 = true
-							}
-							u.alive = u.alive4 || u.alive6
-						})
-					}
+					err := platform.PingIfaceV4(runner, snap[i].iface)
+					ups.update(idx, func(u *uplink) {
+						changed4 = changed4 || updateUplinkAfterPing(u, err == nil, false)
+					})
 				}
 				if snap[i].gw6 != "" {
-					err := runner.Run("ping", "-6", "-c", "1", "-W", "1", "-I", snap[i].iface, "2606:4700:4700::1111")
-					if err != nil {
-						ups.update(idx, func(u *uplink) {
-							prev := u.alive6
-							u.fail6++
-							if u.fail6 >= 3 && u.alive6 {
-								u.alive6 = false
-								changed6 = changed6 || prev
-							}
-							u.alive = u.alive4 || u.alive6
-						})
-					} else {
-						ups.update(idx, func(u *uplink) {
-							prev := u.alive6
-							u.fail6 = 0
-							u.alive6 = true
-							if !prev {
-								changed6 = true
-							}
-							u.alive = u.alive4 || u.alive6
-						})
-					}
+					err := platform.PingIfaceV6(runner, snap[i].iface)
+					ups.update(idx, func(u *uplink) {
+						changed6 = changed6 || updateUplinkAfterPing(u, err == nil, true)
+					})
 				}
 			}
 			if changed4 {

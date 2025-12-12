@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package main
 
 import (
@@ -155,7 +158,7 @@ func (s *serverSession) encryptAndSend(conn *serverConn, ptype uint8, payload []
 	if conn == nil {
 		return nil
 	}
-	
+
 	finalPayload := payload
 	compFlag := common.CompressionNone
 

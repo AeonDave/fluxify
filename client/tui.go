@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 
@@ -12,6 +15,7 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 
+	"fluxify/client/platform"
 	"fluxify/common"
 )
 
@@ -21,9 +25,22 @@ type ifaceChoice struct {
 	HasGateway bool
 }
 
+type tuiRunner struct{}
+
+func (tuiRunner) Run(name string, args ...string) error {
+	return common.RunPrivileged(name, args...)
+}
+
+func (tuiRunner) Output(name string, args ...string) ([]byte, error) {
+	return common.RunPrivilegedOutput(name, args...)
+}
+
+func (tuiRunner) OutputSafe(name string, args ...string) ([]byte, error) {
+	return common.RunPrivilegedOutput(name, args...)
+}
+
 // runTUI launches the interactive UI for bonding/load-balance configuration.
-// If autoStart is true, it will automatically trigger the start action (used after elevation).
-func runTUI(initial clientConfig, autoStart bool) {
+func runTUI(initial clientConfig) {
 	app := tview.NewApplication()
 	app.EnableMouse(true)
 
@@ -103,6 +120,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 
 	// Populate interfaces
 	var refreshIfaces func()
+	var redrawList func()
 	var updateButtons func()
 	var updateStatus func()
 	var persistConfig func()
@@ -119,14 +137,8 @@ func runTUI(initial clientConfig, autoStart bool) {
 		saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Client: cfg.Client, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
 	}
 
-	refreshIfaces = func() {
-		// Do not allow modifying interface list while starting or running
-		if starting || state.running != nil {
-			status.SetText("[yellow]Running: stop before changing interfaces")
-			return
-		}
+	redrawList = func() {
 		ifaceList.Clear()
-		state.discoverIfaces()
 		for _, c := range state.choices {
 			checked := state.selected[c.Name]
 			label := c.Name
@@ -155,10 +167,51 @@ func runTUI(initial clientConfig, autoStart bool) {
 				}
 				state.toggle(choice.Name)
 				persistConfig()
-				refreshIfaces()
+				redrawList()
 				updateButtons()
 			})
 		}
+	}
+
+	refreshIfaces = func() {
+		// Do not allow modifying interface list while starting or running
+		if starting || state.running != nil {
+			status.SetText("[yellow]Running: stop before changing interfaces")
+			return
+		}
+		ifaceList.Clear()
+		ifaceList.AddItem("[yellow]Scanning interfaces... please wait", "", 0, nil)
+
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					msg := fmt.Sprintf("PANIC in discovery: %v\nStack: %s", r, debug.Stack())
+					log.Printf("%s", msg)
+					// Try to show error in UI
+					app.QueueUpdateDraw(func() {
+						ifaceList.Clear()
+						ifaceList.AddItem(fmt.Sprintf("[red]Scan crashed: %v", r), "", 0, nil)
+						status.SetText("[red]Scanner crashed")
+					})
+				}
+			}()
+
+			choices, ips := scanInterfaces()
+
+			app.QueueUpdateDraw(func() {
+				state.choices = choices
+				for k, v := range ips {
+					state.ifaceIPs[k] = v
+				}
+				for _, c := range choices {
+					if _, exists := state.selected[c.Name]; !exists {
+						state.selected[c.Name] = false
+					}
+				}
+				redrawList()
+				updateButtons()
+			})
+		}()
 	}
 
 	refreshBtn.SetSelectedFunc(func() {
@@ -221,9 +274,6 @@ func runTUI(initial clientConfig, autoStart bool) {
 			startBtn.SetDisabled(!ok)
 		}
 		updateStatus()
-		if state.running == nil && !starting {
-			showUsageInInfo(info, state.mode)
-		}
 	}
 
 	setStatus := func(msg string) {
@@ -301,31 +351,6 @@ func runTUI(initial clientConfig, autoStart bool) {
 		}
 		cfg := state.buildConfig()
 
-		// If elevation is needed (bonding or load-balance), relaunch with pkexec.
-		// Bonding needs TUN access; Load-balance needs route/iptables access.
-		if common.NeedsElevation() {
-			var extraArgs []string
-			if state.mode == modeBonding {
-				extraArgs = []string{"--tui-autostart", "-server", cfg.Server, "-ifaces", strings.Join(cfg.Ifaces, ","), "-client", cfg.Client, "-pki", cfg.PKI}
-			} else {
-				// Load-balance mode
-				extraArgs = []string{"--tui-autostart", "-l", "-ifaces", strings.Join(cfg.Ifaces, ","), "-pki", cfg.PKI}
-			}
-			// Append conns to match TUI behavior (ensure consistent count after elevation)
-			extraArgs = append(extraArgs, "-conns", fmt.Sprintf("%d", cfg.Conns))
-
-			var elevErr error
-			app.Suspend(func() {
-				elevErr = common.RelaunchWithPkexec(extraArgs...)
-			})
-			if elevErr != nil {
-				starting = false
-				setStatus(fmt.Sprintf("[red]Elevazione richiesta fallita: %v", elevErr))
-				updateButtons()
-			}
-			return
-		}
-
 		startBtn.SetDisabled(true)
 		stopBtn.SetDisabled(true)
 		// Prevent interface changes while starting/running
@@ -350,7 +375,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 		}, func(err error) {
 			starting = false
 			if err != nil {
-				info.SetText(fmt.Sprintf("[red]Start failed: %v", err))
+				log.Printf("Start failed: %v", err)
 				startBtn.SetDisabled(false)
 				// Re-enable refresh on failure
 				refreshBtn.SetDisabled(false)
@@ -374,6 +399,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 				startBtn.SetDisabled(!state.canStart())
 				// Allow interface changes again
 				refreshBtn.SetDisabled(false)
+				showUsageInInfo(info, state.mode)
 				updateButtons()
 			})
 			return
@@ -390,6 +416,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 
 	modeDrop.SetSelectedFunc(func(text string, idx int) {
 		state.mode = text
+		showUsageInInfo(info, state.mode)
 		updateButtons()
 	})
 
@@ -405,17 +432,8 @@ func runTUI(initial clientConfig, autoStart bool) {
 	})
 
 	refreshIfaces()
+	showUsageInInfo(info, state.mode)
 	updateButtons()
-
-	// If autoStart is set (after elevation), trigger start automatically
-	if autoStart && state.canStart() {
-		go func() {
-			time.Sleep(100 * time.Millisecond) // let UI settle
-			app.QueueUpdateDraw(func() {
-				start()
-			})
-		}()
-	}
 
 	// key bindings
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -496,9 +514,15 @@ func (s *tuiState) canStart() bool {
 	return count >= 2
 }
 
-func (s *tuiState) discoverIfaces() {
-	ifaces, _ := net.Interfaces()
+func scanInterfaces() ([]ifaceChoice, map[string]string) {
+	log.Printf("scanInterfaces: starting")
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Printf("scanInterfaces: list interfaces failed: %v", err)
+		return nil, nil
+	}
 	choices := make([]ifaceChoice, 0)
+	ips := make(map[string]string)
 	for _, iface := range ifaces {
 		// filter: up, not loopback, has IPv4, skip obvious virtual (tap, tun, docker, veth)
 		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
@@ -514,17 +538,16 @@ func (s *tuiState) discoverIfaces() {
 			if !ok || ipNet.IP == nil || ipNet.IP.To4() == nil {
 				continue
 			}
-			gw, _ := gatewayForIface(iface.Name)
+			log.Printf("scanInterfaces: checking %s", iface.Name)
+			gw, _ := platform.GatewayForIface(tuiRunner{}, iface.Name)
 			choices = append(choices, ifaceChoice{Name: iface.Name, IP: ipNet.IP.String(), HasGateway: gw != ""})
-			if _, exists := s.selected[iface.Name]; !exists {
-				s.selected[iface.Name] = false
-			}
-			s.ifaceIPs[iface.Name] = ipNet.IP.String()
+			ips[iface.Name] = ipNet.IP.String()
 			break
 		}
 	}
 	sort.Slice(choices, func(i, j int) bool { return choices[i].Name < choices[j].Name })
-	s.choices = choices
+	log.Printf("scanInterfaces: found %d candidates", len(choices))
+	return choices, ips
 }
 
 func (s *tuiState) buildConfig() clientConfig {
@@ -599,6 +622,16 @@ type tuiLogWriter struct {
 
 func (w *tuiLogWriter) Write(p []byte) (n int, err error) {
 	msg := string(p)
+	// Write to file as well for debugging
+	if exe, err := os.Executable(); err == nil {
+		logFile := filepath.Join(filepath.Dir(exe), "client_debug.log")
+		f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+		if f != nil {
+			// Strip colors/tags if possible, but raw log is fine
+			fmt.Fprintf(f, "%s %s", time.Now().Format("15:04:05"), msg)
+			f.Close()
+		}
+	}
 	w.app.QueueUpdateDraw(func() {
 		_, _ = w.view.Write([]byte(msg))
 		w.view.ScrollToEnd()

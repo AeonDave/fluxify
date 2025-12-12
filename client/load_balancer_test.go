@@ -1,8 +1,12 @@
+//go:build linux
+// +build linux
+
 package main
 
 import (
 	"context"
 	"errors"
+	"fluxify/client/platform"
 	"strings"
 	"testing"
 	"time"
@@ -39,11 +43,11 @@ func (f *fakeRunner) OutputSafe(name string, args ...string) ([]byte, error) {
 }
 
 func TestHealthMonitorFlapsAndUpdatesRoutes(t *testing.T) {
-	// ping fails twice then succeeds, toggling an uplink down then up and causing route refresh
+	// ping fails once then succeeds, toggling an uplink down then up and causing route refresh.
 	seq := 0
 	fr := &fakeRunner{outputs: make(map[string][]byte)}
 	fr.runHook = func(name string, args ...string) error {
-		if name == "ping" {
+		if name == "ping" && (len(args) == 0 || args[0] != "-6") {
 			seq++
 			if seq == 1 {
 				return errors.New("timeout")
@@ -53,31 +57,35 @@ func TestHealthMonitorFlapsAndUpdatesRoutes(t *testing.T) {
 		fr.runs = append(fr.runs, append([]string{name}, args...))
 		return nil
 	}
-	old := runner
+	oldRunner, oldInterval, oldThreshold := runner, healthCheckInterval, healthFailThreshold
 	runner = fr
-	defer func() { runner = old }()
+	healthCheckInterval = 10 * time.Millisecond
+	healthFailThreshold = 3
+	t.Cleanup(func() {
+		runner = oldRunner
+		healthCheckInterval = oldInterval
+		healthFailThreshold = oldThreshold
+	})
 
-	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw: "10.0.0.1", alive: true, alive4: true, fail: 2}}}
+	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw: "10.0.0.1", alive: true, alive4: true, fail: healthFailThreshold - 1}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		// allow enough ticks for down->up transition
-		time.Sleep(12 * time.Second)
+		time.Sleep(35 * time.Millisecond)
 		cancel()
 	}()
 	healthMonitor(ctx, ups)
 
-	// After flapping, multipath should be attempted multiple times
 	calls := 0
 	for _, run := range fr.runs {
 		if len(run) >= 3 && run[0] == "ip" && run[1] == "route" && run[2] == "replace" {
 			calls++
 		}
 	}
-	if calls == 0 {
+	if calls < 1 {
 		t.Fatalf("expected multipath updates after flaps (got %d)", calls)
 	}
 	snap := ups.snapshot()[0]
-	if !snap.alive {
+	if !snap.alive4 || !snap.alive {
 		t.Fatalf("uplink should be alive after recovery")
 	}
 }
@@ -150,7 +158,7 @@ func TestGatewayForIfaceParsesVia(t *testing.T) {
 	runner = fr
 	defer func() { runner = old }()
 
-	gw, err := gatewayForIface("eth0")
+	gw, err := platform.GatewayForIface(fr, "eth0")
 	if err != nil {
 		t.Fatalf("gatewayForIface error: %v", err)
 	}
@@ -165,7 +173,7 @@ func TestGatewayForIface6ParsesVia(t *testing.T) {
 	runner = fr
 	defer func() { runner = old }()
 
-	gw, err := gatewayForIface6("eth0")
+	gw, err := platform.GatewayForIface6(fr, "eth0")
 	if err != nil {
 		t.Fatalf("gatewayForIface6 error: %v", err)
 	}
@@ -193,11 +201,6 @@ func TestAddMasqueradeRules6(t *testing.T) {
 
 func TestHealthMonitorTracksIPv6(t *testing.T) {
 	fr := &fakeRunner{outputs: make(map[string][]byte)}
-	old := runner
-	runner = fr
-	defer func() { runner = old }()
-
-	// First ping -6 fails then succeeds to trigger route updates
 	call := 0
 	fr.runHook = func(name string, args ...string) error {
 		if name == "ping" && len(args) > 0 && args[0] == "-6" {
@@ -205,15 +208,26 @@ func TestHealthMonitorTracksIPv6(t *testing.T) {
 			if call == 1 {
 				return errors.New("fail")
 			}
+			return nil
 		}
 		fr.runs = append(fr.runs, append([]string{name}, args...))
 		return nil
 	}
 
-	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw6: "fe80::1", alive: true, alive6: true, fail6: 2}}}
+	oldRunner, oldInterval, oldThreshold := runner, healthCheckInterval, healthFailThreshold
+	runner = fr
+	healthCheckInterval = 10 * time.Millisecond
+	healthFailThreshold = 3
+	t.Cleanup(func() {
+		runner = oldRunner
+		healthCheckInterval = oldInterval
+		healthFailThreshold = oldThreshold
+	})
+
+	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw6: "fe80::1", alive: true, alive6: true, fail6: healthFailThreshold - 1}}}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		time.Sleep(12 * time.Second)
+		time.Sleep(35 * time.Millisecond)
 		cancel()
 	}()
 	healthMonitor(ctx, ups)
@@ -224,8 +238,54 @@ func TestHealthMonitorTracksIPv6(t *testing.T) {
 			callsV6++
 		}
 	}
-	if callsV6 == 0 {
+	if callsV6 < 1 {
 		t.Fatalf("expected ipv6 route updates, got %d", callsV6)
+	}
+}
+
+func TestUpdateUplinkAfterPingV4ThresholdAndRecovery(t *testing.T) {
+	oldThreshold := healthFailThreshold
+	healthFailThreshold = 3
+	t.Cleanup(func() { healthFailThreshold = oldThreshold })
+
+	u := &uplink{alive4: true, alive: true}
+	for i := 0; i < healthFailThreshold-1; i++ {
+		if updateUplinkAfterPing(u, false, false) {
+			t.Fatalf("unexpected change before threshold (i=%d)", i)
+		}
+		if !u.alive4 {
+			t.Fatalf("alive4 should remain up before threshold")
+		}
+	}
+	if !updateUplinkAfterPing(u, false, false) {
+		t.Fatalf("expected change at threshold")
+	}
+	if u.alive4 {
+		t.Fatalf("alive4 should be down at threshold")
+	}
+
+	if !updateUplinkAfterPing(u, true, false) {
+		t.Fatalf("expected change on recovery")
+	}
+	if !u.alive4 || u.fail != 0 || !u.alive {
+		t.Fatalf("unexpected state after recovery: %+v", *u)
+	}
+	if updateUplinkAfterPing(u, true, false) {
+		t.Fatalf("unexpected change when already up")
+	}
+}
+
+func TestUpdateUplinkAfterPingV6KeepsOverallAlive(t *testing.T) {
+	oldThreshold := healthFailThreshold
+	healthFailThreshold = 3
+	t.Cleanup(func() { healthFailThreshold = oldThreshold })
+
+	u := &uplink{alive4: true, alive6: true, alive: true, fail: healthFailThreshold - 1}
+	if !updateUplinkAfterPing(u, false, false) {
+		t.Fatalf("expected v4 change at threshold")
+	}
+	if u.alive4 || !u.alive6 || !u.alive {
+		t.Fatalf("overall alive should remain true when v6 still up: %+v", *u)
 	}
 }
 

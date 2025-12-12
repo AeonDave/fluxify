@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package main
 
 import (
@@ -64,5 +67,24 @@ func TestExtractDstIPParsesV4AndV6(t *testing.T) {
 	copy(v6[24:40], dst6.To16())
 	if ip := extractDstIP(v6); ip == nil || !ip.Equal(dst6) {
 		t.Fatalf("extractDstIP v6 failed, got %v", ip)
+	}
+}
+
+func TestExtractDstIPInvalidReturnsNil(t *testing.T) {
+	if ip := extractDstIP(nil); ip != nil {
+		t.Fatalf("expected nil for empty packet, got %v", ip)
+	}
+	shortV4 := []byte{0x45}
+	if ip := extractDstIP(shortV4); ip != nil {
+		t.Fatalf("expected nil for short v4, got %v", ip)
+	}
+	shortV6 := make([]byte, 10)
+	shortV6[0] = 0x60
+	if ip := extractDstIP(shortV6); ip != nil {
+		t.Fatalf("expected nil for short v6, got %v", ip)
+	}
+	unknown := []byte{0x10}
+	if ip := extractDstIP(unknown); ip != nil {
+		t.Fatalf("expected nil for unknown version, got %v", ip)
 	}
 }

@@ -2,18 +2,17 @@ package main
 
 import (
 	"testing"
-
-	"fluxify/common"
+	"time"
 )
 
 func TestPickBestConnLoadBalanceChoosesLowestRTT(t *testing.T) {
 	c := &clientState{mode: modeLoadBalance}
 	slow := &clientConn{}
 	slow.alive.Store(true)
-	slow.rttNano.Store(int64(200 * 1e6)) // 200ms
+	slow.rttNano.Store(int64(200 * time.Millisecond))
 	fast := &clientConn{}
 	fast.alive.Store(true)
-	fast.rttNano.Store(int64(10 * 1e6)) // 10ms
+	fast.rttNano.Store(int64(10 * time.Millisecond))
 	c.conns = []*clientConn{slow, fast}
 
 	got := c.pickBestConn()
@@ -22,22 +21,46 @@ func TestPickBestConnLoadBalanceChoosesLowestRTT(t *testing.T) {
 	}
 }
 
-// TestRouteRevertHook ensures the revertRoute hook is set when default route is set to TUN (simulated).
-// This is a light-weight check that the hook is wired; it does not execute system commands.
-func TestRouteRevertHookWired(t *testing.T) {
-	state := &clientState{}
-	state.revertRoute = func() {}
-	if state.revertRoute == nil {
-		t.Fatalf("revertRoute should be non-nil")
+func TestPickBestConnLoadBalanceTreatsZeroRTTAsPenalty(t *testing.T) {
+	c := &clientState{mode: modeLoadBalance}
+	unknown := &clientConn{}
+	unknown.alive.Store(true)
+	unknown.rttNano.Store(0)
+	known := &clientConn{}
+	known.alive.Store(true)
+	known.rttNano.Store(int64(20 * time.Millisecond))
+	c.conns = []*clientConn{unknown, known}
+
+	got := c.pickBestConn()
+	if got != known {
+		t.Fatalf("expected known RTT conn, got %p", got)
 	}
 }
 
-// TestGetDefaultRouteNonLinux is a safety check that the helper is a no-op on non-Linux.
-func TestGetDefaultRouteNonLinux(t *testing.T) {
-	if common.IsLinux() {
-		t.Skip("linux env would try ip route")
+func TestPickBestConnLoadBalanceFallsBackWhenNoneAlive(t *testing.T) {
+	c := &clientState{mode: modeLoadBalance}
+	a := &clientConn{}
+	b := &clientConn{}
+	a.alive.Store(false)
+	b.alive.Store(false)
+	c.conns = []*clientConn{a, b}
+
+	got := c.pickBestConn()
+	if got != a {
+		t.Fatalf("expected fallback to first conn, got %p", got)
 	}
-	if _, _, _, err := common.GetDefaultRoute(); err != nil {
-		t.Fatalf("expected no error on non-linux: %v", err)
+}
+
+func TestPickBestConnBondingPrefersAlive(t *testing.T) {
+	c := &clientState{mode: modeBonding}
+	dead := &clientConn{}
+	alive := &clientConn{}
+	dead.alive.Store(false)
+	alive.alive.Store(true)
+	c.conns = []*clientConn{dead, alive}
+
+	got := c.pickBestConn()
+	if got == nil || !got.alive.Load() {
+		t.Fatalf("expected an alive conn, got %#v", got)
 	}
 }
