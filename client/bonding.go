@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"path/filepath"
 	"runtime"
@@ -25,6 +24,10 @@ import (
 func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	if cfg.Client == "" {
 		return nil, nil, fmt.Errorf("client name required")
+	}
+	cfg.Ifaces = sanitizeIfaces(cfg.Ifaces)
+	if len(cfg.Ifaces) < 2 {
+		return nil, nil, fmt.Errorf("need at least 2 usable interfaces for bonding")
 	}
 	// Bonding requires TUN device which needs root
 	if common.NeedsElevation() {
@@ -301,7 +304,7 @@ func (c *clientState) processAndSend(data []byte) {
 	// Compression
 	compressed := data
 	compressFlag := common.CompressionNone
-	
+
 	// Try compression into a new buffer
 	compBuf := common.GetBuffer()
 	if comp, err := common.CompressPayloadInto(compBuf, data); err == nil {
@@ -327,16 +330,16 @@ func (c *clientState) processAndSend(data []byte) {
 
 	head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketIP, SessionID: c.sessionID, SeqNum: seq, Length: uint16(len(compressed))}
 	head.Reserved[0] = byte(compressFlag)
-	
+
 	// Encrypt into new packet buffer
 	pktBuf := common.GetBuffer()
 	defer common.PutBuffer(pktBuf)
-	
+
 	pkt, err := common.EncryptPacketInto(pktBuf, c.sessionKey, head, compressed)
 	if err != nil {
 		return
 	}
-	
+
 	cc.mu.Lock()
 	_, _ = cc.udp.Write(pkt)
 	cc.mu.Unlock()
@@ -350,15 +353,14 @@ func (c *clientState) pickBestConn() *clientConn {
 		return nil
 	}
 	if c.mode == modeBonding {
-		// simple round-robin over alive
-		start := rand.Intn(len(c.conns))
+		start := int(c.nextConnRR.Add(1)-1) % len(c.conns)
 		for i := 0; i < len(c.conns); i++ {
 			cand := c.conns[(start+i)%len(c.conns)]
 			if cand.alive.Load() {
 				return cand
 			}
 		}
-		return c.conns[start]
+		return nil
 	}
 	// load-balance: pick lowest RTT alive
 	var best *clientConn
@@ -409,7 +411,7 @@ func (c *clientState) heartbeat() {
 		for _, cc := range c.conns {
 			if !cc.alive.Load() {
 				// try one ping to see if it comes back
-				// or maybe we rely on generic traffic? 
+				// or maybe we rely on generic traffic?
 				// The original code sent heartbeat to all.
 			}
 			head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketHeartbeat, SessionID: c.sessionID, SeqNum: 0, Length: uint16(len(payload))}

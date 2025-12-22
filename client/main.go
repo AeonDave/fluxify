@@ -10,12 +10,19 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
 
 	"github.com/rivo/tview"
 )
+
+var logFatalf = log.Fatalf
+var realRunTUI = runTUI
+var runTUIHook = runTUI
+var homeDirFunc = os.UserHomeDir
+var lookupUser = user.Lookup
 
 // splitCSV splits a comma-separated string into trimmed parts.
 func splitCSV(s string) []string {
@@ -34,6 +41,12 @@ func splitCSV(s string) []string {
 }
 
 func main() {
+	exitIf := func(cond bool, msg string, args ...interface{}) {
+		if cond {
+			logFatalf(msg, args...)
+		}
+	}
+
 	server := flag.String("server", "", "server host:port (optional, overridden by TUI)")
 	ifacesStr := flag.String("ifaces", "", "comma-separated interface names (optional)")
 	localIPs := flag.String("ips", "", "comma-separated source IPs (optional)")
@@ -80,13 +93,13 @@ func main() {
 
 	// If launched with --tui-autostart (after elevation), go to TUI with auto-start
 	if *tuiAutoStart {
-		runTUI(initialCfg, true)
+		runTUIHook(initialCfg, true)
 		return
 	}
 
 	autoMode := *loadBalanceFlag || *bondingFlag
 	if !autoMode {
-		runTUI(initialCfg, false)
+		runTUIHook(initialCfg, false)
 		return
 	}
 
@@ -94,17 +107,11 @@ func main() {
 	if cfg.Conns <= 0 {
 		cfg.Conns = len(cfg.Ifaces)
 	}
-	if len(cfg.Ifaces) < 2 {
-		log.Fatalf("need at least 2 interfaces (found %d)", len(cfg.Ifaces))
-	}
-	if cfg.Mode == modeBonding && cfg.Server == "" {
-		log.Fatalf("server is required in bonding mode")
-	}
+	exitIf(len(cfg.Ifaces) < 2, "need at least 2 interfaces (found %d)", len(cfg.Ifaces))
+	exitIf(cfg.Mode == modeBonding && cfg.Server == "", "server is required in bonding mode")
 	if cfg.Mode == modeBonding && cfg.Client == "" {
 		name, err := detectClientCertName(cfg.PKI)
-		if err != nil {
-			log.Fatalf("client cert: %v", err)
-		}
+		exitIf(err != nil, "client cert: %v", err)
 		cfg.Client = name
 	}
 
@@ -199,7 +206,12 @@ func configFilePath() (string, error) {
 }
 
 func userConfigDir() (string, error) {
-	home, err := os.UserHomeDir()
+	if sudoUser := os.Getenv("SUDO_USER"); sudoUser != "" {
+		if u, err := lookupUser(sudoUser); err == nil && u.HomeDir != "" {
+			return filepath.Join(u.HomeDir, ".fluxify"), nil
+		}
+	}
+	home, err := homeDirFunc()
 	if err != nil {
 		return "", err
 	}
