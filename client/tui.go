@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"sort"
 	"strings"
+	"sync"
 
 	"time"
 
@@ -40,11 +41,12 @@ func (tuiRunner) OutputSafe(name string, args ...string) ([]byte, error) {
 }
 
 // runTUI launches the interactive UI for bonding/load-balance configuration.
-func runTUI(initial clientConfig) {
+func runTUI(initial clientConfig, autoStart bool) {
 	app := tview.NewApplication()
 	app.EnableMouse(true)
 
 	state := newTUIState(initial)
+	autoStartOnce := sync.Once{}
 
 	// Widgets
 	modeDrop := tview.NewDropDown().SetLabel("Mode ")
@@ -124,6 +126,7 @@ func runTUI(initial clientConfig) {
 	var updateButtons func()
 	var updateStatus func()
 	var persistConfig func()
+	var start func()
 
 	serverFieldDisabled := false
 	suppressServerChange := false
@@ -210,6 +213,9 @@ func runTUI(initial clientConfig) {
 				}
 				redrawList()
 				updateButtons()
+				if autoStart && state.canStart() {
+					autoStartOnce.Do(func() { start() })
+				}
 			})
 		}()
 	}
@@ -327,7 +333,7 @@ func runTUI(initial clientConfig) {
 		setStatusDirect(msg)
 	}
 
-	start := func() {
+	start = func() {
 		if state.running != nil || starting {
 			return
 		}

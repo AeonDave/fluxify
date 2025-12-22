@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -109,10 +111,23 @@ var (
 	healthFailThreshold = 3
 )
 
+type ifaceLister interface {
+	Interfaces() ([]net.Interface, error)
+}
+
+type defaultIfaceLister struct{}
+
+func (defaultIfaceLister) Interfaces() ([]net.Interface, error) {
+	return net.Interfaces()
+}
+
+var ifaceProvider ifaceLister = defaultIfaceLister{}
+
 func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, app *tview.Application) (func(), error) {
 	if runtime.GOOS == "windows" && !common.IsRoot() {
 		return nil, fmt.Errorf("run the client as administrator on windows to configure routes")
 	}
+	cfg.Ifaces = sanitizeIfaces(cfg.Ifaces)
 	if len(cfg.Ifaces) < 2 {
 		return nil, fmt.Errorf("need at least 2 interfaces for load-balance")
 	}
@@ -430,4 +445,61 @@ func healthMonitor(ctx context.Context, ups *uplinkSet) {
 			return
 		}
 	}
+}
+
+func sanitizeIfaces(raw []string) []string {
+	seen := make(map[string]bool)
+	trimmed := make([]string, 0, len(raw))
+	for _, name := range raw {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		trimmed = append(trimmed, name)
+	}
+	if len(trimmed) == 0 {
+		return nil
+	}
+	ifaces, err := ifaceProvider.Interfaces()
+	if err != nil {
+		log.Printf("list interfaces: %v", err)
+		return trimmed
+	}
+	info := make(map[string]net.Interface, len(ifaces))
+	for _, ifc := range ifaces {
+		info[ifc.Name] = ifc
+	}
+	type candidate struct {
+		name string
+		mtu  int
+	}
+	var candidates []candidate
+	for _, name := range trimmed {
+		ifc, ok := info[name]
+		if !ok {
+			log.Printf("iface %s not found; skipping", name)
+			continue
+		}
+		if ifc.Flags&net.FlagLoopback != 0 {
+			log.Printf("iface %s is loopback; skipping", name)
+			continue
+		}
+		if ifc.Flags&net.FlagUp == 0 {
+			log.Printf("iface %s is down; skipping", name)
+			continue
+		}
+		candidates = append(candidates, candidate{name: name, mtu: ifc.MTU})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].mtu == candidates[j].mtu {
+			return candidates[i].name < candidates[j].name
+		}
+		return candidates[i].mtu > candidates[j].mtu
+	})
+	result := make([]string, len(candidates))
+	for i, c := range candidates {
+		result[i] = c.name
+	}
+	return result
 }

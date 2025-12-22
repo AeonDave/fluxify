@@ -1,6 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
+	"log"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,5 +67,66 @@ func TestPickBestConnBondingPrefersAlive(t *testing.T) {
 	got := c.pickBestConn()
 	if got == nil || !got.alive.Load() {
 		t.Fatalf("expected an alive conn, got %#v", got)
+	}
+}
+
+func TestCLIStartsTUIWhenNoModeFlags(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"client"}
+
+	var buf bytes.Buffer
+	logFatalf = log.Fatalf
+	log.SetOutput(&buf)
+	t.Cleanup(func() {
+		log.SetOutput(os.Stderr)
+		logFatalf = log.Fatalf
+	})
+
+	startedTUI := false
+	runTUIHook = func(cfg clientConfig, autoStart bool) {
+		startedTUI = true
+	}
+	t.Cleanup(func() { runTUIHook = realRunTUI })
+
+	main()
+	if !startedTUI {
+		t.Fatalf("expected TUI to start when no mode flags provided")
+	}
+}
+
+func TestCLIFailsWithoutRequiredBondingParams(t *testing.T) {
+	origArgs := os.Args
+	t.Cleanup(func() { os.Args = origArgs })
+	os.Args = []string{"client", "-b", "-ifaces", "eth0,eth1"}
+
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	exitCh := make(chan string, 1)
+	realFatal := logFatalf
+	runTUIHook = realRunTUI
+	logFatalf = func(format string, args ...interface{}) {
+		exitCh <- fmt.Sprintf(format, args...)
+		panic("exit")
+	}
+	t.Cleanup(func() { logFatalf = realFatal })
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatalf("expected fatal exit when server/client missing")
+		}
+	}()
+
+	main()
+
+	select {
+	case msg := <-exitCh:
+		if !strings.Contains(msg, "server is required") {
+			t.Fatalf("unexpected fatal msg: %s", msg)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("fatal not triggered")
 	}
 }

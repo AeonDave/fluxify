@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
 	"net"
 	"path/filepath"
 	"runtime"
@@ -23,14 +22,18 @@ import (
 )
 
 func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
+	if cfg.Client == "" {
+		return nil, nil, fmt.Errorf("client name required")
+	}
+	cfg.Ifaces = sanitizeIfaces(cfg.Ifaces)
+	if len(cfg.Ifaces) < 2 {
+		return nil, nil, fmt.Errorf("need at least 2 usable interfaces for bonding")
+	}
 	if runtime.GOOS == "windows" && !common.IsRoot() {
 		return nil, nil, fmt.Errorf("run the client as administrator on windows to create the TUN interface")
 	}
 	if runtime.GOOS == "linux" && !common.IsRoot() {
 		return nil, nil, fmt.Errorf("run the client with sudo/root on linux to create the TUN interface")
-	}
-	if cfg.Client == "" {
-		return nil, nil, fmt.Errorf("client name required")
 	}
 	log.Printf("bonding: starting with client=%s server=%s pki=%s", cfg.Client, cfg.Server, cfg.PKI)
 	ctrlHost, ctrlPort, err := parseServerAddr(cfg.Server, cfg.Ctrl)
@@ -340,15 +343,14 @@ func (c *clientState) pickBestConn() *clientConn {
 		return nil
 	}
 	if c.mode == modeBonding {
-		// simple round-robin over alive
-		start := rand.Intn(len(c.conns))
+		start := int(c.nextConnRR.Add(1)-1) % len(c.conns)
 		for i := 0; i < len(c.conns); i++ {
 			cand := c.conns[(start+i)%len(c.conns)]
 			if cand.alive.Load() {
 				return cand
 			}
 		}
-		return c.conns[start]
+		return nil
 	}
 	// load-balance: pick lowest RTT alive
 	var best *clientConn
