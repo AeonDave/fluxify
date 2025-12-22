@@ -1,3 +1,6 @@
+//go:build linux
+// +build linux
+
 package main
 
 import (
@@ -132,12 +135,12 @@ func TestHandlePacketHeartbeatEcho(t *testing.T) {
 	// We must simulate this.
 	payloadBuf := common.GetBuffer()
 	copy(payloadBuf, payload)
-	
+
 	// handlePacket will defer PutBuffer(payloadBuf) unless transferred.
 	// PacketHeartbeat is NOT transferred to TUN, so it will be Put.
 	// But we need to make sure we don't access it after.
 	// Since handlePacket is synchronous here, it's fine.
-	
+
 	s.handlePacket(sess, addr, hdr, payloadBuf[:len(payload)], payloadBuf)
 
 	clientRecv.SetReadDeadline(time.Now().Add(time.Second))
@@ -163,5 +166,49 @@ func TestHandlePacketHeartbeatEcho(t *testing.T) {
 	}
 	if rtt := sess.conns[0].lastRTT.Load(); rtt <= 0 {
 		t.Fatalf("expected RTT stored, got %d", rtt)
+	}
+}
+
+func TestPickBestConnIgnoresStaleConnections(t *testing.T) {
+	key, err := common.GenerateSessionKey()
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	sess := newServerSession(1, "test", key, nil, nil)
+
+	stale := &serverConn{addr: &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 1111}}
+	fresh := &serverConn{addr: &net.UDPAddr{IP: net.IPv4(2, 2, 2, 2), Port: 2222}}
+	stale.alive.Store(true)
+	fresh.alive.Store(true)
+	stale.lastSeen.Store(time.Now().Add(-2 * connStaleTimeout).UnixNano())
+	fresh.lastSeen.Store(time.Now().UnixNano())
+	stale.lastRTT.Store(int64(1 * time.Millisecond))
+	fresh.lastRTT.Store(int64(100 * time.Millisecond))
+
+	sess.conns = []*serverConn{stale, fresh}
+	if best := sess.pickBestConn(); best != fresh {
+		t.Fatalf("expected fresh conn, got %#v", best)
+	}
+}
+
+func TestPickBestConnFallsBackToMostRecentWhenAllStale(t *testing.T) {
+	key, err := common.GenerateSessionKey()
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	sess := newServerSession(1, "test", key, nil, nil)
+
+	older := &serverConn{addr: &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 1111}}
+	newer := &serverConn{addr: &net.UDPAddr{IP: net.IPv4(2, 2, 2, 2), Port: 2222}}
+	older.alive.Store(true)
+	newer.alive.Store(true)
+	older.lastSeen.Store(time.Now().Add(-2 * connStaleTimeout).UnixNano())
+	newer.lastSeen.Store(time.Now().Add(-connStaleTimeout).UnixNano())
+	older.lastRTT.Store(int64(1 * time.Millisecond))
+	newer.lastRTT.Store(int64(500 * time.Millisecond))
+
+	sess.conns = []*serverConn{older, newer}
+	if best := sess.pickBestConn(); best != newer {
+		t.Fatalf("expected fallback to most recent stale conn, got %#v", best)
 	}
 }
