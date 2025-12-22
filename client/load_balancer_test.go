@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,18 @@ type fakeRunner struct {
 	outputs map[string][]byte
 	err     error
 	runHook func(name string, args ...string) error
+}
+
+type fakeIfaceProvider struct {
+	ifaces []net.Interface
+	err    error
+}
+
+func (f fakeIfaceProvider) Interfaces() ([]net.Interface, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.ifaces, nil
 }
 
 func (f *fakeRunner) Run(name string, args ...string) error {
@@ -38,7 +51,40 @@ func (f *fakeRunner) OutputSafe(name string, args ...string) ([]byte, error) {
 	return f.Output(name, args...)
 }
 
+func TestSanitizeIfacesFiltersAndSortsByMTU(t *testing.T) {
+	old := ifaceProvider
+	ifaceProvider = fakeIfaceProvider{ifaces: []net.Interface{
+		{Name: "eth0", MTU: 9000, Flags: net.FlagUp},
+		{Name: "eth1", MTU: 1500, Flags: net.FlagUp},
+		{Name: "lo", MTU: 65536, Flags: net.FlagLoopback | net.FlagUp},
+		{Name: "down0", MTU: 1500},
+	}}
+	t.Cleanup(func() { ifaceProvider = old })
+
+	got := sanitizeIfaces([]string{"eth1", "lo", "eth1", "eth0", "down0", "missing", ""})
+	want := []string{"eth0", "eth1"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
+func TestSanitizeIfacesFallsBackOnError(t *testing.T) {
+	old := ifaceProvider
+	ifaceProvider = fakeIfaceProvider{err: errors.New("boom")}
+	t.Cleanup(func() { ifaceProvider = old })
+
+	got := sanitizeIfaces([]string{"eth0", "eth0", "wlan0", " ", ""})
+	want := []string{"eth0", "wlan0"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("expected %v, got %v", want, got)
+	}
+}
+
 func TestHealthMonitorFlapsAndUpdatesRoutes(t *testing.T) {
+	oldInterval := healthCheckInterval
+	healthCheckInterval = 10 * time.Millisecond
+	t.Cleanup(func() { healthCheckInterval = oldInterval })
+
 	// ping fails twice then succeeds, toggling an uplink down then up and causing route refresh
 	seq := 0
 	fr := &fakeRunner{outputs: make(map[string][]byte)}
@@ -59,11 +105,7 @@ func TestHealthMonitorFlapsAndUpdatesRoutes(t *testing.T) {
 
 	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw: "10.0.0.1", alive: true, alive4: true, fail: 2}}}
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		// allow enough ticks for down->up transition
-		time.Sleep(12 * time.Second)
-		cancel()
-	}()
+	time.AfterFunc(120*time.Millisecond, cancel)
 	healthMonitor(ctx, ups)
 
 	// After flapping, multipath should be attempted multiple times
@@ -192,6 +234,10 @@ func TestAddMasqueradeRules6(t *testing.T) {
 }
 
 func TestHealthMonitorTracksIPv6(t *testing.T) {
+	oldInterval := healthCheckInterval
+	healthCheckInterval = 10 * time.Millisecond
+	t.Cleanup(func() { healthCheckInterval = oldInterval })
+
 	fr := &fakeRunner{outputs: make(map[string][]byte)}
 	old := runner
 	runner = fr
@@ -212,10 +258,7 @@ func TestHealthMonitorTracksIPv6(t *testing.T) {
 
 	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw6: "fe80::1", alive: true, alive6: true, fail6: 2}}}
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(12 * time.Second)
-		cancel()
-	}()
+	time.AfterFunc(120*time.Millisecond, cancel)
 	healthMonitor(ctx, ups)
 
 	callsV6 := 0
@@ -241,5 +284,88 @@ func TestDiscoverGatewaysSkipsOnError(t *testing.T) {
 	}
 	if len(ups) != 0 {
 		t.Fatalf("expected 0 uplinks on error, got %d", len(ups))
+	}
+}
+
+func TestHealthMonitorMarksDownAfterConsecutiveFailures(t *testing.T) {
+	oldInterval := healthCheckInterval
+	healthCheckInterval = 5 * time.Millisecond
+	t.Cleanup(func() { healthCheckInterval = oldInterval })
+
+	fr := &fakeRunner{outputs: make(map[string][]byte)}
+	old := runner
+	runner = fr
+	defer func() { runner = old }()
+
+	fr.runHook = func(name string, args ...string) error {
+		if name == "ping" && len(args) > 0 && args[len(args)-2] == "eth0" {
+			return errors.New("down")
+		}
+		fr.runs = append(fr.runs, append([]string{name}, args...))
+		return nil
+	}
+
+	ups := &uplinkSet{list: []uplink{
+		{iface: "eth0", gw: "10.0.0.1", alive: true, alive4: true},
+		{iface: "eth1", gw: "10.0.0.2", alive: true, alive4: true},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(80*time.Millisecond, cancel)
+	healthMonitor(ctx, ups)
+
+	snap := ups.snapshot()
+	if snap[0].alive4 || snap[0].alive {
+		t.Fatalf("eth0 should be marked down after repeated failures")
+	}
+	if snap[0].fail < 3 {
+		t.Fatalf("expected fail counter to reach threshold, got %d", snap[0].fail)
+	}
+	if !snap[1].alive4 {
+		t.Fatalf("eth1 should remain healthy")
+	}
+
+	routeUpdates := 0
+	for _, run := range fr.runs {
+		if len(run) >= 3 && run[0] == "ip" && run[1] == "route" && run[2] == "replace" {
+			routeUpdates++
+		}
+	}
+	if routeUpdates == 0 {
+		t.Fatalf("expected multipath updates after link failure")
+	}
+}
+
+func TestHealthMonitorKeepsAliveWhenIPv6Healthy(t *testing.T) {
+	oldInterval := healthCheckInterval
+	healthCheckInterval = 5 * time.Millisecond
+	t.Cleanup(func() { healthCheckInterval = oldInterval })
+
+	fr := &fakeRunner{outputs: make(map[string][]byte)}
+	old := runner
+	runner = fr
+	defer func() { runner = old }()
+
+	fr.runHook = func(name string, args ...string) error {
+		if name == "ping" && len(args) > 0 && args[0] != "-6" {
+			return errors.New("ipv4 down")
+		}
+		fr.runs = append(fr.runs, append([]string{name}, args...))
+		return nil
+	}
+
+	ups := &uplinkSet{list: []uplink{{iface: "eth0", gw: "10.0.0.1", gw6: "fe80::1", alive: true, alive4: true, alive6: true}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(80*time.Millisecond, cancel)
+	healthMonitor(ctx, ups)
+
+	snap := ups.snapshot()[0]
+	if snap.alive4 {
+		t.Fatalf("ipv4 should be marked down")
+	}
+	if !snap.alive6 {
+		t.Fatalf("ipv6 should remain healthy")
+	}
+	if !snap.alive {
+		t.Fatalf("overall alive should remain true when ipv6 is up")
 	}
 }

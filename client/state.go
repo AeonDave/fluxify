@@ -36,6 +36,7 @@ type clientState struct {
 	conns       []*clientConn
 	connMu      sync.RWMutex
 	nextSeqSend atomic.Uint32
+	nextConnRR  atomic.Uint32
 	tun         *water.Interface
 	mode        string
 	ctx         context.Context
