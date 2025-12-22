@@ -9,6 +9,9 @@
 - Run all tests: `go test ./...`
 - Run common tests: `go test ./common/...`
 
+## Operational notes
+- Client and server must be started with admin/sudo privileges; do not add runtime elevation prompts.
+
 ## Code style
 - Go 1.24+ required
 - Standard Go formatting with `go fmt`

@@ -84,7 +84,7 @@ func TestCLIStartsTUIWhenNoModeFlags(t *testing.T) {
 	})
 
 	startedTUI := false
-	runTUIHook = func(cfg clientConfig, autoStart bool) {
+	runTUIHook = func(cfg clientConfig) {
 		startedTUI = true
 	}
 	t.Cleanup(func() { runTUIHook = realRunTUI })

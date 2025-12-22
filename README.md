@@ -96,7 +96,7 @@ go build -o client ./client
 
 ### Modes
 
-- **Bonding (server-backed):** Round-robin over alive links; requires server control connection and client certificate (CN set via `-client` or TUI). Start requires at least two selected interfaces and a non-empty server; uses a TUN at 10.8.0.x/24 and fd00:8:0::x/64.
+- **Bonding (server-backed):** Round-robin over alive links; requires server control connection and a client bundle (.pem with cert+key). One UDP connection is opened per selected interface. Start requires at least two selected interfaces and a non-empty server; uses a TUN at 10.8.0.x/24 and fd00:8:0::x/64.
 - **Load-balance (local/serverless):** No server or TUN. Discovers gateways per selected interface via `ip route get`, installs per-uplink MASQUERADE and a multipath default route; requires at least two interfaces with gateways. The TUI disables the server field and marks interfaces without gateways in red/unselectable. Supports IPv4 and IPv6 gateways.
 
 ### Flags (CLI)
@@ -104,14 +104,11 @@ go build -o client ./client
 - `-server` (string): Server host:port for control; if port omitted, `-ctrl` is used.
 - `-ifaces` (string): Comma-separated interface names to bind UDP sockets (Linux `SO_BINDTODEVICE`).
 - `-ips` (string): Comma-separated source IPs matching interfaces (optional).
-- `-conns` (int, default 2): Number of parallel UDP connections.
 - `-pki` (string, default `~/.fluxify`): PKI directory containing CA and client cert/key in flat files.
-- `-client` (string): Client certificate name (CN); required for bonding.
+- `-cert` (string): Path to client bundle (.pem with cert+key); if omitted, auto-detects a single bundle in `-pki`.
 - `-ctrl` (int, default 8443): Control-plane TLS port if not specified in `-server`.
 - `-b` (bool): Force bonding mode (headless/scripted).
 - `-l` (bool): Force load-balance mode (headless/scripted).
-- `-policy-routing` (bool): Placeholder flag; policy routing helper exists but is not auto-applied.
-- `-gws` (string): Comma-separated gateways matching ifaces/IPs (for future policy routing).
 
 ### Client TUI
 
@@ -126,6 +123,7 @@ go build -o client ./client
 
 - Obtain client cert/key from the server (generated via TUI or headless) and place them directly under the client PKI dir (flat layout): either a bundle `<name>.pem` containing cert+key or `<name>.pem` + `<name>-key.pem`, plus `ca.pem`.
 - Ensure the server certificate SANs include the hostname/IP used by the client; otherwise, TLS validation will fail.
+- CLI can point to a bundle explicitly via `-cert`; if omitted, the client auto-detects a single bundle in `-pki`.
 
 Notes on PKI layout and server vs client:
 
@@ -156,7 +154,7 @@ Notes on PKI layout and server vs client:
 3. **Client run (TUI recommended):**
 
    ```bash
-   sudo ./client -server SERVER_IP:8443 -client alice -pki ~/.fluxify -conns 2
+   sudo ./client -server SERVER_IP:8443 -cert ~/.fluxify/alice.pem -pki ~/.fluxify
    ```
 
    In the TUI, select mode (bonding/load-balance), pick at least two interfaces, ensure server is set for bonding, then Start.

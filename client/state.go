@@ -47,23 +47,21 @@ type clientState struct {
 }
 
 type clientConfig struct {
-	Server        string
-	Ifaces        []string
-	IPs           []string
-	Conns         int
-	Mode          string
-	PKI           string
-	Client        string
-	Ctrl          int
-	PolicyRouting bool
-	Gateways      []string
+	Server string
+	Ifaces []string
+	IPs    []string
+	Mode   string
+	PKI    string
+	Cert   string
+	Ctrl   int
 }
 
 type storedConfig struct {
 	Server string   `json:"server"`
 	Mode   string   `json:"mode"`
 	Ifaces []string `json:"ifaces"`
-	Client string   `json:"client"`
+	Cert   string   `json:"cert,omitempty"`
+	Client string   `json:"client,omitempty"`
 	PKI    string   `json:"pki"`
 	Ctrl   int      `json:"ctrl"`
 }

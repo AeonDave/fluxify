@@ -72,15 +72,11 @@ func main() {
 	server := flag.String("server", "", "server host:port (optional, overridden by TUI)")
 	ifacesStr := flag.String("ifaces", "", "comma-separated interface names (optional)")
 	localIPs := flag.String("ips", "", "comma-separated source IPs (optional)")
-	nconns := flag.Int("conns", 2, "number of parallel UDP conns")
 	bondingFlag := flag.Bool("b", false, "force bonding mode")
 	loadBalanceFlag := flag.Bool("l", false, "force load-balance mode")
 	pkiDir := flag.String("pki", "", "PKI directory (defaults to ~/.fluxify)")
-	clientName := flag.String("client", "", "client certificate name (CN)")
+	certPath := flag.String("cert", "", "path to client bundle (.pem with cert+key)")
 	ctrlPort := flag.Int("ctrl", 8443, "control TLS port")
-	policyRouting := flag.Bool("policy-routing", false, "install per-interface policy routing (linux only)")
-	gateways := flag.String("gws", "", "comma-separated gateways matching ifaces/IPs (optional)")
-	tuiAutoStart := flag.Bool("tui-autostart", false, "auto-start in TUI after elevation")
 	flag.Parse()
 
 	chosenPKI := *pkiDir
@@ -88,21 +84,19 @@ func main() {
 		chosenPKI = defaultPKIDir()
 	}
 	initialCfg := clientConfig{
-		Server:        *server,
-		Ifaces:        splitCSV(*ifacesStr),
-		IPs:           splitCSV(*localIPs),
-		Conns:         *nconns,
-		Mode:          modeBonding,
-		PKI:           chosenPKI,
-		Client:        *clientName,
-		Ctrl:          *ctrlPort,
-		PolicyRouting: *policyRouting,
-		Gateways:      splitCSV(*gateways),
+		Server: *server,
+		Ifaces: splitCSV(*ifacesStr),
+		IPs:    splitCSV(*localIPs),
+		Mode:   modeBonding,
+		PKI:    chosenPKI,
+		Cert:   *certPath,
+		Ctrl:   *ctrlPort,
 	}
 
 	// If -pki was explicitly provided, don't let stored config override it.
 	pkiFromCLI := *pkiDir != ""
-	initialCfg = mergeWithStoredConfig(initialCfg, pkiFromCLI)
+	certFromCLI := *certPath != ""
+	initialCfg = mergeWithStoredConfig(initialCfg, pkiFromCLI, certFromCLI)
 	if *loadBalanceFlag {
 		initialCfg.Mode = modeLoadBalance
 	} else if *bondingFlag {
@@ -121,35 +115,29 @@ func main() {
 		log.Fatalf("ensure base dirs: %v", err)
 	}
 
-	// If launched with --tui-autostart (after elevation), go to TUI with auto-start
-	if *tuiAutoStart {
-		runTUIHook(initialCfg, true)
-		return
-	}
-
 	autoMode := *loadBalanceFlag || *bondingFlag
 	if !autoMode {
-		runTUIHook(initialCfg, false)
+		runTUIHook(initialCfg)
 		return
 	}
 
 	cfg := initialCfg
-	if cfg.Conns <= 0 {
-		cfg.Conns = len(cfg.Ifaces)
-	}
 	exitIf(len(cfg.Ifaces) < 2, "need at least 2 interfaces (found %d)", len(cfg.Ifaces))
 	exitIf(cfg.Mode == modeBonding && cfg.Server == "", "server is required in bonding mode")
-	if cfg.Mode == modeBonding && cfg.Client == "" {
-		name, err := detectClientCertName(cfg.PKI)
+	if cfg.Mode == modeBonding && cfg.Cert == "" {
+		path, err := detectClientBundlePath(cfg.PKI)
 		exitIf(err != nil, "client cert: %v", err)
-		cfg.Client = name
+		cfg.Cert = path
+	}
+	if cfg.Cert != "" {
+		cfg.Cert = expandPath(cfg.Cert)
 	}
 
 	stop, err := startClient(cfg)
 	if err != nil {
 		log.Fatalf("start: %v", err)
 	}
-	saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Client: cfg.Client, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
+	saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Cert: cfg.Cert, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
 	log.Printf("running in %s mode; press Ctrl-C to stop", cfg.Mode)
 
 	sigc := make(chan os.Signal, 1)
@@ -161,7 +149,8 @@ func main() {
 	log.Printf("stopped")
 }
 
-func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI bool) clientConfig {
+func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI, certFromCLI bool) clientConfig {
+	storedClient := ""
 	if stored, err := loadStoredConfig(); err == nil {
 		if stored.Server != "" {
 			cfg.Server = stored.Server
@@ -172,8 +161,11 @@ func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI bool) clientConfig {
 		if len(stored.Ifaces) > 0 {
 			cfg.Ifaces = stored.Ifaces
 		}
+		if stored.Cert != "" && !certFromCLI {
+			cfg.Cert = stored.Cert
+		}
 		if stored.Client != "" {
-			cfg.Client = stored.Client
+			storedClient = stored.Client
 		}
 		// Only use stored PKI if CLI didn't explicitly provide one.
 		if stored.PKI != "" && !pkiFromCLI {
@@ -190,6 +182,11 @@ func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI bool) clientConfig {
 	cfg.PKI = normalizePKIPath(cfg.PKI)
 	// Expand to absolute path for consistent config usage.
 	cfg.PKI = expandPath(cfg.PKI)
+	if cfg.Cert == "" {
+		if storedClient != "" && !certFromCLI {
+			cfg.Cert = filepath.Join(cfg.PKI, storedClient+".pem")
+		}
+	}
 	return cfg
 }
 
@@ -360,15 +357,15 @@ func pathWithinHome(p, home string) bool {
 	return !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
 }
 
-// detectClientCertName scans pkiDir for a single bundle .pem containing cert+key.
+// detectClientBundlePath scans pkiDir for a single bundle .pem containing cert+key.
 // Ignores ca.pem, config.json, and files without a private key.
-func detectClientCertName(pkiDir string) (string, error) {
+func detectClientBundlePath(pkiDir string) (string, error) {
 	pkiDir = expandPath(pkiDir)
 	ents, err := os.ReadDir(pkiDir)
 	if err != nil {
 		return "", fmt.Errorf("read dir %s: %w", pkiDir, err)
 	}
-	var names []string
+	var bundles []string
 	for _, ent := range ents {
 		if ent.IsDir() {
 			continue
@@ -381,19 +378,32 @@ func detectClientCertName(pkiDir string) (string, error) {
 		if name == "ca.pem" || name == "server.pem" || name == "server-key.pem" {
 			continue
 		}
-		base := strings.TrimSuffix(name, ".pem")
+		full := filepath.Join(pkiDir, name)
 		// Must be a bundle with private key inside
-		if hasCertAndKey(filepath.Join(pkiDir, name)) {
-			names = append(names, base)
+		if hasCertAndKey(full) {
+			bundles = append(bundles, full)
 		}
 	}
-	if len(names) == 0 {
+	if len(bundles) == 0 {
 		return "", fmt.Errorf("no client bundle found in %s (need .pem with cert+key)", pkiDir)
 	}
-	if len(names) > 1 {
+	if len(bundles) > 1 {
+		var names []string
+		for _, b := range bundles {
+			names = append(names, filepath.Base(b))
+		}
 		return "", fmt.Errorf("multiple client bundles found: %s", strings.Join(names, ", "))
 	}
-	return names[0], nil
+	return bundles[0], nil
+}
+
+// detectClientCertName returns the base name of the only bundle in pkiDir.
+func detectClientCertName(pkiDir string) (string, error) {
+	path, err := detectClientBundlePath(pkiDir)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(filepath.Base(path), ".pem"), nil
 }
 
 // hasCertAndKey reports whether the PEM file contains at least one CERTIFICATE and one private key.

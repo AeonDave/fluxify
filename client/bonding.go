@@ -9,7 +9,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -22,9 +21,6 @@ import (
 )
 
 func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
-	if cfg.Client == "" {
-		return nil, nil, fmt.Errorf("client name required")
-	}
 	cfg.Ifaces = sanitizeIfaces(cfg.Ifaces)
 	if len(cfg.Ifaces) < 2 {
 		return nil, nil, fmt.Errorf("need at least 2 usable interfaces for bonding")
@@ -35,7 +31,11 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	if runtime.GOOS == "linux" && !common.IsRoot() {
 		return nil, nil, fmt.Errorf("run the client with sudo/root on linux to create the TUN interface")
 	}
-	log.Printf("bonding: starting with client=%s server=%s pki=%s", cfg.Client, cfg.Server, cfg.PKI)
+	certInfo := cfg.Cert
+	if certInfo == "" {
+		certInfo = "(auto)"
+	}
+	log.Printf("bonding: starting with cert=%s server=%s pki=%s", certInfo, cfg.Server, cfg.PKI)
 	ctrlHost, ctrlPort, err := parseServerAddr(cfg.Server, cfg.Ctrl)
 	if err != nil {
 		return nil, nil, err
@@ -132,7 +132,8 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		log.Printf("bonding: loopback server detected (%s); skipping route changes and iface binding for testing", serverUDP.String())
 	}
 
-	for i := 0; i < cfg.Conns; i++ {
+	numConns := len(cfg.Ifaces)
+	for i := 0; i < numConns; i++ {
 		iface := pickIndex(cfg.Ifaces, i)
 		ip := pickIndex(cfg.IPs, i)
 		if isLoopback {
@@ -462,7 +463,7 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 		_ = conn.Close()
 	}(conn)
 
-	req := common.ControlRequest{ClientName: cfg.Client}
+	req := common.ControlRequest{}
 	buf, _ := req.Marshal()
 	if _, err := conn.Write(buf); err != nil {
 		return nil, 0, 0, "", "", err
@@ -524,8 +525,16 @@ func classifyTLSError(err error) error {
 }
 
 func clientTLSConfig(cfg clientConfig) (*tls.Config, error) {
-	pkiDir := expandPath(cfg.PKI)
-	bundlePath := filepath.Join(pkiDir, cfg.Client+".pem")
+	bundlePath := cfg.Cert
+	if bundlePath == "" {
+		var err error
+		bundlePath, err = detectClientBundlePath(cfg.PKI)
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		bundlePath = expandPath(bundlePath)
+	}
 	caPool, cert, err := parseBundlePEM(bundlePath)
 	if err != nil {
 		return nil, err

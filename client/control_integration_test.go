@@ -91,7 +91,7 @@ func TestFetchSessionEndToEnd(t *testing.T) {
 	addr, stop := startTempControlServer(t, pki)
 	defer stop()
 
-	cfg := clientConfig{Server: addr, PKI: pki.Dir, Client: "bob", Ctrl: 0}
+	cfg := clientConfig{Server: addr, PKI: pki.Dir, Cert: bundlePath, Ctrl: 0}
 	key, sessID, udpPort, clientIP, clientIPv6, err := fetchSession(addr, cfg)
 	if err != nil {
 		t.Fatalf("fetchSession: %v", err)
@@ -119,7 +119,7 @@ func TestFetchSessionRejectsWithoutCert(t *testing.T) {
 	defer stop()
 
 	// Missing client cert/key should fail during tls.Dial
-	cfg := clientConfig{Server: addr, PKI: pki.Dir, Client: "missing", Ctrl: 0}
+	cfg := clientConfig{Server: addr, PKI: pki.Dir, Cert: filepath.Join(pki.Dir, "missing.pem"), Ctrl: 0}
 	if _, _, _, _, _, err := fetchSession(addr, cfg); err == nil {
 		t.Fatalf("expected error without client cert")
 	}

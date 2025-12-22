@@ -2,15 +2,15 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
 	"strings"
-	"sync"
-
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -23,7 +23,13 @@ import (
 type ifaceChoice struct {
 	Name       string
 	IP         string
+	MTU        int
+	Gw         string
+	Gw6        string
 	HasGateway bool
+	Up         bool
+	Loopback   bool
+	Virtual    bool
 }
 
 type tuiRunner struct{}
@@ -41,12 +47,11 @@ func (tuiRunner) OutputSafe(name string, args ...string) ([]byte, error) {
 }
 
 // runTUI launches the interactive UI for bonding/load-balance configuration.
-func runTUI(initial clientConfig, autoStart bool) {
+func runTUI(initial clientConfig) {
 	app := tview.NewApplication()
 	app.EnableMouse(true)
 
 	state := newTUIState(initial)
-	autoStartOnce := sync.Once{}
 
 	// Widgets
 	modeDrop := tview.NewDropDown().SetLabel("Mode ")
@@ -62,38 +67,54 @@ func runTUI(initial clientConfig, autoStart bool) {
 
 	ifaceList := tview.NewList().ShowSecondaryText(true)
 	ifaceList.SetBorder(true).SetTitle("Interfaces (select with mouse/Enter)")
-	ifaceList.SetSelectedBackgroundColor(tcell.ColorWhite)
-	ifaceList.SetSelectedTextColor(tcell.ColorBlack)
+	ifaceList.SetSelectedBackgroundColor(tcell.ColorDarkSlateGray)
+	ifaceList.SetSelectedTextColor(tcell.ColorWhite)
 
 	info := tview.NewTextView().SetDynamicColors(true).SetWordWrap(true).SetWrap(true)
 	info.SetBorder(true).SetTitle("Info & Usage")
 	log.SetOutput(&tuiLogWriter{app: app, view: info})
 
-	status := tview.NewTextView().SetDynamicColors(true).SetText("Select mode, server, and at least 2 interfaces")
-	status.SetBorder(true).SetTitle("Status")
+	statusBar := tview.NewTextView().SetDynamicColors(true)
+	statusBar.SetBorder(true).SetTitle("Status")
 
-	styleBtn := func(b *tview.Button) {
+	actionStatus := tview.NewTextView().SetDynamicColors(true).SetText("Idle")
+	actionStatus.SetBorder(true).SetTitle("Activity")
+
+	styleActionBtn := func(b *tview.Button, bg tcell.Color) {
 		b.SetBorder(false)
-		b.SetBackgroundColor(tcell.ColorDefault)
+		b.SetBackgroundColor(bg)
 		b.SetLabelColor(tcell.ColorWhite)
 		b.SetLabelColorActivated(tcell.ColorYellow)
 	}
 
-	startBtn := tview.NewButton("[ Start ]")
-	styleBtn(startBtn)
-	stopBtn := tview.NewButton("[ Stop ]")
-	styleBtn(stopBtn)
+	startBtn := tview.NewButton(" START ")
+	styleActionBtn(startBtn, tcell.ColorDarkGreen)
+	stopBtn := tview.NewButton(" STOP ")
+	styleActionBtn(stopBtn, tcell.ColorDarkRed)
 	stopBtn.SetDisabled(true)
-	refreshBtn := tview.NewButton("[ Refresh IFs ]")
-	styleBtn(refreshBtn)
-	quitBtn := tview.NewButton("[ Quit ]")
-	styleBtn(quitBtn)
+	refreshBtn := tview.NewButton(" REFRESH IFs ")
+	styleActionBtn(refreshBtn, tcell.ColorDarkBlue)
+	quitBtn := tview.NewButton(" QUIT ")
+	styleActionBtn(quitBtn, tcell.ColorDarkSlateGray)
 
 	// Layout: top row = Config (left 1/2) + Actions (right 1/2)
 	configBox := tview.NewFlex().SetDirection(tview.FlexRow)
 	configBox.SetBorder(true).SetTitle("Config")
 	configBox.AddItem(modeDrop, 1, 0, false)
 	configBox.AddItem(serverField, 1, 0, false)
+
+	filterUp := true
+	filterGateway := true
+	filterNonVirtual := true
+
+	filterUpBox := tview.NewCheckbox().SetLabel("Up").SetChecked(true)
+	filterGatewayBox := tview.NewCheckbox().SetLabel("Gateway").SetChecked(true)
+	filterNonVirtualBox := tview.NewCheckbox().SetLabel("Non-virtual").SetChecked(true)
+	filtersRow := tview.NewFlex().SetDirection(tview.FlexColumn)
+	filtersRow.AddItem(filterUpBox, 0, 1, false)
+	filtersRow.AddItem(filterGatewayBox, 0, 1, false)
+	filtersRow.AddItem(filterNonVirtualBox, 0, 1, false)
+	configBox.AddItem(filtersRow, 1, 0, false)
 
 	actionsBox := tview.NewFlex().SetDirection(tview.FlexRow)
 	actionsBox.SetBorder(true).SetTitle("Actions")
@@ -113,10 +134,11 @@ func runTUI(initial clientConfig, autoStart bool) {
 
 	// Main layout
 	form := tview.NewFlex().SetDirection(tview.FlexRow)
-	form.AddItem(topRow, 9, 0, false)
+	form.AddItem(topRow, 11, 0, false)
+	form.AddItem(statusBar, 2, 0, false)
 	form.AddItem(ifaceList, 0, 1, true)
 	form.AddItem(info, 10, 0, false)
-	form.AddItem(status, 3, 0, false)
+	form.AddItem(actionStatus, 3, 0, false)
 
 	app.SetRoot(form, true).SetFocus(ifaceList)
 
@@ -127,6 +149,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 	var updateStatus func()
 	var persistConfig func()
 	var start func()
+	var scanInFlight bool
 
 	serverFieldDisabled := false
 	suppressServerChange := false
@@ -137,35 +160,43 @@ func runTUI(initial clientConfig, autoStart bool) {
 			return
 		}
 		cfg := state.buildConfig()
-		saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Client: cfg.Client, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
+		saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Cert: cfg.Cert, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
 	}
 
 	redrawList = func() {
 		ifaceList.Clear()
 		for _, c := range state.choices {
+			if filterUp && !c.Up {
+				continue
+			}
+			if filterGateway && !c.HasGateway {
+				continue
+			}
+			if filterNonVirtual && (c.Virtual || c.Loopback) {
+				continue
+			}
 			checked := state.selected[c.Name]
-			label := c.Name
-			if c.IP != "" {
-				label += " (" + c.IP + ")"
-			}
-			mark := "[ ] "
+			ext := externalLabelFor(state, c)
+			label := formatIfaceLabel(c, ext)
+			selTag := "[gray]---[white]"
 			if checked {
-				mark = "[x] "
+				selTag = "[green]SEL[white]"
 			}
-			if !c.HasGateway {
+			availTag := "[green]OK[white]"
+			if !ifaceSelectable(c) {
 				state.selected[c.Name] = false
-				label = "[red]" + label + " (no gateway)"
-				mark = "[ ] "
+				availTag = "[red]NO[white]"
 			}
+			line := fmt.Sprintf("%s %s %s", selTag, availTag, label)
 			choice := c
-			ifaceList.AddItem(mark+label, "", 0, func() {
+			ifaceList.AddItem(line, "", 0, func() {
 				// Block toggles while running
 				if starting || state.running != nil {
-					status.SetText("[yellow]Running: stop before changing interfaces")
+					actionStatus.SetText("[yellow]Running: stop before changing interfaces")
 					return
 				}
-				if !choice.HasGateway {
-					status.SetText("[red]Interface has no gateway; pick another")
+				if !ifaceSelectable(choice) {
+					actionStatus.SetText("[red]Interface unavailable; pick another")
 					return
 				}
 				state.toggle(choice.Name)
@@ -179,11 +210,18 @@ func runTUI(initial clientConfig, autoStart bool) {
 	refreshIfaces = func() {
 		// Do not allow modifying interface list while starting or running
 		if starting || state.running != nil {
-			status.SetText("[yellow]Running: stop before changing interfaces")
+			actionStatus.SetText("[yellow]Running: stop before changing interfaces")
 			return
 		}
-		ifaceList.Clear()
-		ifaceList.AddItem("[yellow]Scanning interfaces... please wait", "", 0, nil)
+		if scanInFlight {
+			return
+		}
+		scanInFlight = true
+		actionStatus.SetText("[yellow]Scanning interfaces...")
+		if len(state.choices) == 0 {
+			ifaceList.Clear()
+			ifaceList.AddItem("[yellow]Scanning interfaces... please wait", "", 0, nil)
+		}
 
 		go func() {
 			defer func() {
@@ -192,9 +230,12 @@ func runTUI(initial clientConfig, autoStart bool) {
 					log.Printf("%s", msg)
 					// Try to show error in UI
 					app.QueueUpdateDraw(func() {
-						ifaceList.Clear()
-						ifaceList.AddItem(fmt.Sprintf("[red]Scan crashed: %v", r), "", 0, nil)
-						status.SetText("[red]Scanner crashed")
+						if len(state.choices) == 0 {
+							ifaceList.Clear()
+							ifaceList.AddItem(fmt.Sprintf("[red]Scan crashed: %v", r), "", 0, nil)
+						}
+						actionStatus.SetText("[red]Scanner crashed")
+						scanInFlight = false
 					})
 				}
 			}()
@@ -211,18 +252,23 @@ func runTUI(initial clientConfig, autoStart bool) {
 						state.selected[c.Name] = false
 					}
 				}
-				redrawList()
-				updateButtons()
-				if autoStart && state.canStart() {
-					autoStartOnce.Do(func() { start() })
+				if len(choices) == 0 {
+					ifaceList.Clear()
+					ifaceList.AddItem("[red]No interfaces found", "", 0, nil)
+				} else {
+					redrawList()
 				}
+				updateButtons()
+				queueExternalIPChecks(app, state, choices, redrawList, updateButtons)
+				actionStatus.SetText("Idle")
+				scanInFlight = false
 			})
 		}()
 	}
 
 	refreshBtn.SetSelectedFunc(func() {
 		if starting || state.running != nil {
-			status.SetText("[yellow]Running: stop before changing interfaces")
+			actionStatus.SetText("[yellow]Running: stop before changing interfaces")
 			return
 		}
 		refreshIfaces()
@@ -282,15 +328,31 @@ func runTUI(initial clientConfig, autoStart bool) {
 		updateStatus()
 	}
 
-	setStatus := func(msg string) {
+	filterUpBox.SetChangedFunc(func(checked bool) {
+		filterUp = checked
+		redrawList()
+		updateButtons()
+	})
+	filterGatewayBox.SetChangedFunc(func(checked bool) {
+		filterGateway = checked
+		redrawList()
+		updateButtons()
+	})
+	filterNonVirtualBox.SetChangedFunc(func(checked bool) {
+		filterNonVirtual = checked
+		redrawList()
+		updateButtons()
+	})
+
+	setActionStatus := func(msg string) {
 		app.QueueUpdateDraw(func() {
-			status.SetText(msg)
+			actionStatus.SetText(msg)
 		})
 	}
 
-	// setStatusDirect updates status without QueueUpdateDraw (safe before app.Run)
-	setStatusDirect := func(msg string) {
-		status.SetText(msg)
+	// setStatusBarDirect updates status bar without QueueUpdateDraw (safe before app.Run)
+	setStatusBarDirect := func(msg string) {
+		statusBar.SetText(msg)
 	}
 
 	updateStatus = func() {
@@ -302,7 +364,19 @@ func runTUI(initial clientConfig, autoStart bool) {
 		if state.mode == modeLoadBalance {
 			srv = "(local)"
 		}
-		msg := fmt.Sprintf("Mode: %s | Server: %s | Selected IFs: %d", state.mode, srv, selected)
+		visibleCount := countVisibleChoices(state.choices, filterUp, filterGateway, filterNonVirtual)
+		visibleSelected := countVisibleSelected(state.choices, state.selected, filterUp, filterGateway, filterNonVirtual)
+		stateLabel := "IDLE"
+		stateColor := "[white]"
+		if starting {
+			stateLabel = "STARTING"
+			stateColor = "[yellow]"
+		} else if state.running != nil {
+			stateLabel = "RUNNING"
+			stateColor = "[green]"
+		}
+		msg := fmt.Sprintf("Mode: %s | Server: %s | IFs: %d selected (%d/%d shown) | State: %s%s[white]",
+			state.mode, srv, selected, visibleSelected, visibleCount, stateColor, stateLabel)
 
 		var certErr error
 		if state.mode == modeBonding {
@@ -326,11 +400,12 @@ func runTUI(initial clientConfig, autoStart bool) {
 		if selected < 2 {
 			needs = append(needs, ">=2 ifs")
 		}
+		filterLine := fmt.Sprintf("Filters: up=%s gw=%s non-virtual=%s", onOff(filterUp), onOff(filterGateway), onOff(filterNonVirtual))
 		if len(needs) > 0 {
-			msg += " [yellow](need " + strings.Join(needs, ", ") + ")"
+			filterLine += " | Need: " + strings.Join(needs, ", ")
 		}
 
-		setStatusDirect(msg)
+		setStatusBarDirect(msg + "\n" + filterLine)
 	}
 
 	start = func() {
@@ -343,17 +418,17 @@ func runTUI(initial clientConfig, autoStart bool) {
 			state.server = strings.TrimSpace(serverField.GetText())
 		}
 		if !state.canStart() {
-			setStatus("[red]Select server and at least 2 interfaces (server only needed for bonding)")
+			setActionStatus("[red]Select server and at least 2 interfaces (server only needed for bonding)")
 			starting = false
 			return
 		}
 		if state.mode == modeBonding {
-			name, err := detectClientCertName(state.pki)
+			path, err := detectClientBundlePath(state.pki)
 			if err != nil {
-				setStatus(fmt.Sprintf("[red]%v", err))
+				setActionStatus(fmt.Sprintf("[red]%v", err))
 				return
 			}
-			state.client = name
+			state.cert = path
 		}
 		cfg := state.buildConfig()
 
@@ -366,7 +441,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 		// Clear usage text and show we're starting
 		info.Clear()
 		_, _ = fmt.Fprintf(info, "Starting %s mode...\n", cfg.Mode)
-		runAsync(app, status, "Starting", func() error {
+		runAsync(app, actionStatus, "Starting", func() error {
 			log.Printf("start: calling startClientWithStats")
 			fn, err := startClientWithStats(cfg, info, app)
 			if err != nil {
@@ -389,7 +464,8 @@ func runTUI(initial clientConfig, autoStart bool) {
 				return
 			}
 			state.running = stopper
-			saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Client: cfg.Client, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
+			_, _ = fmt.Fprintf(info, "[green]Started %s with %d interfaces.[white]\n", cfg.Mode, len(cfg.Ifaces))
+			saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Cert: cfg.Cert, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
 			stopBtn.SetDisabled(false)
 		})
 	}
@@ -397,7 +473,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 	stop := func() {
 		if state.running != nil {
 			stopBtn.SetDisabled(true)
-			runAsync(app, status, "Stopping", func() error {
+			runAsync(app, actionStatus, "Stopping", func() error {
 				state.running()
 				state.running = nil
 				return nil
@@ -406,6 +482,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 				// Allow interface changes again
 				refreshBtn.SetDisabled(false)
 				showUsageInInfo(info, state.mode)
+				_, _ = fmt.Fprintln(info, "[green]Stopped.[white]")
 				updateButtons()
 			})
 			return
@@ -413,7 +490,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 		startBtn.SetDisabled(!state.canStart())
 		stopBtn.SetDisabled(true)
 		refreshBtn.SetDisabled(false)
-		setStatus("[yellow]stopped")
+		setActionStatus("[yellow]stopped")
 		updateButtons()
 	}
 
@@ -461,7 +538,7 @@ func runTUI(initial clientConfig, autoStart bool) {
 type tuiState struct {
 	mode     string
 	server   string
-	client   string
+	cert     string
 	pki      string
 	ctrl     int
 	choices  []ifaceChoice
@@ -469,18 +546,26 @@ type tuiState struct {
 	running  func()
 
 	ifaceIPs map[string]string
+	extIP    map[string]string
+	extErr   map[string]string
+	extAt    map[string]time.Time
+	extBusy  map[string]bool
 }
 
 func newTUIState(initial clientConfig) *tuiState {
 	st := &tuiState{
 		mode:     initial.Mode,
 		server:   initial.Server,
-		client:   initial.Client,
+		cert:     initial.Cert,
 		pki:      initial.PKI,
 		ctrl:     initial.Ctrl,
 		selected: make(map[string]bool),
 		ifaceIPs: make(map[string]string),
 		choices:  make([]ifaceChoice, 0),
+		extIP:    make(map[string]string),
+		extErr:   make(map[string]string),
+		extAt:    make(map[string]time.Time),
+		extBusy:  make(map[string]bool),
 	}
 	for _, name := range initial.Ifaces {
 		st.selected[name] = true
@@ -530,30 +615,243 @@ func scanInterfaces() ([]ifaceChoice, map[string]string) {
 	choices := make([]ifaceChoice, 0)
 	ips := make(map[string]string)
 	for _, iface := range ifaces {
-		// filter: up, not loopback, has IPv4, skip obvious virtual (tap, tun, docker, veth)
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		lname := strings.ToLower(iface.Name)
-		if strings.HasPrefix(lname, "lo") || strings.Contains(lname, "docker") || strings.Contains(lname, "veth") || strings.Contains(lname, "br-") || strings.Contains(lname, "tun") || strings.Contains(lname, "tap") {
-			continue
-		}
+		up := iface.Flags&net.FlagUp != 0
+		loopback := iface.Flags&net.FlagLoopback != 0
+		virtual := isVirtualIfaceName(iface.Name)
 		addrs, _ := iface.Addrs()
+		ip := ""
 		for _, a := range addrs {
 			ipNet, ok := a.(*net.IPNet)
-			if !ok || ipNet.IP == nil || ipNet.IP.To4() == nil {
+			if !ok || ipNet.IP == nil {
 				continue
 			}
+			if v4 := ipNet.IP.To4(); v4 != nil {
+				ip = v4.String()
+				break
+			}
+		}
+		gw := ""
+		gw6 := ""
+		if up && !loopback {
 			log.Printf("scanInterfaces: checking %s", iface.Name)
-			gw, _ := platform.GatewayForIface(tuiRunner{}, iface.Name)
-			choices = append(choices, ifaceChoice{Name: iface.Name, IP: ipNet.IP.String(), HasGateway: gw != ""})
-			ips[iface.Name] = ipNet.IP.String()
-			break
+			gw, _ = platform.GatewayForIface(tuiRunner{}, iface.Name)
+			gw6, _ = platform.GatewayForIface6(tuiRunner{}, iface.Name)
+		}
+		hasGateway := gw != "" || gw6 != ""
+		if ip == "" && !hasGateway && !up {
+			continue
+		}
+		choices = append(choices, ifaceChoice{
+			Name:       iface.Name,
+			IP:         ip,
+			MTU:        iface.MTU,
+			Gw:         gw,
+			Gw6:        gw6,
+			HasGateway: hasGateway,
+			Up:         up,
+			Loopback:   loopback,
+			Virtual:    virtual,
+		})
+		if ip != "" {
+			ips[iface.Name] = ip
 		}
 	}
 	sort.Slice(choices, func(i, j int) bool { return choices[i].Name < choices[j].Name })
 	log.Printf("scanInterfaces: found %d candidates", len(choices))
 	return choices, ips
+}
+
+func isVirtualIfaceName(name string) bool {
+	lname := strings.ToLower(name)
+	return strings.HasPrefix(lname, "lo") ||
+		strings.Contains(lname, "docker") ||
+		strings.Contains(lname, "veth") ||
+		strings.Contains(lname, "br-") ||
+		strings.Contains(lname, "tun") ||
+		strings.Contains(lname, "tap")
+}
+
+func ifaceSelectable(c ifaceChoice) bool {
+	if !c.HasGateway || !c.Up {
+		return false
+	}
+	if c.Virtual || c.Loopback {
+		return false
+	}
+	return true
+}
+
+func formatIfaceLabel(c ifaceChoice, ext string) string {
+	ip := c.IP
+	if ip == "" {
+		ip = "-"
+	}
+	gw := "-"
+	if c.Gw != "" {
+		gw = c.Gw
+	}
+	if c.Gw6 != "" {
+		if gw == "-" {
+			gw = c.Gw6
+		} else {
+			gw = gw + "/" + c.Gw6
+		}
+	}
+	ip = truncate(ip, 18)
+	gw = truncate(gw, 22)
+	ext = truncate(ext, 15)
+	state := "[red]DOWN"
+	if c.Up {
+		state = "[green]UP"
+	}
+	flags := ""
+	if c.Virtual || c.Loopback {
+		flags = " [gray](virt)"
+	}
+	return fmt.Sprintf("%-10s %-18s mtu:%4d gw:%-22s ext:%-15s %s[white]%s", c.Name, ip, c.MTU, gw, ext, state, flags)
+}
+
+func externalLabelFor(st *tuiState, c ifaceChoice) string {
+	if c.IP == "" || !c.Up || !c.HasGateway {
+		return "-"
+	}
+	if st.extBusy[c.Name] {
+		return "..."
+	}
+	if ip := st.extIP[c.Name]; ip != "" {
+		return ip
+	}
+	if st.extErr[c.Name] != "" {
+		return "err"
+	}
+	return "..."
+}
+
+func queueExternalIPChecks(app *tview.Application, st *tuiState, choices []ifaceChoice, redrawList func(), updateButtons func()) {
+	now := time.Now()
+	for _, c := range choices {
+		if c.IP == "" || !c.Up || !c.HasGateway {
+			continue
+		}
+		if st.extBusy[c.Name] {
+			continue
+		}
+		if at, ok := st.extAt[c.Name]; ok && now.Sub(at) < 60*time.Second {
+			continue
+		}
+		name := c.Name
+		localIP := c.IP
+		st.extBusy[name] = true
+		go func() {
+			ip, err := fetchExternalIP(localIP)
+			app.QueueUpdateDraw(func() {
+				st.extBusy[name] = false
+				st.extAt[name] = time.Now()
+				if err != nil {
+					log.Printf("external ip (%s): %v", name, err)
+					st.extErr[name] = err.Error()
+					st.extIP[name] = ""
+				} else {
+					st.extErr[name] = ""
+					st.extIP[name] = ip
+				}
+				redrawList()
+				updateButtons()
+			})
+		}()
+	}
+}
+
+func truncate(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 3 {
+		return s[:max]
+	}
+	return s[:max-3] + "..."
+}
+
+func fetchExternalIP(localIP string) (string, error) {
+	if localIP == "" {
+		return "", fmt.Errorf("no local ip")
+	}
+	ip := net.ParseIP(localIP)
+	if ip == nil {
+		return "", fmt.Errorf("invalid local ip: %s", localIP)
+	}
+	dialer := &net.Dialer{
+		Timeout:   3 * time.Second,
+		LocalAddr: &net.TCPAddr{IP: ip},
+	}
+	tr := &http.Transport{
+		DialContext:         dialer.DialContext,
+		TLSHandshakeTimeout: 3 * time.Second,
+	}
+	client := &http.Client{
+		Timeout:   5 * time.Second,
+		Transport: tr,
+	}
+	resp, err := client.Get("https://api.ipify.org")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return "", err
+	}
+	ext := strings.TrimSpace(string(body))
+	if net.ParseIP(ext) == nil {
+		return "", fmt.Errorf("invalid response: %q", ext)
+	}
+	return ext, nil
+}
+
+func onOff(v bool) string {
+	if v {
+		return "on"
+	}
+	return "off"
+}
+
+func countVisibleChoices(choices []ifaceChoice, filterUp, filterGateway, filterNonVirtual bool) int {
+	count := 0
+	for _, c := range choices {
+		if filterUp && !c.Up {
+			continue
+		}
+		if filterGateway && !c.HasGateway {
+			continue
+		}
+		if filterNonVirtual && (c.Virtual || c.Loopback) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func countVisibleSelected(choices []ifaceChoice, selected map[string]bool, filterUp, filterGateway, filterNonVirtual bool) int {
+	count := 0
+	for _, c := range choices {
+		if filterUp && !c.Up {
+			continue
+		}
+		if filterGateway && !c.HasGateway {
+			continue
+		}
+		if filterNonVirtual && (c.Virtual || c.Loopback) {
+			continue
+		}
+		if selected[c.Name] {
+			count++
+		}
+	}
+	return count
 }
 
 func (s *tuiState) buildConfig() clientConfig {
@@ -573,10 +871,9 @@ func (s *tuiState) buildConfig() clientConfig {
 		Server: server,
 		Ifaces: ifaces,
 		IPs:    ips,
-		Conns:  len(ifaces),
 		Mode:   s.mode,
 		PKI:    s.pki,
-		Client: s.client,
+		Cert:   s.cert,
 		Ctrl:   s.ctrl,
 	}
 }
