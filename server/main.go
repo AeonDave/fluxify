@@ -5,11 +5,16 @@ package main
 
 import (
 	"flag"
+	"fmt"
+	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"fluxify/common"
 )
@@ -31,8 +36,21 @@ func main() {
 
 	pki := common.DefaultPKI(*pkiDir)
 	hostList := splitCSV(*hosts)
+	hostsProvided := false
+	flag.CommandLine.Visit(func(f *flag.Flag) {
+		if f.Name == "hosts" {
+			hostsProvided = true
+		}
+	})
 	if len(hostList) == 0 {
 		hostList = []string{"127.0.0.1", "localhost"}
+	}
+	if !hostsProvided {
+		if publicIP, err := fetchPublicIP(); err == nil && publicIP != "" {
+			hostList = addHostIfMissing(hostList, publicIP)
+		} else if err != nil {
+			log.Printf("warning: failed to fetch public IP for cert SANs: %v", err)
+		}
 	}
 	if err := common.EnsureBasePKI(pki, hostList, *regen); err != nil {
 		log.Fatalf("pki init error: %v", err)
@@ -68,4 +86,34 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+func addHostIfMissing(hosts []string, host string) []string {
+	for _, h := range hosts {
+		if strings.EqualFold(h, host) {
+			return hosts
+		}
+	}
+	return append(hosts, host)
+}
+
+func fetchPublicIP() (string, error) {
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get("https://api.ipify.org")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ipify http %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return "", err
+	}
+	ip := strings.TrimSpace(string(body))
+	if net.ParseIP(ip) == nil {
+		return "", fmt.Errorf("invalid ipify response: %q", ip)
+	}
+	return ip, nil
 }

@@ -106,6 +106,20 @@ func SetDefaultRouteDev(dev string) error {
 	return RunPrivileged("ip", "route", "replace", "default", "dev", dev)
 }
 
+// SetDefaultRouteDevWithGateway replaces the default route via gateway on the given device (Linux only).
+func SetDefaultRouteDevWithGateway(dev, gateway string) error {
+	if runtime.GOOS != "linux" {
+		return nil
+	}
+	if dev == "" {
+		return fmt.Errorf("device required")
+	}
+	if gateway == "" {
+		return RunPrivileged("ip", "route", "replace", "default", "dev", dev)
+	}
+	return RunPrivileged("ip", "route", "replace", "default", "via", gateway, "dev", dev)
+}
+
 // GetDefaultRoute6 returns the IPv6 default route line along with via/dev (Linux only).
 // If no default route is found, via/dev are empty.
 func GetDefaultRoute6() (line, via, dev string, err error) {
@@ -172,6 +186,11 @@ func EnsureHostRoute6(ip, via, dev string) error {
 	return RunPrivileged("ip", args...)
 }
 
+// AddHostRoute6 adds a host route via the given gateway/device (Linux only).
+func AddHostRoute6(ip, via, dev string) error {
+	return EnsureHostRoute6(ip, via, dev)
+}
+
 // DeleteHostRoute6 removes an IPv6 host route if present (best-effort, Linux only).
 func DeleteHostRoute6(ip string) error {
 	if runtime.GOOS != "linux" {
@@ -196,6 +215,11 @@ func EnsureHostRoute(ip, via, dev string) error {
 		args = []string{"route", "replace", ip, "via", via, "dev", dev}
 	}
 	return RunPrivileged("ip", args...)
+}
+
+// AddHostRoute adds a host route via the given gateway/device (Linux only).
+func AddHostRoute(ip, via, dev string) error {
+	return EnsureHostRoute(ip, via, dev)
 }
 
 // DeleteHostRoute removes a host route if present (best-effort, Linux only).

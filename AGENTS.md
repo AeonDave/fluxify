@@ -11,6 +11,7 @@
 
 ## Operational notes
 - Client and server must be started with admin/sudo privileges; do not add runtime elevation prompts.
+- Client debug log (`client_debug.log`) is written only when `-v` is enabled.
 
 ## Code style
 - Go 1.24+ required

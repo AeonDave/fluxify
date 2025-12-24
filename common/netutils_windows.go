@@ -95,13 +95,19 @@ func SetDefaultRouteDev(dev string) error {
 	if strings.TrimSpace(dev) == "" {
 		return nil
 	}
-	// Try using interface's first IPv4 as gateway if none provided.
-	ifaceIP, _ := interfaceIPv4(dev)
-	gw := "0.0.0.0"
-	if ifaceIP != nil {
-		gw = ifaceIP.String()
+	// Use on-link gateway for point-to-point style TUN routes.
+	return setDefaultRoute("0.0.0.0", dev, "1")
+}
+
+// SetDefaultRouteDevWithGateway replaces the default route to point to dev via gateway.
+func SetDefaultRouteDevWithGateway(dev, gateway string) error {
+	if strings.TrimSpace(dev) == "" {
+		return nil
 	}
-	return setDefaultRoute(gw, dev, "1")
+	if strings.TrimSpace(gateway) == "" {
+		return SetDefaultRouteDev(dev)
+	}
+	return setDefaultRoute(gateway, dev, "1")
 }
 
 func setDefaultRoute(gateway, dev, metric string) error {
@@ -210,6 +216,17 @@ func EnsureHostRoute6(ip, via, dev string) error {
 	return exec.Command("netsh", "interface", "ipv6", "add", "route", ip, dev, via, "store=active").Run()
 }
 
+// AddHostRoute6 adds an IPv6 host route without deleting existing routes first.
+func AddHostRoute6(ip, via, dev string) error {
+	if ip == "" || dev == "" {
+		return nil
+	}
+	if via == "" {
+		via = "::"
+	}
+	return exec.Command("netsh", "interface", "ipv6", "add", "route", ip, dev, via, "store=active").Run()
+}
+
 func DeleteHostRoute6(ip string) error {
 	if ip == "" {
 		return nil
@@ -237,15 +254,32 @@ func EnsureHostRoute(ip, via, dev string) error {
 	return exec.Command("route", args...).Run()
 }
 
+// AddHostRoute adds a host route without deleting existing routes first.
+func AddHostRoute(ip, via, dev string) error {
+	if ip == "" || dev == "" {
+		return nil
+	}
+	ifIdx, err := interfaceIndex(dev)
+	if err != nil {
+		return err
+	}
+	if via == "" {
+		if ip4, _ := interfaceIPv4(dev); ip4 != nil {
+			via = ip4.String()
+		} else {
+			via = "0.0.0.0"
+		}
+	}
+	args := []string{"add", ip, "mask", "255.255.255.255", via, "if", strconv.Itoa(ifIdx), "metric", "1"}
+	return exec.Command("route", args...).Run()
+}
+
 func DeleteHostRoute(ip string) error {
 	if ip == "" {
 		return nil
 	}
 	return exec.Command("route", "delete", ip).Run()
 }
-
-// IsLinux reports whether the current GOOS is linux (always false on Windows).
-func IsLinux() bool { return false }
 
 // Helpers
 

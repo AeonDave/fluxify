@@ -10,6 +10,7 @@
 *.dylib
 *.test
 *.out
+*.log
 go.work
 go.work.sum
 out/

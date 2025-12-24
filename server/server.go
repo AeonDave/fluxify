@@ -96,6 +96,8 @@ func (s *Server) Start() error {
 	}
 	_ = ensureNatRule()
 	_ = ensureNatRule6()
+	_ = ensureForwardRules(tun.Name())
+	_ = ensureForwardRules6(tun.Name())
 	enableForwarding()
 
 	// Setup UDP
@@ -308,6 +310,10 @@ func (s *Server) handlePacket(sess *serverSession, addr *net.UDPAddr, h common.P
 				return
 			}
 		}
+		if !isIPPacket(data) {
+			s.logDebug("drop non-ip packet len=%d", len(data))
+			return
+		}
 
 		// Send to TUN writer
 		// Case 1: No compression. data == payload (backed by payloadBuf).
@@ -383,6 +389,21 @@ func extractDstIP(pkt []byte) net.IP {
 		return net.IP(pkt[24:40])
 	}
 	return nil
+}
+
+func isIPPacket(pkt []byte) bool {
+	if len(pkt) < 1 {
+		return false
+	}
+	ver := pkt[0] >> 4
+	switch ver {
+	case 4:
+		return len(pkt) >= 20
+	case 6:
+		return len(pkt) >= 40
+	default:
+		return false
+	}
 }
 
 // Control server logic
@@ -545,6 +566,48 @@ func ensureNatRule6() error {
 		return nil
 	}
 	return exec.Command("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-s", "fd00:8:0::/64", "-j", "MASQUERADE").Run()
+}
+
+func ensureForwardRules(iface string) error {
+	if iface == "" {
+		return nil
+	}
+	if _, err := exec.LookPath("iptables"); err != nil {
+		return err
+	}
+	rules := [][]string{
+		{"FORWARD", "-i", iface, "-j", "ACCEPT"},
+		{"FORWARD", "-o", iface, "-j", "ACCEPT"},
+	}
+	for _, rule := range rules {
+		_ = exec.Command("iptables", append([]string{"-D"}, rule...)...).Run()
+		add := append([]string{"-I", "FORWARD", "1"}, rule[1:]...)
+		if err := exec.Command("iptables", add...).Run(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureForwardRules6(iface string) error {
+	if iface == "" {
+		return nil
+	}
+	if _, err := exec.LookPath("ip6tables"); err != nil {
+		return err
+	}
+	rules := [][]string{
+		{"FORWARD", "-i", iface, "-j", "ACCEPT"},
+		{"FORWARD", "-o", iface, "-j", "ACCEPT"},
+	}
+	for _, rule := range rules {
+		_ = exec.Command("ip6tables", append([]string{"-D"}, rule...)...).Run()
+		add := append([]string{"-I", "FORWARD", "1"}, rule[1:]...)
+		if err := exec.Command("ip6tables", add...).Run(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func enableForwarding() {

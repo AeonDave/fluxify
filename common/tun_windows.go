@@ -52,6 +52,11 @@ func ConfigureTUN(cfg TUNConfig) error {
 			return err
 		}
 	}
+	if cfg.CIDR != "" {
+		if err := ensureInterfaceIPv4(cfg.IfaceName, cfg.CIDR); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -79,4 +84,58 @@ func parseCIDR(cidr string) (ip string, mask string, err error) {
 	ip = prefixIP.String()
 	mask = net.IP(n.Mask).String()
 	return ip, mask, nil
+}
+
+func ensureInterfaceIPv4(iface, cidr string) error {
+	ip, _, err := net.ParseCIDR(cidr)
+	if err != nil || ip == nil {
+		return fmt.Errorf("invalid cidr: %s", cidr)
+	}
+	ipStr := ip.String()
+	if hasInterfaceIPv4(iface, ipStr) {
+		return nil
+	}
+	if err := forceInterfaceIPv4(iface, ipStr, cidr); err != nil {
+		return fmt.Errorf("set interface ip: %w", err)
+	}
+	if hasInterfaceIPv4(iface, ipStr) {
+		return nil
+	}
+	return fmt.Errorf("interface %s ip mismatch (expected %s)", iface, ipStr)
+}
+
+func hasInterfaceIPv4(iface, ip string) bool {
+	ifc, err := net.InterfaceByName(iface)
+	if err != nil {
+		return false
+	}
+	addrs, err := ifc.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			if v4 := ipn.IP.To4(); v4 != nil && v4.String() == ip {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func forceInterfaceIPv4(iface, ip, cidr string) error {
+	_, ipnet, err := net.ParseCIDR(cidr)
+	if err != nil {
+		return err
+	}
+	prefixLen, _ := ipnet.Mask.Size()
+	cmd := fmt.Sprintf(`$if='%s'; `+
+		`Get-NetIPAddress -InterfaceAlias $if -AddressFamily IPv4 -ErrorAction SilentlyContinue | `+
+		`Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue; `+
+		`New-NetIPAddress -InterfaceAlias $if -IPAddress %s -PrefixLength %d -Type Unicast -ErrorAction Stop | Out-Null`, iface, ip, prefixLen)
+	out, err := exec.Command("powershell", "-NoProfile", "-Command", cmd).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("powershell ip config failed: %v (%s)", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

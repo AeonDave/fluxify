@@ -42,6 +42,12 @@ func (f *fakeRunner) Run(name string, args ...string) error {
 }
 
 func (f *fakeRunner) Output(name string, args ...string) ([]byte, error) {
+	if f.runHook != nil {
+		if err := f.runHook(name, args...); err != nil {
+			return nil, err
+		}
+		f.runs = append(f.runs, append([]string{name}, args...))
+	}
 	key := name + " " + strings.Join(args, " ")
 	if out, ok := f.outputs[key]; ok {
 		return out, nil
@@ -49,7 +55,7 @@ func (f *fakeRunner) Output(name string, args ...string) ([]byte, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
-	return nil, errors.New("unexpected command")
+	return nil, nil
 }
 
 func (f *fakeRunner) OutputSafe(name string, args ...string) ([]byte, error) {
@@ -66,7 +72,7 @@ func TestSanitizeIfacesFiltersAndSortsByMTU(t *testing.T) {
 	}}
 	t.Cleanup(func() { ifaceProvider = old })
 
-	got := sanitizeIfaces([]string{"eth1", "lo", "eth1", "eth0", "down0", "missing", ""})
+	got := sanitizeIfaces([]string{"eth1", "lo", "eth1", "eth0", "down0", "missing", ""}, false)
 	want := []string{"eth0", "eth1"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("expected %v, got %v", want, got)
@@ -78,7 +84,7 @@ func TestSanitizeIfacesFallsBackOnError(t *testing.T) {
 	ifaceProvider = fakeIfaceProvider{err: errors.New("boom")}
 	t.Cleanup(func() { ifaceProvider = old })
 
-	got := sanitizeIfaces([]string{"eth0", "eth0", "wlan0", " ", ""})
+	got := sanitizeIfaces([]string{"eth0", "eth0", "wlan0", " ", ""}, false)
 	want := []string{"eth0", "wlan0"}
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("expected %v, got %v", want, got)

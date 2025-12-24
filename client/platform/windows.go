@@ -5,10 +5,10 @@ package platform
 
 import (
 	"fmt"
-	"log"
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -28,12 +28,12 @@ type Uplink struct {
 }
 
 func GatewayForIface(r Runner, iface string) (string, error) {
-	log.Printf("GatewayForIface(%s): checking gateway...", iface)
+	vlogf("GatewayForIface(%s): checking gateway...", iface)
 	if gw, err := gatewayViaPowerShell(r, iface, false); err == nil && gw != "" {
-		log.Printf("GatewayForIface(%s): found via PowerShell: %s", iface, gw)
+		vlogf("GatewayForIface(%s): found via PowerShell: %s", iface, gw)
 		return gw, nil
 	} else {
-		log.Printf("GatewayForIface(%s): PowerShell failed/empty (err=%v), falling back to route print", iface, err)
+		vlogf("GatewayForIface(%s): PowerShell failed/empty (err=%v), falling back to route print", iface, err)
 	}
 	ifaceIP, err := getInterfaceIP(iface, false)
 	if err != nil {
@@ -50,11 +50,11 @@ func GatewayForIface(r Runner, iface string) (string, error) {
 			continue
 		}
 		if f[0] == "0.0.0.0" && f[1] == "0.0.0.0" && f[3] == ifaceIP.String() {
-			log.Printf("GatewayForIface(%s): found via route print: %s", iface, f[2])
+			vlogf("GatewayForIface(%s): found via route print: %s", iface, f[2])
 			return f[2], nil
 		}
 	}
-	log.Printf("GatewayForIface(%s): no default gateway found in route print for IP %s", iface, ifaceIP)
+	vlogf("GatewayForIface(%s): no default gateway found in route print for IP %s", iface, ifaceIP)
 	return "", nil
 }
 
@@ -91,7 +91,7 @@ func GatewayForIface6(r Runner, iface string) (string, error) {
 
 func InstallMultipathDefault(r Runner, uplinks []Uplink) error {
 	added := 0
-	log.Printf("InstallMultipathDefault: deleting 0.0.0.0")
+	vlogf("InstallMultipathDefault: deleting 0.0.0.0")
 	_ = r.Run("route", "delete", "0.0.0.0")
 	for _, u := range uplinks {
 		if !u.Alive4 || u.Gw == "" {
@@ -99,12 +99,12 @@ func InstallMultipathDefault(r Runner, uplinks []Uplink) error {
 		}
 		ifIdx, err := interfaceIndex(u.Iface)
 		if err != nil {
-			log.Printf("InstallMultipathDefault: iface index error for %s: %v", u.Iface, err)
+			vlogf("InstallMultipathDefault: iface index error for %s: %v", u.Iface, err)
 			return err
 		}
 		args := []string{"add", "0.0.0.0", "mask", "0.0.0.0", u.Gw, "if", strconv.Itoa(ifIdx), "metric", "1"}
 		if err := r.Run("route", args...); err != nil {
-			log.Printf("InstallMultipathDefault: route add failed for %s (GW %s): %v", u.Iface, u.Gw, err)
+			vlogf("InstallMultipathDefault: route add failed for %s (GW %s): %v", u.Iface, u.Gw, err)
 			return err
 		}
 		added++
@@ -112,7 +112,7 @@ func InstallMultipathDefault(r Runner, uplinks []Uplink) error {
 	if added == 0 {
 		return fmt.Errorf("no alive uplinks to install")
 	}
-	log.Printf("InstallMultipathDefault: installed %d routes", added)
+	vlogf("InstallMultipathDefault: installed %d routes", added)
 	return nil
 }
 
@@ -155,20 +155,62 @@ func ReadInterfaceBytes(iface string) (rx, tx uint64, err error) {
 	return uint64(row.InOctets), uint64(row.OutOctets), nil
 }
 
-func PingIfaceV4(r Runner, iface string) error {
+func PingIfaceV4(r Runner, iface string) (time.Duration, error) {
 	ip, err := getInterfaceIP(iface, false)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return r.Run("ping", "-n", "1", "-w", "1000", "-S", ip.String(), "1.1.1.1")
+	out, err := r.OutputSafe("ping", "-n", "1", "-w", "1000", "-S", ip.String(), "1.1.1.1")
+	if err != nil {
+		return 0, err
+	}
+	return parsePingRTT(string(out)), nil
 }
 
-func PingIfaceV6(r Runner, iface string) error {
+func PingIfaceV6(r Runner, iface string) (time.Duration, error) {
 	ip, err := getInterfaceIP(iface, true)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return r.Run("ping", "-6", "-n", "1", "-w", "1000", "-S", ip.String(), "2606:4700:4700::1111")
+	out, err := r.OutputSafe("ping", "-6", "-n", "1", "-w", "1000", "-S", ip.String(), "2606:4700:4700::1111")
+	if err != nil {
+		return 0, err
+	}
+	return parsePingRTT(string(out)), nil
+}
+
+func parsePingRTT(out string) time.Duration {
+	if out == "" {
+		return 0
+	}
+	if idx := strings.Index(out, "time="); idx != -1 {
+		rest := out[idx+len("time="):]
+		return parsePingMillis(rest)
+	}
+	if idx := strings.Index(out, "Average = "); idx != -1 {
+		rest := out[idx+len("Average = "):]
+		return parsePingMillis(rest)
+	}
+	return 0
+}
+
+func parsePingMillis(s string) time.Duration {
+	s = strings.TrimSpace(s)
+	if strings.HasPrefix(s, "<") {
+		s = strings.TrimPrefix(s, "<")
+	}
+	if idx := strings.Index(s, "ms"); idx != -1 {
+		s = s[:idx]
+	}
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
+	}
+	val, err := strconv.ParseFloat(s, 64)
+	if err != nil {
+		return 0
+	}
+	return time.Duration(val * float64(time.Millisecond))
 }
 
 func gatewayViaPowerShell(r Runner, iface string, ipv6 bool) (string, error) {

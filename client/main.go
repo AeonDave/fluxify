@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"os/user"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/rivo/tview"
 
+	"fluxify/client/platform"
 	"fluxify/common"
 )
 
@@ -30,6 +32,8 @@ var realRunTUI = runTUI
 var runTUIHook = runTUI
 var homeDirFunc = os.UserHomeDir
 var lookupUser = user.Lookup
+var isRoot = common.IsRoot
+var panicHandlerEnabled = true
 
 // splitCSV splits a comma-separated string into trimmed parts.
 func splitCSV(s string) []string {
@@ -47,12 +51,32 @@ func splitCSV(s string) []string {
 	return out
 }
 
+func parseDNSServers(list []string) ([]string, []string, error) {
+	var dns4 []string
+	var dns6 []string
+	for _, s := range list {
+		ip := net.ParseIP(s)
+		if ip == nil {
+			return nil, nil, fmt.Errorf("invalid DNS server %q", s)
+		}
+		if ip.To4() != nil {
+			dns4 = append(dns4, ip.String())
+		} else {
+			dns6 = append(dns6, ip.String())
+		}
+	}
+	return dns4, dns6, nil
+}
+
 func main() {
 	// Global panic handler to keep window open and log error
 	defer func() {
+		if !panicHandlerEnabled {
+			return
+		}
 		if r := recover(); r != nil {
 			msg := fmt.Sprintf("PANIC: %v\nStack:\n%s", r, debug.Stack())
-			fmt.Fprintln(os.Stderr, msg)
+			_, _ = fmt.Fprintln(os.Stderr, msg)
 			// Try to write to a file in the same directory
 			if exe, err := os.Executable(); err == nil {
 				logFile := filepath.Join(filepath.Dir(exe), "client_panic.log")
@@ -76,13 +100,19 @@ func main() {
 	loadBalanceFlag := flag.Bool("l", false, "force load-balance mode")
 	pkiDir := flag.String("pki", "", "PKI directory (defaults to ~/.fluxify)")
 	certPath := flag.String("cert", "", "path to client bundle (.pem with cert+key)")
+	dnsServers := flag.String("dns", "", "comma-separated DNS servers for TUN (optional)")
 	ctrlPort := flag.Int("ctrl", 8443, "control TLS port")
+	verbose := flag.Bool("v", false, "enable verbose logs")
 	flag.Parse()
+	setVerboseLogging(*verbose)
+	platform.SetVerbose(*verbose)
 
 	chosenPKI := *pkiDir
 	if chosenPKI == "" || chosenPKI == "./pki" {
 		chosenPKI = defaultPKIDir()
 	}
+	dns4, dns6, err := parseDNSServers(splitCSV(*dnsServers))
+	exitIf(err != nil, "invalid -dns: %v", err)
 	initialCfg := clientConfig{
 		Server: *server,
 		Ifaces: splitCSV(*ifacesStr),
@@ -91,6 +121,8 @@ func main() {
 		PKI:    chosenPKI,
 		Cert:   *certPath,
 		Ctrl:   *ctrlPort,
+		DNS4:   dns4,
+		DNS6:   dns6,
 	}
 
 	// If -pki was explicitly provided, don't let stored config override it.
@@ -104,15 +136,15 @@ func main() {
 	}
 
 	// Client must be started with elevated privileges on supported platforms.
-	if runtime.GOOS == "windows" && !common.IsRoot() {
-		log.Fatalf("run the client as administrator on windows")
+	if runtime.GOOS == "windows" && !isRoot() {
+		logFatalf("run the client as administrator on windows")
 	}
-	if runtime.GOOS == "linux" && !common.IsRoot() {
-		log.Fatalf("run the client with sudo/root on linux")
+	if runtime.GOOS == "linux" && !isRoot() {
+		logFatalf("run the client with sudo/root on linux")
 	}
 
 	if err := ensureConfigAndPKI(initialCfg.PKI); err != nil {
-		log.Fatalf("ensure base dirs: %v", err)
+		logFatalf("ensure base dirs: %v", err)
 	}
 
 	autoMode := *loadBalanceFlag || *bondingFlag
@@ -135,7 +167,7 @@ func main() {
 
 	stop, err := startClient(cfg)
 	if err != nil {
-		log.Fatalf("start: %v", err)
+		logFatalf("start: %v", err)
 	}
 	saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Cert: cfg.Cert, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
 	log.Printf("running in %s mode; press Ctrl-C to stop", cfg.Mode)
@@ -371,7 +403,7 @@ func detectClientBundlePath(pkiDir string) (string, error) {
 			continue
 		}
 		name := ent.Name()
-		if !strings.HasSuffix(name, ".pem") {
+		if !(strings.HasSuffix(name, ".pem") || strings.HasSuffix(name, ".bundle")) {
 			continue
 		}
 		// Skip well-known non-client files
@@ -385,7 +417,7 @@ func detectClientBundlePath(pkiDir string) (string, error) {
 		}
 	}
 	if len(bundles) == 0 {
-		return "", fmt.Errorf("no client bundle found in %s (need .pem with cert+key)", pkiDir)
+		return "", fmt.Errorf("no client bundle found in %s (need .pem/.bundle with cert+key)", pkiDir)
 	}
 	if len(bundles) > 1 {
 		var names []string
@@ -403,7 +435,18 @@ func detectClientCertName(pkiDir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSuffix(filepath.Base(path), ".pem"), nil
+	return bundleBaseName(path), nil
+}
+
+func bundleBaseName(path string) string {
+	base := filepath.Base(path)
+	if strings.HasSuffix(base, ".pem") {
+		return strings.TrimSuffix(base, ".pem")
+	}
+	if strings.HasSuffix(base, ".bundle") {
+		return strings.TrimSuffix(base, ".bundle")
+	}
+	return base
 }
 
 // hasCertAndKey reports whether the PEM file contains at least one CERTIFICATE and one private key.

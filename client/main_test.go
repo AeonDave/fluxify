@@ -2,12 +2,15 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"log"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	"fluxify/common"
 )
 
 func TestPickBestConnLoadBalanceChoosesLowestRTT(t *testing.T) {
@@ -74,6 +77,11 @@ func TestCLIStartsTUIWhenNoModeFlags(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })
 	os.Args = []string{"client"}
+	origFlags := flag.CommandLine
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	t.Cleanup(func() { flag.CommandLine = origFlags })
+	origHome := homeDirFunc
+	homeDirFunc = func() (string, error) { return t.TempDir(), nil }
 
 	var buf bytes.Buffer
 	logFatalf = log.Fatalf
@@ -81,8 +89,13 @@ func TestCLIStartsTUIWhenNoModeFlags(t *testing.T) {
 	t.Cleanup(func() {
 		log.SetOutput(os.Stderr)
 		logFatalf = log.Fatalf
+		isRoot = common.IsRoot
+		panicHandlerEnabled = true
+		homeDirFunc = origHome
 	})
 
+	isRoot = func() bool { return true }
+	panicHandlerEnabled = false
 	startedTUI := false
 	runTUIHook = func(cfg clientConfig) {
 		startedTUI = true
@@ -99,6 +112,11 @@ func TestCLIFailsWithoutRequiredBondingParams(t *testing.T) {
 	origArgs := os.Args
 	t.Cleanup(func() { os.Args = origArgs })
 	os.Args = []string{"client", "-b", "-ifaces", "eth0,eth1"}
+	origFlags := flag.CommandLine
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	t.Cleanup(func() { flag.CommandLine = origFlags })
+	origHome := homeDirFunc
+	homeDirFunc = func() (string, error) { return t.TempDir(), nil }
 
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
@@ -111,7 +129,14 @@ func TestCLIFailsWithoutRequiredBondingParams(t *testing.T) {
 		exitCh <- fmt.Sprintf(format, args...)
 		panic("exit")
 	}
-	t.Cleanup(func() { logFatalf = realFatal })
+	t.Cleanup(func() {
+		logFatalf = realFatal
+		isRoot = common.IsRoot
+		panicHandlerEnabled = true
+		homeDirFunc = origHome
+	})
+	isRoot = func() bool { return true }
+	panicHandlerEnabled = false
 
 	defer func() {
 		if r := recover(); r == nil {

@@ -373,6 +373,11 @@ func createClientCert(certFile, keyFile string, caCert *x509.Certificate, caKey 
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
+	if ip := net.ParseIP(name); ip != nil {
+		tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+	} else {
+		tmpl.DNSNames = append(tmpl.DNSNames, name)
+	}
 	key, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
 		return err

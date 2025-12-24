@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,70 +12,70 @@ import (
 	"time"
 
 	"fluxify/common"
-
-	"github.com/atotto/clipboard"
 )
 
-func TestDownloadClientCertCopiesDated(t *testing.T) {
+func TestWriteClientBundleCreatesBundle(t *testing.T) {
 	base := t.TempDir()
 	pki := common.DefaultPKI(filepath.Join(base, "pki"))
 	if err := common.EnsureBasePKI(pki, nil, false); err != nil {
 		t.Fatalf("ensure pki: %v", err)
 	}
-	_, _, _, _, err := common.GenerateDatedClientCert(pki, "alice", time.Now())
+	certPath, keyPath, _, _, err := common.GenerateDatedClientCert(pki, "alice", time.Now())
 	if err != nil {
 		t.Fatalf("generate dated: %v", err)
 	}
 
-	var captured string
-	clipWrite = func(s string) error {
-		captured = s
-		return nil
-	}
-	t.Cleanup(func() { clipWrite = clipboard.WriteAll })
-
-	if err := downloadClientCert(pki, "alice"); err != nil {
-		t.Fatalf("download: %v", err)
+	if err := writeClientBundle(pki, certPath, keyPath); err != nil {
+		t.Fatalf("write bundle: %v", err)
 	}
 
-	if !strings.Contains(captured, "BEGIN CERTIFICATE") {
-		t.Fatalf("clipboard missing cert: %q", captured)
+	bundlePath := strings.TrimSuffix(certPath, ".pem") + ".bundle"
+	bundleBytes, err := os.ReadFile(bundlePath)
+	if err != nil {
+		t.Fatalf("read bundle: %v", err)
 	}
-	if !strings.Contains(captured, "BEGIN RSA PRIVATE KEY") {
-		t.Fatalf("clipboard missing key: %q", captured)
+	caBytes, err := os.ReadFile(pki.CACert)
+	if err != nil {
+		t.Fatalf("read ca: %v", err)
+	}
+	certBytes, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read cert: %v", err)
+	}
+	keyBytes, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read key: %v", err)
+	}
+	caIndex := bytes.Index(bundleBytes, caBytes)
+	certIndex := bytes.Index(bundleBytes, certBytes)
+	keyIndex := bytes.Index(bundleBytes, keyBytes)
+	if caIndex == -1 || certIndex == -1 || keyIndex == -1 {
+		t.Fatalf("bundle missing expected parts")
+	}
+	if !(caIndex < certIndex && certIndex < keyIndex) {
+		t.Fatalf("bundle order incorrect")
 	}
 }
 
-func TestDownloadClientCertFallsBackToAny(t *testing.T) {
+func TestDeleteClientCertsRemovesBundle(t *testing.T) {
 	base := t.TempDir()
 	pki := common.DefaultPKI(filepath.Join(base, "pki"))
-	if err := os.MkdirAll(pki.ClientsDir, 0o700); err != nil {
-		t.Fatalf("mkdir clients: %v", err)
+	if err := common.EnsureBasePKI(pki, nil, false); err != nil {
+		t.Fatalf("ensure pki: %v", err)
 	}
-	if err := os.WriteFile(pki.CACert, []byte("dummy-ca"), 0o600); err != nil {
-		t.Fatalf("write ca: %v", err)
+	certPath, keyPath, _, _, err := common.GenerateDatedClientCert(pki, "bob", time.Now())
+	if err != nil {
+		t.Fatalf("generate dated: %v", err)
 	}
-	certPath := filepath.Join(pki.ClientsDir, "bob.pem")
-	keyPath := filepath.Join(pki.ClientsDir, "bob-key.pem")
-	if err := os.WriteFile(certPath, []byte("dummy-cert"), 0o600); err != nil {
-		t.Fatalf("write cert: %v", err)
-	}
-	if err := os.WriteFile(keyPath, []byte("dummy-key"), 0o600); err != nil {
-		t.Fatalf("write key: %v", err)
+	if err := writeClientBundle(pki, certPath, keyPath); err != nil {
+		t.Fatalf("write bundle: %v", err)
 	}
 
-	var captured string
-	clipWrite = func(s string) error {
-		captured = s
-		return nil
+	bundlePath := strings.TrimSuffix(certPath, ".pem") + ".bundle"
+	if err := deleteClientCerts(pki, "bob"); err != nil {
+		t.Fatalf("delete client: %v", err)
 	}
-	t.Cleanup(func() { clipWrite = clipboard.WriteAll })
-
-	if err := downloadClientCert(pki, "bob"); err != nil {
-		t.Fatalf("download fallback: %v", err)
-	}
-
-	if !strings.Contains(captured, "dummy-cert") || !strings.Contains(captured, "dummy-key") {
-		t.Fatalf("clipboard missing fallback data: %q", captured)
+	if _, err := os.Stat(bundlePath); err == nil {
+		t.Fatalf("bundle still exists after delete")
 	}
 }

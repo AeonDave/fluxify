@@ -55,7 +55,7 @@ Fluxify is a multipath VPN that bonds or load-balances multiple WAN interfaces. 
 - **Routing flip on start (bonding):** Installs a host route to the server via the existing default and replaces the default route to point to the TUN. On stop, restores the previous default route and removes the host route.
 - **Routing (load-balance):** Installs per-uplink MASQUERADE rules and a multipath default route over discovered gateways; no TUN is created. Supports both IPv4 and IPv6 gateways.
 - **Compression:** Best-effort gzip on payloads when it reduces size, signaled in the header.
-- **Persistence:** Client settings are stored as JSON under `~/.fluxify`. PKI defaults to the same flat directory: place `ca.pem` and either a bundle `<name>.pem` or `<name>.pem` + `<name>-key.pem` directly in `~/.fluxify`.
+- **Persistence:** Client settings are stored as JSON under `~/.fluxify`. PKI defaults to the same flat directory: place `ca.pem` and either a bundle `<name>.bundle`/`<name>.pem` or `<name>.pem` + `<name>-key.pem` directly in `~/.fluxify`.
 
 ## Building
 
@@ -105,8 +105,9 @@ go build -o client ./client
 - `-ifaces` (string): Comma-separated interface names to bind UDP sockets (Linux `SO_BINDTODEVICE`).
 - `-ips` (string): Comma-separated source IPs matching interfaces (optional).
 - `-pki` (string, default `~/.fluxify`): PKI directory containing CA and client cert/key in flat files.
-- `-cert` (string): Path to client bundle (.pem with cert+key); if omitted, auto-detects a single bundle in `-pki`.
+- `-cert` (string): Path to client bundle (.pem/.bundle with cert+key); if omitted, auto-detects a single bundle in `-pki`.
 - `-ctrl` (int, default 8443): Control-plane TLS port if not specified in `-server`.
+- `-v` (bool): Enable verbose logs (interface scan, gateways, routes) and write `client_debug.log`.
 - `-b` (bool): Force bonding mode (headless/scripted).
 - `-l` (bool): Force load-balance mode (headless/scripted).
 
@@ -118,10 +119,12 @@ go build -o client ./client
 - Load-balance start: discovers gateways (IPv4/IPv6), installs per-uplink MASQUERADE and a multipath default route (no TUN); a health monitor pings per uplink to drop/add nexthops dynamically.
 - On Stop: tears down UDP/TUN, removes MASQUERADE rules, replaces the previous default route, and (for bonding) removes the host route.
 - Config is saved in the user config dir as JSON and reused on next launch.
+- Usage panel shows per-interface share, rates, loss, jitter, and a stability score; summary lines include aggregate rates and gain.
+- Status warns when multiple selected interfaces report the same external IP (same upstream network, limited benefit).
 
 ### Certificates
 
-- Obtain client cert/key from the server (generated via TUI or headless) and place them directly under the client PKI dir (flat layout): either a bundle `<name>.pem` containing cert+key or `<name>.pem` + `<name>-key.pem`, plus `ca.pem`.
+- Obtain client cert/key from the server (generated via TUI or headless) and place them directly under the client PKI dir (flat layout): either a bundle `<name>.bundle`/`<name>.pem` containing cert+key or `<name>.pem` + `<name>-key.pem`, plus `ca.pem`.
 - Ensure the server certificate SANs include the hostname/IP used by the client; otherwise, TLS validation will fail.
 - CLI can point to a bundle explicitly via `-cert`; if omitted, the client auto-detects a single bundle in `-pki`.
 

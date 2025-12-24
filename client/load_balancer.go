@@ -30,32 +30,36 @@ func recoverPanic(name string) {
 			logFile := filepath.Join(filepath.Dir(exe), "client_panic.log")
 			f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if f != nil {
-				fmt.Fprintf(f, "\n%s\n%s\n", time.Now().Format(time.RFC3339), msg)
-				f.Close()
+				_, _ = fmt.Fprintf(f, "\n%s\n%s\n", time.Now().Format(time.RFC3339), msg)
+				_ = f.Close()
 			}
 		}
-		// We can't keep the window open easily from a background goroutine panic,
-		// but at least we logged it.
-		// Force exit to ensure we don't hang in undefined state
-		os.Exit(1)
 	}
 }
 
 type uplink struct {
-	iface   string
-	gw      string
-	gw6     string
-	alive   bool
-	alive4  bool
-	alive6  bool
-	fail    int
-	fail6   int
-	bytesTx uint64
-	bytesRx uint64
-	lastTx  uint64
-	lastRx  uint64
-	rateTxK float64
-	rateRxK float64
+	iface     string
+	gw        string
+	gw6       string
+	alive     bool
+	alive4    bool
+	alive6    bool
+	fail      int
+	fail6     int
+	pingSent4 uint64
+	pingRecv4 uint64
+	pingSent6 uint64
+	pingRecv6 uint64
+	jitter4Ms float64
+	jitter6Ms float64
+	lastRtt4  time.Duration
+	lastRtt6  time.Duration
+	bytesTx   uint64
+	bytesRx   uint64
+	lastTx    uint64
+	lastRx    uint64
+	rateTxK   float64
+	rateRxK   float64
 }
 
 type uplinkSet struct {
@@ -127,7 +131,7 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 	if runtime.GOOS == "windows" && !common.IsRoot() {
 		return nil, fmt.Errorf("run the client as administrator on windows to configure routes")
 	}
-	cfg.Ifaces = sanitizeIfaces(cfg.Ifaces)
+	cfg.Ifaces = sanitizeIfaces(cfg.Ifaces, false)
 	if len(cfg.Ifaces) < 2 {
 		return nil, fmt.Errorf("need at least 2 interfaces for load-balance")
 	}
@@ -139,7 +143,7 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 	if err != nil {
 		return nil, fmt.Errorf("get default route v6: %w", err)
 	}
-	log.Printf("Saved old route: %s", oldRoute)
+	vlogf("Saved old route: %s", oldRoute)
 
 	rawUplinks, err := discoverGateways(cfg.Ifaces)
 	if err != nil {
@@ -148,7 +152,7 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 	if len(rawUplinks) == 0 {
 		return nil, fmt.Errorf("no gateways discovered for selected interfaces")
 	}
-	log.Printf("Discovered %d uplinks", len(rawUplinks))
+	vlogf("Discovered %d uplinks", len(rawUplinks))
 
 	ups := &uplinkSet{list: rawUplinks, statsView: statsView}
 	hasV4 := false
@@ -167,14 +171,14 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 		if err := addMasqueradeRules(snapshot); err != nil {
 			return nil, err
 		}
-		log.Printf("Added MASQUERADE rules")
+		vlogf("Added MASQUERADE rules")
 	}
 	if hasV6 {
 		if err := addMasqueradeRules6(snapshot); err != nil {
 			_ = removeMasqueradeRules(snapshot)
 			return nil, err
 		}
-		log.Printf("Added IPv6 MASQUERADE rules")
+		vlogf("Added IPv6 MASQUERADE rules")
 	}
 
 	// Install multipath default route directly (no TUN needed for simple load-balance)
@@ -186,7 +190,7 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 			}
 			return nil, err
 		}
-		log.Printf("Installed multipath default route")
+		vlogf("Installed multipath default route")
 	}
 	if hasV6 {
 		if err := installMultipathDefault6(snapshot); err != nil {
@@ -194,7 +198,7 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 			_ = removeMasqueradeRules6(snapshot)
 			return nil, err
 		}
-		log.Printf("Installed IPv6 multipath default route")
+		vlogf("Installed IPv6 multipath default route")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -207,7 +211,7 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 
 	stop := func() {
 		cancel()
-		log.Printf("Restoring old route: %s", oldRoute)
+		vlogf("Restoring old route: %s", oldRoute)
 		snapshot := ups.snapshot()
 		if oldRoute != "" {
 			_ = common.ReplaceDefaultRoute(oldRoute)
@@ -221,7 +225,7 @@ func startLocalBalancerWithStats(cfg clientConfig, statsView *tview.TextView, ap
 		if hasV6 {
 			_ = removeMasqueradeRules6(snapshot)
 		}
-		log.Printf("Load-balancer stopped")
+		vlogf("Load-balancer stopped")
 	}
 	return stop, nil
 }
@@ -250,14 +254,30 @@ func updateLBStats(ups *uplinkSet) {
 	ups.mu.RLock()
 	defer ups.mu.RUnlock()
 	var lines []string
-	lines = append(lines, "[yellow]Load-Balance Stats:[white]")
+	lines = append(lines, "[yellow]Load-Balance Metrics:[white]")
 	var totalTx, totalRx uint64
+	var totalRateTx, totalRateRx float64
+	var totalRate float64
+	maxShare := 0.0
+	active := 0
+	var totalPingSent uint64
+	var totalPingRecv uint64
+	var jitterSum float64
+	var jitterCount int
+	var scoreSum float64
 	for _, u := range ups.list {
 		totalTx += u.bytesTx
 		totalRx += u.bytesRx
+		totalRateTx += u.rateTxK
+		totalRateRx += u.rateRxK
+		rateSum := u.rateTxK + u.rateRxK
+		totalRate += rateSum
+		totalPingSent += u.pingSent4 + u.pingSent6
+		totalPingRecv += u.pingRecv4 + u.pingRecv6
 		status := "[red]DOWN"
 		if u.alive {
 			status = "[green]UP"
+			active++
 		}
 		gwLabel := u.gw
 		if u.gw6 != "" {
@@ -267,10 +287,87 @@ func updateLBStats(ups *uplinkSet) {
 			gwLabel += u.gw6
 		}
 		fam := fmt.Sprintf("(v4:%s v6:%s)", upDown(u.alive4), upDown(u.alive6))
-		lines = append(lines, fmt.Sprintf("  %s (%s) %s %s | TX: %s (%.1f kbps) | RX: %s (%.1f kbps)", u.iface, gwLabel, status, fam, fmtBytes(u.bytesTx), u.rateTxK, fmtBytes(u.bytesRx), u.rateRxK))
+		share := 0.0
+		if totalRate > 0 {
+			share = rateSum / totalRate * 100
+			if share > maxShare {
+				maxShare = share
+			}
+		}
+		loss := combinedLoss(u)
+		jitterMs, jitterOk := combinedJitterMs(u)
+		score := stabilityScore(loss.percent, jitterMs, 0)
+		if jitterOk {
+			jitterSum += jitterMs
+			jitterCount++
+			scoreSum += score
+		}
+		lossText := "-"
+		if loss.ok {
+			lossText = fmt.Sprintf("%.1f%%", loss.percent)
+		}
+		jitterText := "-"
+		if jitterOk {
+			jitterText = fmt.Sprintf("%.1f ms", jitterMs)
+		}
+		scoreText := "-"
+		if loss.ok || jitterOk {
+			scoreText = fmt.Sprintf("%.0f", score)
+		}
+		lines = append(lines, fmt.Sprintf("  %s (%s) %s %s | share: %3.0f%% | TX: %s (%.1f kbps) | RX: %s (%.1f kbps)",
+			u.iface, gwLabel, status, fam, share, fmtBytes(u.bytesTx), u.rateTxK, fmtBytes(u.bytesRx), u.rateRxK))
+		lines[len(lines)-1] += fmt.Sprintf(" | loss: %s | jitter: %s | score: %s", lossText, jitterText, scoreText)
 	}
-	lines = append(lines, fmt.Sprintf("\n[cyan]Total TX:[white] %s  [cyan]Total RX:[white] %s", fmtBytes(totalTx), fmtBytes(totalRx)))
+	lines = append(lines, fmt.Sprintf("\n[cyan]Total TX:[white] %s (%.1f kbps)  [cyan]Total RX:[white] %s (%.1f kbps)  [cyan]Active:[white] %d/%d",
+		fmtBytes(totalTx), totalRateTx, fmtBytes(totalRx), totalRateRx, active, len(ups.list)))
+	lossText := "n/a"
+	if loss := lossPercent(totalPingSent, totalPingRecv); loss.ok {
+		lossText = fmt.Sprintf("%.1f%%", loss.percent)
+	}
+	jitterText := "n/a"
+	scoreText := "n/a"
+	if jitterCount > 0 {
+		jitterText = fmt.Sprintf("%.1f ms", jitterSum/float64(jitterCount))
+		scoreText = fmt.Sprintf("%.0f", scoreSum/float64(jitterCount))
+	}
+	lines = append(lines, fmt.Sprintf("[cyan]Loss:[white] %s  [cyan]Jitter:[white] %s  [cyan]Score:[white] %s", lossText, jitterText, scoreText))
+	if totalRate > 0 && len(ups.list) > 1 {
+		lines = append(lines, fmt.Sprintf("[cyan]Distribution:[white] max %.0f%% on a single iface", maxShare))
+	}
 	ups.statsView.SetText(strings.Join(lines, "\n"))
+}
+
+func combinedLoss(u uplink) lossStats {
+	s4 := lossPercent(u.pingSent4, u.pingRecv4)
+	s6 := lossPercent(u.pingSent6, u.pingRecv6)
+	switch {
+	case s4.ok && s6.ok:
+		return lossPercent(u.pingSent4+u.pingSent6, u.pingRecv4+u.pingRecv6)
+	case s4.ok:
+		return s4
+	case s6.ok:
+		return s6
+	default:
+		return lossStats{percent: 0, ok: false}
+	}
+}
+
+func combinedJitterMs(u uplink) (float64, bool) {
+	ok4 := u.pingRecv4 >= 3
+	ok6 := u.pingRecv6 >= 3
+	switch {
+	case ok4 && ok6:
+		if u.jitter4Ms >= u.jitter6Ms {
+			return u.jitter4Ms, true
+		}
+		return u.jitter6Ms, true
+	case ok4:
+		return u.jitter4Ms, true
+	case ok6:
+		return u.jitter6Ms, true
+	default:
+		return 0, false
+	}
 }
 
 func upDown(b bool) string {
@@ -309,15 +406,15 @@ func discoverGateways(ifaces []string) ([]uplink, error) {
 		}
 		gw, err := platform.GatewayForIface(runner, ifc)
 		if err != nil {
-			log.Printf("gateway lookup failed for %s: %v", ifc, err)
+			vlogf("gateway lookup failed for %s: %v", ifc, err)
 			continue
 		}
 		gw6, err := platform.GatewayForIface6(runner, ifc)
 		if err != nil {
-			log.Printf("gateway6 lookup failed for %s: %v", ifc, err)
+			vlogf("gateway6 lookup failed for %s: %v", ifc, err)
 		}
 		if gw == "" && gw6 == "" {
-			log.Printf("no gateway found for %s", ifc)
+			vlogf("no gateway found for %s", ifc)
 			continue
 		}
 		uplinks = append(uplinks, uplink{iface: ifc, gw: gw, gw6: gw6, alive: gw != "" || gw6 != "", alive4: gw != "", alive6: gw6 != ""})
@@ -406,6 +503,44 @@ func updateUplinkAfterPing(u *uplink, ok bool, v6 bool) bool {
 	return changed
 }
 
+func recordPing(u *uplink, ok bool, rtt time.Duration, v6 bool) {
+	if v6 {
+		u.pingSent6++
+		if !ok {
+			return
+		}
+		u.pingRecv6++
+		if rtt > 0 {
+			if u.lastRtt6 > 0 {
+				delta := rtt - u.lastRtt6
+				if delta < 0 {
+					delta = -delta
+				}
+				deltaMs := float64(delta) / float64(time.Millisecond)
+				u.jitter6Ms += (deltaMs - u.jitter6Ms) / 16
+			}
+			u.lastRtt6 = rtt
+		}
+		return
+	}
+	u.pingSent4++
+	if !ok {
+		return
+	}
+	u.pingRecv4++
+	if rtt > 0 {
+		if u.lastRtt4 > 0 {
+			delta := rtt - u.lastRtt4
+			if delta < 0 {
+				delta = -delta
+			}
+			deltaMs := float64(delta) / float64(time.Millisecond)
+			u.jitter4Ms += (deltaMs - u.jitter4Ms) / 16
+		}
+		u.lastRtt4 = rtt
+	}
+}
+
 func healthMonitor(ctx context.Context, ups *uplinkSet) {
 	defer recoverPanic("healthMonitor")
 	ticker := time.NewTicker(healthCheckInterval)
@@ -419,14 +554,16 @@ func healthMonitor(ctx context.Context, ups *uplinkSet) {
 			for i := range snap {
 				idx := i
 				if snap[i].gw != "" {
-					err := platform.PingIfaceV4(runner, snap[i].iface)
+					rtt, err := platform.PingIfaceV4(runner, snap[i].iface)
 					ups.update(idx, func(u *uplink) {
+						recordPing(u, err == nil, rtt, false)
 						changed4 = changed4 || updateUplinkAfterPing(u, err == nil, false)
 					})
 				}
 				if snap[i].gw6 != "" {
-					err := platform.PingIfaceV6(runner, snap[i].iface)
+					rtt, err := platform.PingIfaceV6(runner, snap[i].iface)
 					ups.update(idx, func(u *uplink) {
+						recordPing(u, err == nil, rtt, true)
 						changed6 = changed6 || updateUplinkAfterPing(u, err == nil, true)
 					})
 				}
@@ -447,7 +584,7 @@ func healthMonitor(ctx context.Context, ups *uplinkSet) {
 	}
 }
 
-func sanitizeIfaces(raw []string) []string {
+func sanitizeIfaces(raw []string, allowDown bool) []string {
 	seen := make(map[string]bool)
 	trimmed := make([]string, 0, len(raw))
 	for _, name := range raw {
@@ -478,16 +615,19 @@ func sanitizeIfaces(raw []string) []string {
 	for _, name := range trimmed {
 		ifc, ok := info[name]
 		if !ok {
-			log.Printf("iface %s not found; skipping", name)
+			vlogf("iface %s not found; skipping", name)
 			continue
 		}
 		if ifc.Flags&net.FlagLoopback != 0 {
-			log.Printf("iface %s is loopback; skipping", name)
+			vlogf("iface %s is loopback; skipping", name)
 			continue
 		}
 		if ifc.Flags&net.FlagUp == 0 {
-			log.Printf("iface %s is down; skipping", name)
-			continue
+			if !allowDown {
+				vlogf("iface %s is down; skipping", name)
+				continue
+			}
+			vlogf("iface %s is down; keeping for recovery", name)
 		}
 		candidates = append(candidates, candidate{name: name, mtu: ifc.MTU})
 	}

@@ -1,6 +1,10 @@
 package main
 
 import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"log"
@@ -8,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
@@ -50,6 +55,7 @@ func (tuiRunner) OutputSafe(name string, args ...string) ([]byte, error) {
 func runTUI(initial clientConfig) {
 	app := tview.NewApplication()
 	app.EnableMouse(true)
+	app.EnablePaste(true)
 
 	state := newTUIState(initial)
 
@@ -70,12 +76,20 @@ func runTUI(initial clientConfig) {
 	ifaceList.SetSelectedBackgroundColor(tcell.ColorDarkSlateGray)
 	ifaceList.SetSelectedTextColor(tcell.ColorWhite)
 
-	info := tview.NewTextView().SetDynamicColors(true).SetWordWrap(true).SetWrap(true)
-	info.SetBorder(true).SetTitle("Info & Usage")
-	log.SetOutput(&tuiLogWriter{app: app, view: info})
+	usageView := tview.NewTextView().SetDynamicColors(true).SetWordWrap(true).SetWrap(true)
+	usageView.SetBorder(true).SetTitle("Usage")
+	usageView.SetScrollable(true)
+
+	logView := tview.NewTextView().SetDynamicColors(true).SetWordWrap(true).SetWrap(true)
+	logView.SetBorder(true).SetTitle("Logs")
+	logView.SetScrollable(true)
+	log.SetOutput(&tuiLogWriter{app: app, view: logView})
 
 	statusBar := tview.NewTextView().SetDynamicColors(true)
 	statusBar.SetBorder(true).SetTitle("Status")
+	statusBar.SetWrap(true)
+	statusBar.SetWordWrap(true)
+	statusBar.SetScrollable(true)
 
 	actionStatus := tview.NewTextView().SetDynamicColors(true).SetText("Idle")
 	actionStatus.SetBorder(true).SetTitle("Activity")
@@ -92,8 +106,8 @@ func runTUI(initial clientConfig) {
 	stopBtn := tview.NewButton(" STOP ")
 	styleActionBtn(stopBtn, tcell.ColorDarkRed)
 	stopBtn.SetDisabled(true)
-	refreshBtn := tview.NewButton(" REFRESH IFs ")
-	styleActionBtn(refreshBtn, tcell.ColorDarkBlue)
+	diagBtn := tview.NewButton(" DIAG ")
+	styleActionBtn(diagBtn, tcell.ColorDarkBlue)
 	quitBtn := tview.NewButton(" QUIT ")
 	styleActionBtn(quitBtn, tcell.ColorDarkSlateGray)
 
@@ -107,14 +121,14 @@ func runTUI(initial clientConfig) {
 	filterGateway := true
 	filterNonVirtual := true
 
-	filterUpBox := tview.NewCheckbox().SetLabel("Up").SetChecked(true)
-	filterGatewayBox := tview.NewCheckbox().SetLabel("Gateway").SetChecked(true)
-	filterNonVirtualBox := tview.NewCheckbox().SetLabel("Non-virtual").SetChecked(true)
-	filtersRow := tview.NewFlex().SetDirection(tview.FlexColumn)
-	filtersRow.AddItem(filterUpBox, 0, 1, false)
-	filtersRow.AddItem(filterGatewayBox, 0, 1, false)
-	filtersRow.AddItem(filterNonVirtualBox, 0, 1, false)
-	configBox.AddItem(filtersRow, 1, 0, false)
+	filterUpBox := tview.NewCheckbox().SetLabel("Up ").SetChecked(true)
+	filterGatewayBox := tview.NewCheckbox().SetLabel("Gateway ").SetChecked(true)
+	filterNonVirtualBox := tview.NewCheckbox().SetLabel("Non-virtual ").SetChecked(true)
+	filtersRow := tview.NewFlex().SetDirection(tview.FlexRow)
+	filtersRow.AddItem(filterUpBox, 1, 0, false)
+	filtersRow.AddItem(filterGatewayBox, 1, 0, false)
+	filtersRow.AddItem(filterNonVirtualBox, 1, 0, false)
+	configBox.AddItem(filtersRow, 3, 0, false)
 
 	actionsBox := tview.NewFlex().SetDirection(tview.FlexRow)
 	actionsBox.SetBorder(true).SetTitle("Actions")
@@ -123,7 +137,7 @@ func runTUI(initial clientConfig) {
 	actionsBox.AddItem(tview.NewBox(), 1, 0, false)
 	actionsBox.AddItem(stopBtn, 1, 0, false)
 	actionsBox.AddItem(tview.NewBox(), 1, 0, false)
-	actionsBox.AddItem(refreshBtn, 1, 0, false)
+	actionsBox.AddItem(diagBtn, 1, 0, false)
 	actionsBox.AddItem(tview.NewBox(), 1, 0, false)
 	actionsBox.AddItem(quitBtn, 1, 0, false)
 	actionsBox.AddItem(tview.NewBox(), 0, 1, false) // bottom spacer
@@ -132,12 +146,16 @@ func runTUI(initial clientConfig) {
 	topRow.AddItem(configBox, 0, 1, false)
 	topRow.AddItem(actionsBox, 0, 1, false)
 
+	infoRow := tview.NewFlex().SetDirection(tview.FlexColumn)
+	infoRow.AddItem(usageView, 0, 1, false)
+	infoRow.AddItem(logView, 0, 1, false)
+
 	// Main layout
 	form := tview.NewFlex().SetDirection(tview.FlexRow)
-	form.AddItem(topRow, 11, 0, false)
-	form.AddItem(statusBar, 2, 0, false)
-	form.AddItem(ifaceList, 0, 1, true)
-	form.AddItem(info, 10, 0, false)
+	form.AddItem(topRow, 9, 0, false)
+	form.AddItem(statusBar, 6, 0, false)
+	form.AddItem(ifaceList, 0, 3, true)
+	form.AddItem(infoRow, 0, 2, false)
 	form.AddItem(actionStatus, 3, 0, false)
 
 	app.SetRoot(form, true).SetFocus(ifaceList)
@@ -149,11 +167,32 @@ func runTUI(initial clientConfig) {
 	var updateStatus func()
 	var persistConfig func()
 	var start func()
+	var stop func(exit bool)
+	var requestQuit func()
 	var scanInFlight bool
+	var startWatchCancel func()
+	var quitRequested bool
 
+	mouseEnabled := true
+	lastError := ""
 	serverFieldDisabled := false
 	suppressServerChange := false
-	var starting bool // prevent multiple concurrent starts and preserve info panel
+	var starting bool // prevent multiple concurrent starts and preserve stats panel
+	filtersActive := func() bool {
+		return !starting && state.running == nil
+	}
+	displayChoices := func() []ifaceChoice {
+		if filtersActive() {
+			return state.choices
+		}
+		choices := make([]ifaceChoice, 0, len(state.choices))
+		for _, c := range state.choices {
+			if state.selected[c.Name] || strings.EqualFold(c.Name, "fluxify") {
+				choices = append(choices, c)
+			}
+		}
+		return choices
+	}
 
 	persistConfig = func() {
 		if starting || state.running != nil {
@@ -165,14 +204,15 @@ func runTUI(initial clientConfig) {
 
 	redrawList = func() {
 		ifaceList.Clear()
-		for _, c := range state.choices {
-			if filterUp && !c.Up {
+		applyFilters := filtersActive()
+		for _, c := range displayChoices() {
+			if applyFilters && filterUp && !c.Up {
 				continue
 			}
-			if filterGateway && !c.HasGateway {
+			if applyFilters && filterGateway && !c.HasGateway {
 				continue
 			}
-			if filterNonVirtual && (c.Virtual || c.Loopback) {
+			if applyFilters && filterNonVirtual && (c.Virtual || c.Loopback) {
 				continue
 			}
 			checked := state.selected[c.Name]
@@ -184,14 +224,16 @@ func runTUI(initial clientConfig) {
 			}
 			availTag := "[green]OK[white]"
 			if !ifaceSelectable(c) {
-				state.selected[c.Name] = false
+				if filtersActive() {
+					state.selected[c.Name] = false
+				}
 				availTag = "[red]NO[white]"
 			}
 			line := fmt.Sprintf("%s %s %s", selTag, availTag, label)
 			choice := c
 			ifaceList.AddItem(line, "", 0, func() {
 				// Block toggles while running
-				if starting || state.running != nil {
+				if state.running != nil {
 					actionStatus.SetText("[yellow]Running: stop before changing interfaces")
 					return
 				}
@@ -208,9 +250,8 @@ func runTUI(initial clientConfig) {
 	}
 
 	refreshIfaces = func() {
-		// Do not allow modifying interface list while starting or running
-		if starting || state.running != nil {
-			actionStatus.SetText("[yellow]Running: stop before changing interfaces")
+		// Do not allow modifying interface list while running
+		if state.running != nil || starting {
 			return
 		}
 		if scanInFlight {
@@ -243,6 +284,10 @@ func runTUI(initial clientConfig) {
 			choices, ips := scanInterfaces()
 
 			app.QueueUpdateDraw(func() {
+				scanInFlight = false
+				if state.running != nil || starting {
+					return
+				}
 				state.choices = choices
 				for k, v := range ips {
 					state.ifaceIPs[k] = v
@@ -259,20 +304,39 @@ func runTUI(initial clientConfig) {
 					redrawList()
 				}
 				updateButtons()
-				queueExternalIPChecks(app, state, choices, redrawList, updateButtons)
+				if filtersActive() {
+					queueExternalIPChecks(app, state, choices, redrawList, updateButtons)
+				}
 				actionStatus.SetText("Idle")
-				scanInFlight = false
 			})
 		}()
 	}
 
-	refreshBtn.SetSelectedFunc(func() {
-		if starting || state.running != nil {
-			actionStatus.SetText("[yellow]Running: stop before changing interfaces")
-			return
+	diagBtn.SetSelectedFunc(func() {
+		cfg := clientConfig{
+			Server: strings.TrimSpace(serverField.GetText()),
+			Mode:   state.mode,
+			PKI:    state.pki,
+			Cert:   state.cert,
+			Ctrl:   state.ctrl,
 		}
-		refreshIfaces()
-		updateButtons()
+		var report diagReport
+		runAsync(app, actionStatus, "Diagnosing", func() error {
+			report, _ = runDiagnostics(cfg)
+			return report.err
+		}, func(err error) {
+			appendLog(app, logView, "\n"+report.details+"\n")
+			appendDiagnosticsLog(report.details)
+			lastError = report.errString()
+			if report.summary != "" {
+				if report.err != nil {
+					actionStatus.SetText("[red]" + report.summary)
+				} else {
+					actionStatus.SetText("[green]" + report.summary)
+				}
+			}
+			updateStatus()
+		})
 	})
 
 	done := make(chan struct{})
@@ -282,7 +346,7 @@ func runTUI(initial clientConfig) {
 			select {
 			case <-ticker.C:
 				app.QueueUpdateDraw(func() {
-					if starting || state.running != nil {
+					if state.running != nil {
 						// Do not refresh/modify the interfaces list while running
 						return
 					}
@@ -294,10 +358,6 @@ func runTUI(initial clientConfig) {
 			}
 		}
 	}()
-
-	quitBtn.SetSelectedFunc(func() {
-		app.Stop()
-	})
 
 	updateButtons = func() {
 		modeIdx, _ := modeDrop.GetCurrentOption()
@@ -321,11 +381,22 @@ func runTUI(initial clientConfig) {
 		if !serverDisabled {
 			state.server = strings.TrimSpace(serverField.GetText())
 		}
+		filtersOn := filtersActive()
+		filterUpBox.SetDisabled(!filtersOn)
+		filterGatewayBox.SetDisabled(!filtersOn)
+		filterNonVirtualBox.SetDisabled(!filtersOn)
+		if filtersOn {
+			ifaceList.SetTitle("Interfaces (select with mouse/Enter)")
+		} else {
+			ifaceList.SetTitle("Interfaces (locked while running)")
+		}
+		redrawList()
 		ok := state.canStart()
 		if state.running == nil && !starting {
 			startBtn.SetDisabled(!ok)
 		}
 		updateStatus()
+		showUsageInUsage(usageView, state, starting)
 	}
 
 	filterUpBox.SetChangedFunc(func(checked bool) {
@@ -345,9 +416,80 @@ func runTUI(initial clientConfig) {
 	})
 
 	setActionStatus := func(msg string) {
-		app.QueueUpdateDraw(func() {
-			actionStatus.SetText(msg)
-		})
+		actionStatus.SetText(msg)
+	}
+
+	resetStartState := func(err error) {
+		starting = false
+		if startWatchCancel != nil {
+			startWatchCancel()
+			startWatchCancel = nil
+		}
+		state.running = nil
+		stopBtn.SetDisabled(true)
+		if err != nil {
+			lastError = err.Error()
+			setActionStatus("[red]" + err.Error())
+		} else {
+			lastError = ""
+			setActionStatus("Idle")
+		}
+		showUsageInUsage(usageView, state, starting)
+		updateButtons()
+		if quitRequested {
+			quitRequested = false
+			app.Stop()
+		}
+	}
+
+	summarizeList := func(items []string, limit int) string {
+		if len(items) == 0 {
+			return ""
+		}
+		if len(items) <= limit {
+			return strings.Join(items, ", ")
+		}
+		return strings.Join(items[:limit], ", ") + fmt.Sprintf(" +%d", len(items)-limit)
+	}
+
+	collectWarnings := func() []string {
+		warnings := make([]string, 0)
+		extCounts := make(map[string]int)
+		for _, c := range state.choices {
+			if !state.selected[c.Name] {
+				continue
+			}
+			if !c.Up {
+				warnings = append(warnings, c.Name+" down")
+				continue
+			}
+			if !c.HasGateway {
+				warnings = append(warnings, c.Name+" no gw")
+			}
+			if c.IP == "" {
+				warnings = append(warnings, c.Name+" no ip")
+			}
+			if errMsg := state.extErr[c.Name]; errMsg != "" {
+				warnings = append(warnings, c.Name+" ext ip err")
+			}
+			if ext := state.extIP[c.Name]; ext != "" {
+				extCounts[ext]++
+			}
+		}
+		for ip, count := range extCounts {
+			if count >= 2 {
+				warnings = append(warnings, fmt.Sprintf("same ext ip: %s (%d ifs)", ip, count))
+			}
+		}
+		return warnings
+	}
+
+	setMouseEnabled := func(enabled bool) {
+		mouseEnabled = enabled
+		app.EnableMouse(enabled)
+		if updateStatus != nil {
+			updateStatus()
+		}
 	}
 
 	// setStatusBarDirect updates status bar without QueueUpdateDraw (safe before app.Run)
@@ -364,8 +506,10 @@ func runTUI(initial clientConfig) {
 		if state.mode == modeLoadBalance {
 			srv = "(local)"
 		}
-		visibleCount := countVisibleChoices(state.choices, filterUp, filterGateway, filterNonVirtual)
-		visibleSelected := countVisibleSelected(state.choices, state.selected, filterUp, filterGateway, filterNonVirtual)
+		choices := displayChoices()
+		applyFilters := filtersActive()
+		visibleCount := countVisibleChoices(choices, filterUp && applyFilters, filterGateway && applyFilters, filterNonVirtual && applyFilters)
+		visibleSelected := countVisibleSelected(choices, state.selected, filterUp && applyFilters, filterGateway && applyFilters, filterNonVirtual && applyFilters)
 		stateLabel := "IDLE"
 		stateColor := "[white]"
 		if starting {
@@ -375,16 +519,22 @@ func runTUI(initial clientConfig) {
 			stateLabel = "RUNNING"
 			stateColor = "[green]"
 		}
-		msg := fmt.Sprintf("Mode: %s | Server: %s | IFs: %d selected (%d/%d shown) | State: %s%s[white]",
-			state.mode, srv, selected, visibleSelected, visibleCount, stateColor, stateLabel)
+		mouseLabel := "OFF"
+		if mouseEnabled {
+			mouseLabel = "ON"
+		}
+		line1 := fmt.Sprintf("State: %s%s[white] | Mode: %s | IFs: %d (%d/%d shown) | Server: %s | Mouse: %s",
+			stateColor, stateLabel, state.mode, selected, visibleSelected, visibleCount, srv, mouseLabel)
 
 		var certErr error
+		var certName string
+		var caName string
 		if state.mode == modeBonding {
-			if name, err := detectClientCertName(state.pki); err != nil {
+			if bundlePath, err := detectClientBundlePath(state.pki); err != nil {
 				certErr = err
-				msg += " | Cert: [red]missing[-]"
 			} else {
-				msg += " | Cert: " + name
+				certName = bundleBaseName(bundlePath)
+				caName, _ = bundleCAName(bundlePath)
 			}
 		}
 
@@ -400,12 +550,33 @@ func runTUI(initial clientConfig) {
 		if selected < 2 {
 			needs = append(needs, ">=2 ifs")
 		}
-		filterLine := fmt.Sprintf("Filters: up=%s gw=%s non-virtual=%s", onOff(filterUp), onOff(filterGateway), onOff(filterNonVirtual))
+
+		warnings := collectWarnings()
+		warnText := summarizeList(warnings, 2)
+
+		line2 := "[green]OK[white]"
 		if len(needs) > 0 {
-			filterLine += " | Need: " + strings.Join(needs, ", ")
+			line2 = "[red]BLOCKED[white]: " + strings.Join(needs, ", ")
+		} else if state.mode == modeBonding && certName != "" {
+			line2 = "[green]OK[white]: cert " + certName
+		}
+		if state.mode == modeBonding {
+			if certErr != nil {
+				line2 += " | CA: missing"
+			} else if caName != "" {
+				line2 += " | CA: " + caName
+			} else {
+				line2 += " | CA: unknown"
+			}
+		}
+		if warnText != "" {
+			line2 += " | [yellow]Warn[white]: " + warnText
+		}
+		if lastError != "" {
+			line2 += " | [red]Err[white]: " + lastError
 		}
 
-		setStatusBarDirect(msg + "\n" + filterLine)
+		setStatusBarDirect(line1 + "\n" + line2)
 	}
 
 	start = func() {
@@ -413,6 +584,11 @@ func runTUI(initial clientConfig) {
 			return
 		}
 		starting = true
+		if startWatchCancel != nil {
+			startWatchCancel()
+			startWatchCancel = nil
+		}
+		lastError = ""
 		state.mode = state.currentMode(modeDrop)
 		if state.mode == modeBonding {
 			state.server = strings.TrimSpace(serverField.GetText())
@@ -420,12 +596,13 @@ func runTUI(initial clientConfig) {
 		if !state.canStart() {
 			setActionStatus("[red]Select server and at least 2 interfaces (server only needed for bonding)")
 			starting = false
+			updateButtons()
 			return
 		}
 		if state.mode == modeBonding {
 			path, err := detectClientBundlePath(state.pki)
 			if err != nil {
-				setActionStatus(fmt.Sprintf("[red]%v", err))
+				resetStartState(err)
 				return
 			}
 			state.cert = path
@@ -434,43 +611,57 @@ func runTUI(initial clientConfig) {
 
 		startBtn.SetDisabled(true)
 		stopBtn.SetDisabled(true)
-		// Prevent interface changes while starting/running
-		refreshBtn.SetDisabled(true)
-
 		var stopper func()
-		// Clear usage text and show we're starting
-		info.Clear()
-		_, _ = fmt.Fprintf(info, "Starting %s mode...\n", cfg.Mode)
+		log.Printf("Starting %s mode...", cfg.Mode)
+
+		// Watchdog: force-reset UI if start hangs longer than controlTimeout+5s
+		{
+			watchCtx, cancelWatch := context.WithCancel(context.Background())
+			startWatchCancel = cancelWatch
+			go func() {
+				select {
+				case <-time.After(controlTimeout + 5*time.Second):
+					app.QueueUpdateDraw(func() {
+						if starting && state.running == nil {
+							resetStartState(fmt.Errorf("start timeout: no response from control plane"))
+						}
+					})
+				case <-watchCtx.Done():
+				}
+			}()
+		}
+
 		runAsync(app, actionStatus, "Starting", func() error {
-			log.Printf("start: calling startClientWithStats")
-			fn, err := startClientWithStats(cfg, info, app)
+			vlogf("start: calling startClientWithStats")
+			fn, err := startClientWithStats(cfg, usageView, app)
 			if err != nil {
-				log.Printf("start: startClientWithStats failed: %v", err)
+				vlogf("start: startClientWithStats failed: %v", err)
 			} else {
-				log.Printf("start: startClientWithStats OK")
+				vlogf("start: startClientWithStats OK")
 			}
 			if err == nil {
 				stopper = fn
 			}
 			return err
 		}, func(err error) {
-			starting = false
 			if err != nil {
-				log.Printf("Start failed: %v", err)
-				startBtn.SetDisabled(false)
-				// Re-enable refresh on failure
-				refreshBtn.SetDisabled(false)
-				updateButtons()
+				resetStartState(err)
 				return
 			}
+			lastError = ""
+			starting = false
 			state.running = stopper
-			_, _ = fmt.Fprintf(info, "[green]Started %s with %d interfaces.[white]\n", cfg.Mode, len(cfg.Ifaces))
+			log.Printf("Started %s with %d interfaces.", cfg.Mode, len(cfg.Ifaces))
 			saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Cert: cfg.Cert, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
 			stopBtn.SetDisabled(false)
+			if quitRequested {
+				quitRequested = false
+				stop(true)
+			}
 		})
 	}
 
-	stop := func() {
+	stop = func(exit bool) {
 		if state.running != nil {
 			stopBtn.SetDisabled(true)
 			runAsync(app, actionStatus, "Stopping", func() error {
@@ -479,27 +670,40 @@ func runTUI(initial clientConfig) {
 				return nil
 			}, func(err error) {
 				startBtn.SetDisabled(!state.canStart())
-				// Allow interface changes again
-				refreshBtn.SetDisabled(false)
-				showUsageInInfo(info, state.mode)
-				_, _ = fmt.Fprintln(info, "[green]Stopped.[white]")
+				showUsageInUsage(usageView, state, starting)
+				log.Printf("Stopped.")
 				updateButtons()
+				if exit {
+					app.Stop()
+				}
 			})
 			return
 		}
 		startBtn.SetDisabled(!state.canStart())
 		stopBtn.SetDisabled(true)
-		refreshBtn.SetDisabled(false)
 		setActionStatus("[yellow]stopped")
 		updateButtons()
+		if exit {
+			app.Stop()
+		}
+	}
+
+	requestQuit = func() {
+		if starting && state.running == nil {
+			quitRequested = true
+			setActionStatus("[yellow]Stopping...")
+			return
+		}
+		stop(true)
 	}
 
 	startBtn.SetSelectedFunc(start)
-	stopBtn.SetSelectedFunc(stop)
+	stopBtn.SetSelectedFunc(func() { stop(false) })
+	quitBtn.SetSelectedFunc(requestQuit)
 
 	modeDrop.SetSelectedFunc(func(text string, idx int) {
 		state.mode = text
-		showUsageInInfo(info, state.mode)
+		showUsageInUsage(usageView, state, starting)
 		updateButtons()
 	})
 
@@ -515,18 +719,39 @@ func runTUI(initial clientConfig) {
 	})
 
 	refreshIfaces()
-	showUsageInInfo(info, state.mode)
+	showUsageInUsage(usageView, state, starting)
 	updateButtons()
 
 	// key bindings
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyCtrlC {
-			app.Stop()
+			requestQuit()
+			return nil
+		}
+		if event.Key() == tcell.KeyEscape {
+			requestQuit()
+			return nil
+		}
+		if event.Key() == tcell.KeyRune {
+			switch event.Rune() {
+			case 'q', 'Q':
+				requestQuit()
+				return nil
+			}
+		}
+		if event.Key() == tcell.KeyF2 {
+			setMouseEnabled(!mouseEnabled)
 			return nil
 		}
 		return event
 	})
 
+	defer func() {
+		if state.running != nil {
+			state.running()
+			state.running = nil
+		}
+	}()
 	if err := app.Run(); err != nil {
 		log.Fatalf("tui error: %v", err)
 	}
@@ -541,6 +766,8 @@ type tuiState struct {
 	cert     string
 	pki      string
 	ctrl     int
+	dns4     []string
+	dns6     []string
 	choices  []ifaceChoice
 	selected map[string]bool
 	running  func()
@@ -559,6 +786,8 @@ func newTUIState(initial clientConfig) *tuiState {
 		cert:     initial.Cert,
 		pki:      initial.PKI,
 		ctrl:     initial.Ctrl,
+		dns4:     initial.DNS4,
+		dns6:     initial.DNS6,
 		selected: make(map[string]bool),
 		ifaceIPs: make(map[string]string),
 		choices:  make([]ifaceChoice, 0),
@@ -606,7 +835,7 @@ func (s *tuiState) canStart() bool {
 }
 
 func scanInterfaces() ([]ifaceChoice, map[string]string) {
-	log.Printf("scanInterfaces: starting")
+	vlogf("scanInterfaces: starting")
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		log.Printf("scanInterfaces: list interfaces failed: %v", err)
@@ -633,7 +862,7 @@ func scanInterfaces() ([]ifaceChoice, map[string]string) {
 		gw := ""
 		gw6 := ""
 		if up && !loopback {
-			log.Printf("scanInterfaces: checking %s", iface.Name)
+			vlogf("scanInterfaces: checking %s", iface.Name)
 			gw, _ = platform.GatewayForIface(tuiRunner{}, iface.Name)
 			gw6, _ = platform.GatewayForIface6(tuiRunner{}, iface.Name)
 		}
@@ -657,7 +886,7 @@ func scanInterfaces() ([]ifaceChoice, map[string]string) {
 		}
 	}
 	sort.Slice(choices, func(i, j int) bool { return choices[i].Name < choices[j].Name })
-	log.Printf("scanInterfaces: found %d candidates", len(choices))
+	vlogf("scanInterfaces: found %d candidates", len(choices))
 	return choices, ips
 }
 
@@ -748,7 +977,7 @@ func queueExternalIPChecks(app *tview.Application, st *tuiState, choices []iface
 				st.extBusy[name] = false
 				st.extAt[name] = time.Now()
 				if err != nil {
-					log.Printf("external ip (%s): %v", name, err)
+					vlogf("external ip (%s): %v", name, err)
 					st.extErr[name] = err.Error()
 					st.extIP[name] = ""
 				} else {
@@ -796,7 +1025,9 @@ func fetchExternalIP(localIP string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
+	defer func(Body io.ReadCloser) {
+		_ = Body.Close()
+	}(resp.Body)
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("http %d", resp.StatusCode)
 	}
@@ -811,11 +1042,173 @@ func fetchExternalIP(localIP string) (string, error) {
 	return ext, nil
 }
 
-func onOff(v bool) string {
-	if v {
-		return "on"
+type diagReport struct {
+	summary string
+	details string
+	err     error
+}
+
+func (d diagReport) errString() string {
+	if d.err == nil {
+		return ""
 	}
-	return "off"
+	if d.summary != "" {
+		return d.summary
+	}
+	return d.err.Error()
+}
+
+func runDiagnostics(cfg clientConfig) (diagReport, error) {
+	lines := []string{"[yellow]Diagnostics[white]"}
+	if cfg.Server == "" {
+		err := fmt.Errorf("server missing")
+		lines = append(lines, "[red]Server: missing[white]")
+		return diagReport{summary: "server missing", details: strings.Join(lines, "\n"), err: err}, err
+	}
+	host, port, err := parseServerAddr(cfg.Server, cfg.Ctrl)
+	if err != nil {
+		lines = append(lines, fmt.Sprintf("[red]Server: %v[white]", err))
+		return diagReport{summary: "invalid server", details: strings.Join(lines, "\n"), err: err}, err
+	}
+	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	lines = append(lines, fmt.Sprintf("Server: %s", addr))
+	if ip := net.ParseIP(host); ip == nil {
+		ips, err := net.LookupIP(host)
+		if err != nil {
+			lines = append(lines, fmt.Sprintf("[yellow]DNS: %v[white]", err))
+		} else if len(ips) > 0 {
+			var ipStrs []string
+			for _, ip := range ips {
+				ipStrs = append(ipStrs, ip.String())
+			}
+			lines = append(lines, "DNS: "+strings.Join(ipStrs, ", "))
+		}
+	}
+
+	start := time.Now()
+	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+	if err != nil {
+		lines = append(lines, fmt.Sprintf("[red]TCP: failed (%s)[white]", err))
+		report := diagReport{summary: "tcp connect failed", details: strings.Join(lines, "\n"), err: err}
+		return report, err
+	}
+	_ = conn.Close()
+	lines = append(lines, fmt.Sprintf("[green]TCP: ok (%s)[white]", time.Since(start).Round(time.Millisecond)))
+
+	bundlePath := cfg.Cert
+	if bundlePath == "" {
+		bundlePath, err = detectClientBundlePath(cfg.PKI)
+	}
+	if err != nil {
+		lines = append(lines, fmt.Sprintf("[red]Bundle: %v[white]", err))
+		report := diagReport{summary: "bundle missing", details: strings.Join(lines, "\n"), err: err}
+		return report, err
+	}
+	lines = append(lines, "Bundle: "+bundlePath)
+	if name := bundleBaseName(bundlePath); name != "" {
+		lines = append(lines, "Cert: "+name)
+	}
+	if caName, err := bundleCAName(bundlePath); err == nil && caName != "" {
+		lines = append(lines, "CA: "+caName)
+	}
+
+	tlsCfg, err := clientTLSConfig(cfg)
+	if err != nil {
+		lines = append(lines, fmt.Sprintf("[red]TLS config: %v[white]", err))
+		report := diagReport{summary: "tls config failed", details: strings.Join(lines, "\n"), err: err}
+		return report, err
+	}
+	if host != "" {
+		c := tlsCfg.Clone()
+		c.ServerName = host
+		tlsCfg = c
+	}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	tcpConn, err := dialer.Dial("tcp", addr)
+	if err != nil {
+		lines = append(lines, fmt.Sprintf("[red]TLS: tcp connect failed (%s)[white]", err))
+		report := diagReport{summary: "tls tcp failed", details: strings.Join(lines, "\n"), err: err}
+		return report, err
+	}
+	tlsConn := tls.Client(tcpConn, tlsCfg)
+	_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
+	if err := tlsConn.Handshake(); err != nil {
+		_ = tlsConn.Close()
+		tlsErr := classifyTLSError(err)
+		lines = append(lines, fmt.Sprintf("[red]TLS: failed (%s)[white]", tlsErr))
+		report := diagReport{summary: "tls failed", details: strings.Join(lines, "\n"), err: tlsErr}
+		return report, tlsErr
+	}
+	_ = tlsConn.Close()
+	lines = append(lines, "[green]TLS: ok[white]")
+	lines = append(lines, "")
+	lines = append(lines, "[yellow]Routing[white]")
+	lines = appendRouteDump(lines)
+	report := diagReport{summary: "diagnostics ok", details: strings.Join(lines, "\n"), err: nil}
+	return report, nil
+}
+
+func appendRouteDump(lines []string) []string {
+	if runtime.GOOS == "windows" {
+		lines = append(lines, "[cyan]IPv4 routes (route print -4):[white]")
+		lines = appendCommandOutput(lines, "route", "print", "-4")
+		lines = append(lines, "[cyan]IPv6 routes (netsh interface ipv6 show route):[white]")
+		lines = appendCommandOutput(lines, "netsh", "interface", "ipv6", "show", "route")
+		return lines
+	}
+	lines = append(lines, "[cyan]IPv4 routes (ip route):[white]")
+	lines = appendCommandOutput(lines, "ip", "route")
+	lines = append(lines, "[cyan]IPv6 routes (ip -6 route):[white]")
+	lines = appendCommandOutput(lines, "ip", "-6", "route")
+	return lines
+}
+
+func appendCommandOutput(lines []string, name string, args ...string) []string {
+	out, err := common.RunPrivilegedOutput(name, args...)
+	if err != nil {
+		lines = append(lines, fmt.Sprintf("[red]%s %s failed: %v[white]", name, strings.Join(args, " "), err))
+		return lines
+	}
+	text := strings.TrimRight(string(out), "\r\n")
+	if text == "" {
+		lines = append(lines, "[gray](no output)[white]")
+		return lines
+	}
+	for _, line := range strings.Split(text, "\n") {
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func bundleCAName(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	var certs [][]byte
+	rest := b
+	for {
+		var blk *pem.Block
+		blk, rest = pem.Decode(rest)
+		if blk == nil {
+			break
+		}
+		if blk.Type == "CERTIFICATE" {
+			certs = append(certs, blk.Bytes)
+		}
+	}
+	if len(certs) < 2 {
+		return "", fmt.Errorf("bundle needs CA + client cert (found %d certs)", len(certs))
+	}
+	caCert, err := x509.ParseCertificate(certs[0])
+	if err != nil {
+		return "", err
+	}
+	name := strings.TrimSpace(caCert.Subject.CommonName)
+	if name == "" {
+		name = strings.TrimSpace(caCert.Subject.String())
+	}
+	return name, nil
 }
 
 func countVisibleChoices(choices []ifaceChoice, filterUp, filterGateway, filterNonVirtual bool) int {
@@ -875,6 +1268,8 @@ func (s *tuiState) buildConfig() clientConfig {
 		PKI:    s.pki,
 		Cert:   s.cert,
 		Ctrl:   s.ctrl,
+		DNS4:   s.dns4,
+		DNS6:   s.dns6,
 	}
 }
 
@@ -904,10 +1299,6 @@ func runAsync(app *tview.Application, status *tview.TextView, label string, work
 		app.QueueUpdateDraw(func() {
 			if err != nil {
 				status.SetText(fmt.Sprintf("[red]%s failed: %v", label, err))
-				// Also surface the error to the info pane if available.
-				if status != nil {
-					// no-op; status already set
-				}
 			} else {
 				status.SetText(fmt.Sprintf("[green]%s done", label))
 			}
@@ -926,38 +1317,143 @@ type tuiLogWriter struct {
 func (w *tuiLogWriter) Write(p []byte) (n int, err error) {
 	msg := string(p)
 	// Write to file as well for debugging
-	if exe, err := os.Executable(); err == nil {
-		logFile := filepath.Join(filepath.Dir(exe), "client_debug.log")
-		f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if f != nil {
-			// Strip colors/tags if possible, but raw log is fine
-			fmt.Fprintf(f, "%s %s", time.Now().Format("15:04:05"), msg)
-			f.Close()
+	if verboseLogging {
+		if exe, err := os.Executable(); err == nil {
+			logFile := filepath.Join(filepath.Dir(exe), "client_debug.log")
+			f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if f != nil {
+				// Strip colors/tags if possible, but raw log is fine
+				_, _ = fmt.Fprintf(f, "%s %s", time.Now().Format("15:04:05"), msg)
+				_ = f.Close()
+			}
 		}
 	}
-	w.app.QueueUpdateDraw(func() {
-		_, _ = w.view.Write([]byte(msg))
-		w.view.ScrollToEnd()
-	})
+	appendLog(w.app, w.view, msg)
 	return len(p), nil
 }
 
-func showUsageInInfo(info *tview.TextView, mode string) {
-	var help string
-	if mode == modeBonding {
-		help = `[yellow]BONDING MODE[white]
-• Server-backed multipath VPN
-• TUN at 10.8.0.x/24
-• Requires server + client cert
-
-[gray]Waiting for connection stats...`
-	} else {
-		help = `[yellow]LOAD-BALANCE MODE[white]
-• Local multipath routing (no TUN)
-• Installs multipath default route over selected gateways
-• Adds MASQUERADE per uplink; no server required
-
-[gray]Waiting for connection stats...`
+func appendLog(app *tview.Application, view *tview.TextView, msg string) {
+	if app == nil || view == nil {
+		return
 	}
-	info.SetText(help)
+	go func() {
+		app.QueueUpdateDraw(func() {
+			appendLogSync(view, msg)
+		})
+	}()
+}
+
+func appendLogSync(view *tview.TextView, msg string) {
+	if view == nil {
+		return
+	}
+	follow := logViewAtBottom(view)
+	_, _ = view.Write([]byte(msg))
+	if follow {
+		view.ScrollToEnd()
+	}
+}
+
+func logViewAtBottom(view *tview.TextView) bool {
+	if view == nil {
+		return true
+	}
+	row, _ := view.GetScrollOffset()
+	if row < 0 {
+		return true
+	}
+	_, _, _, height := view.GetRect()
+	if height <= 0 {
+		return true
+	}
+	lineCount := view.GetWrappedLineCount()
+	if lineCount == 0 {
+		return true
+	}
+	maxOffset := lineCount - height
+	if maxOffset < 0 {
+		maxOffset = 0
+	}
+	return row >= maxOffset
+}
+
+func showUsageInUsage(view *tview.TextView, st *tuiState, starting bool) {
+	if view == nil || st == nil {
+		return
+	}
+	if starting || st.running != nil {
+		return
+	}
+	lines := []string{"[yellow]Usage[white]"}
+	if st.mode == modeBonding {
+		lines = append(lines, "Mode: bonding (server-backed)")
+	} else {
+		lines = append(lines, "Mode: load-balance (local)")
+	}
+
+	selected := make([]string, 0)
+	for name, on := range st.selected {
+		if on {
+			selected = append(selected, name)
+		}
+	}
+	sort.Strings(selected)
+	if len(selected) == 0 {
+		lines = append(lines, "[gray]No interfaces selected.[white]")
+	} else {
+		lines = append(lines, fmt.Sprintf("Selected interfaces: %d", len(selected)))
+		choices := make(map[string]ifaceChoice, len(st.choices))
+		for _, c := range st.choices {
+			choices[c.Name] = c
+		}
+		for _, name := range selected {
+			c, ok := choices[name]
+			if !ok {
+				lines = append(lines, fmt.Sprintf("  %s (not found)", name))
+				continue
+			}
+			ip := c.IP
+			if ip == "" {
+				ip = "-"
+			}
+			gw := c.Gw
+			if gw == "" {
+				gw = c.Gw6
+			}
+			if gw == "" {
+				gw = "-"
+			}
+			ext := externalLabelFor(st, c)
+			if ext == "" {
+				ext = "-"
+			}
+			stateLabel := "[red]DOWN[white]"
+			if c.Up {
+				stateLabel = "[green]UP[white]"
+			}
+			lines = append(lines, fmt.Sprintf("  %s ip:%s gw:%s ext:%s %s", c.Name, ip, gw, ext, stateLabel))
+		}
+	}
+	lines = append(lines, "[gray]Start to see live stats.[white]")
+	view.SetText(strings.Join(lines, "\n"))
+}
+
+func appendDiagnosticsLog(details string) {
+	if !verboseLogging {
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return
+	}
+	logFile := filepath.Join(filepath.Dir(exe), "client_debug.log")
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return
+	}
+	defer func(f *os.File) {
+		_ = f.Close()
+	}(f)
+	sep := "-----------"
+	_, _ = fmt.Fprintf(f, "\n%s\n%s\n%s\n", sep, details, sep)
 }
