@@ -1,7 +1,7 @@
 //go:build windows && 386
 // +build windows,386
 
-package main
+package platform
 
 import _ "embed"
 

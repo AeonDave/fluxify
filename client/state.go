@@ -9,6 +9,9 @@ import (
 	"time"
 
 	"github.com/rivo/tview"
+
+	"fluxify/client/platform"
+	"fluxify/common"
 )
 
 const (
@@ -46,7 +49,7 @@ type clientState struct {
 	connMu      sync.RWMutex
 	nextSeqSend atomic.Uint32
 	nextConnRR  atomic.Uint32
-	tun         tunDevice
+	tun         platform.TunDevice
 	tunWriteCh  chan []byte
 	mode        string
 	ctx         context.Context
@@ -64,18 +67,51 @@ type clientState struct {
 	ipv6Enabled bool
 	rateMu      sync.Mutex
 	rateByConn  map[*clientConn]*ifaceRate
+	compStats   compressionStats
+
+	// Inbound reorder (server -> client) for packet-level striping.
+	inReorder      *reorderBuffer
+	stopInReorder  chan struct{}
+	inReorderStats struct {
+		packetsBuffered  atomic.Uint64
+		packetsReordered atomic.Uint64
+		packetsDropped   atomic.Uint64
+		flushes          atomic.Uint64
+		maxDepth         atomic.Uint32
+	}
+
+	// Weighted scheduler state (bonding mode)
+	schedMu      sync.Mutex
+	schedDeficit map[*clientConn]float64
+
+	// Flow scheduler (bonding mode): keep packets of same flow on same conn.
+	flowMu     sync.Mutex
+	flowToConn map[common.FlowKey]*clientConn
+}
+
+type compressionStats struct {
+	attempts      atomic.Uint64
+	savings       atomic.Int64 // bytes saved (negative = waste)
+	enabled       atomic.Bool
+	samplingPhase atomic.Bool
+	sampleSize    atomic.Uint32
 }
 
 type clientConfig struct {
-	Server string
-	Ifaces []string
-	IPs    []string
-	Mode   string
-	PKI    string
-	Cert   string
-	Ctrl   int
-	DNS4   []string
-	DNS6   []string
+	Server                string
+	Ifaces                []string
+	IPs                   []string
+	Mode                  string
+	PKI                   string
+	Cert                  string
+	Ctrl                  int
+	DNS4                  []string
+	DNS6                  []string
+	CompressionSampleSize int
+	ReorderBufferSize     int
+	ReorderFlushTimeout   time.Duration
+	MTU                   int  // 0 = use default (common.MTU), >0 = override
+	ProbePMTUD            bool // if true, probe PMTUD at startup and warn if fails
 }
 
 type storedConfig struct {

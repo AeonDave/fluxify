@@ -50,7 +50,13 @@ Fluxify is a multipath VPN that bonds or load-balances multiple WAN interfaces. 
 - **Control plane (TLS/mTLS):** Client connects to the server control port, authenticates with a client certificate, and receives a per-session `SessionID`, `SessionKey` (AES-256), UDP port, and assigned TUN IPs (10.8.0.x for IPv4, fd00:8:0::x for IPv6). Certificates are issued by the server’s CA.
 - **Data plane (UDP):** Encrypted packets carry a compact 22-byte header (version, type, session ID, seq, length, reserved). Payloads are AES-GCM encrypted with the header as AAD. Optional gzip compression is flagged in `Reserved[0]`.
 - **TUN interfaces:** In bonding mode client and server create TUN devices; IP traffic is injected/extracted at the IP layer. Server performs NAT (MASQUERADE) for 10.8.0.0/24 (IPv4) and fd00:8:0::/64 (IPv6) toward the Internet. Load-balance mode does not use a client TUN.
-- **Multipath scheduling:** Client uplink supports two modes: bonding (round-robin over alive links) and load-balance (lowest RTT). Server downlink picks the lowest-RTT alive path per session. Heartbeats measure RTT.
+- **Multipath scheduling:**
+  - **Bonding mode:** multipath over multiple UDP connections.
+    - **Reorder buffers** exist on both sides to tolerate out-of-order delivery.
+    - **Flow-based scheduling (5‑tuple pinning)** is used to keep packets of the same TCP/UDP flow on the same path whenever possible, avoiding TCP throughput collapse on mixed RTT links (e.g. Ethernet + 5G hotspot).
+    - A **strict bad-link exclusion** policy avoids sending even a small share of traffic to high-jitter/high-RTT links that would trigger reordering and fast-retransmits.
+  - **Load-balance mode:** selects a single best path (lowest RTT) without TUN.
+  - Heartbeats measure RTT (and client estimates jitter/loss for adaptive decisions).
 - **Interface binding:** Each UDP connection can bind to a specific interface/IP (Linux `SO_BINDTODEVICE`). Policy-routing helper exists but is not auto-applied; manual multi-WAN routing may be required.
 - **Routing flip on start (bonding):** Installs a host route to the server via the existing default and replaces the default route to point to the TUN. On stop, restores the previous default route and removes the host route.
 - **Routing (load-balance):** Installs per-uplink MASQUERADE rules and a multipath default route over discovered gateways; no TUN is created. Supports both IPv4 and IPv6 gateways.
@@ -77,6 +83,10 @@ go build -o client ./client
 - `-regen` (bool): Regenerate CA and server certificates at start.
 - `-hosts` (string, default `127.0.0.1,localhost`): Comma-separated SANs for the server certificate.
 - `-tui` (bool): Launch certificate-management TUI instead of starting the data/control plane.
+- `-reorder-buffer-size` (int, default 128): Max packets in reorder buffer (inbound).
+- `-reorder-flush-timeout` (duration, default 50ms): Flush timeout for reorder buffer.
+- `-mss-clamp` (string, default `off`): TCP MSS clamp for traffic traversing TUN. Values: `off` | `pmtu` | `fixed:N`.
+- `-metrics-every` (duration, default `0`): Periodically log per-session metrics (reorder + per-connection RTT/bytes). `0` disables.
 
 ### Behavior
 
@@ -84,7 +94,9 @@ go build -o client ./client
 - Assigns client IPs starting from 10.8.0.2/24 (IPv4) and fd00:8:0::2/64 (IPv6).
 - Listens on UDP `-port` for encrypted data-plane traffic; listens on TCP `-ctrl` for mTLS control.
 - Installs NAT MASQUERADE for 10.8.0.0/24 (IPv4) and fd00:8:0::/64 (IPv6) if missing (Linux).
-- Downlink scheduling picks the lowest-RTT alive connection per session; gzip is applied when beneficial.
+- Downlink scheduling stripes packets across alive UDP connections per session; client reorders by `SeqNum`.
+- Client uplink (bonding) uses a **weighted deficit RR** scheduler with adaptive thresholds based on `-reorder-flush-timeout` (jitter/loss/RTT) to avoid bad links collapsing TCP.
+- Gzip is applied when beneficial.
 
 ### Server TUI (`-tui`)
 
@@ -96,7 +108,7 @@ go build -o client ./client
 
 ### Modes
 
-- **Bonding (server-backed):** Round-robin over alive links; requires server control connection and a client bundle (.pem with cert+key). One UDP connection is opened per selected interface. Start requires at least two selected interfaces and a non-empty server; uses a TUN at 10.8.0.x/24 and fd00:8:0::x/64.
+- **Bonding (server-backed):** Packet-level striping + reorder (bandwidth aggregation). Requires server control connection and a client bundle (.pem with cert+key). One UDP connection is opened per selected interface. Start requires at least two selected interfaces and a non-empty server; uses a TUN at 10.8.0.x/24 and fd00:8:0::x/64.
 - **Load-balance (local/serverless):** No server or TUN. Discovers gateways per selected interface via `ip route get`, installs per-uplink MASQUERADE and a multipath default route; requires at least two interfaces with gateways. The TUI disables the server field and marks interfaces without gateways in red/unselectable. Supports IPv4 and IPv6 gateways.
 
 ### Flags (CLI)
@@ -107,6 +119,10 @@ go build -o client ./client
 - `-pki` (string, default `~/.fluxify`): PKI directory containing CA and client cert/key in flat files.
 - `-cert` (string): Path to client bundle (.pem/.bundle with cert+key); if omitted, auto-detects a single bundle in `-pki`.
 - `-ctrl` (int, default 8443): Control-plane TLS port if not specified in `-server`.
+- `-reorder-buffer-size` (int, default 128): Client-side reorder buffer max packets (inbound, for server→client striping).
+- `-reorder-flush-timeout` (duration, default 50ms): Reorder flush timeout (also used to tune adaptive bonding thresholds).
+- `-mtu` (int, default 0): TUN MTU override (0=auto/default 1400). Use e.g. 1280, 1350 if you experience throughput issues.
+- `-probe-pmtud` (bool): Probe path MTU at startup and warn if the default MTU may cause blackhole. Auto-reduces MTU if probe fails.
 - `-v` (bool): Enable verbose logs (interface scan, gateways, routes) and write `client_debug.log`.
 - `-b` (bool): Force bonding mode (headless/scripted).
 - `-l` (bool): Force load-balance mode (headless/scripted).
@@ -140,9 +156,51 @@ Notes on PKI layout and server vs client:
   - Linux: run with `sudo` (e.g., `sudo ./client`, `sudo ./server`).
   - Windows: run as Administrator (UAC prompt at launch).
 - The data plane is UDP; TCP-over-UDP avoids TCP-over-TCP head-of-line issues. AES-GCM protects both header integrity (as AAD) and payload confidentiality.
-- No reorder buffer is implemented; higher-layer TCP handles reordering. Heartbeats run every 2s to update RTT for scheduling.
+- Bonding mode implements reorder buffers on both client and server. In practice, mixed-RTT paths can still degrade single-flow TCP if packets are striped per-packet; Fluxify therefore uses **flow-based scheduling** and strict bad-link exclusion by default.
+- Heartbeats run every 2s to update RTT for scheduling.
 - Compression is opportunistic; large incompressible payloads are sent uncompressed.
 - Policy routing: helper functions exist (`EnsurePolicyRouting`) but are not invoked automatically; configure per-WAN routing manually if needed to force egress per interface.
+
+## Troubleshooting
+
+### Throughput is very low (MTU/PMTUD)
+
+If you see unexpectedly low throughput (e.g. a few Mbps) especially over mixed paths (Wi‑Fi + 5G), it can be caused by **PMTUD blackholes** or fragmentation issues.
+
+Recommended mitigation on the server (Linux):
+
+```bash
+sudo ./server ... -mss-clamp=pmtu
+```
+
+Or a fixed conservative MSS:
+
+```bash
+sudo ./server ... -mss-clamp=fixed:1360
+```
+
+### Bonding feels unstable / TCP is slow
+
+Use the client TUI “Bonding Metrics” panel:
+- Per-interface: RTT, jitter, heartbeat loss, stability score, and tx/rx rates.
+- Inbound reorder (server->client): `bufferedEvents`, `reorderedEvents`, `drops`, `flushes`, `maxDepth`.
+
+If one link shows high loss/jitter, try increasing tolerance (at the cost of latency) via:
+
+```bash
+./client ... -reorder-flush-timeout=80ms
+```
+
+Or, if you want stricter behavior (exclude bad links more aggressively):
+
+```bash
+./client ... -reorder-flush-timeout=30ms
+```
+
+> Note
+>
+> With highly asymmetric links (e.g. ETH 20–40ms vs 5G hotspot 150–300ms), true single-flow bandwidth aggregation is generally not achievable with per-packet striping without MPTCP-like congestion control. Fluxify will keep the flow pinned to the best path to preserve throughput, while still benefiting from multipath for multiple simultaneous flows.
+
 
 ## Quickstart (single client)
 
@@ -175,8 +233,39 @@ Notes on PKI layout and server vs client:
 go test ./...
 ```
 
-If the repository contains a `server/pki` directory created by a root-run server, the Go toolchain may hit permission errors when expanding `./...`. In that case run package-specific tests, which avoid that folder:
+Note: server code is **Linux build-tagged**; `go test ./server/...` may match no packages. Prefer:
 
 ```bash
-go test ./common ./client ./server
+go test ./...
 ```
+
+### E2E Testing & Diagnostics
+
+**End-to-End Bonding Test** (`scripts/test_bonding_e2e.sh`):
+- Simulates multiple WAN links with different characteristics using `tc/netem` (delay, jitter, loss, bandwidth)
+- Runs baseline throughput tests per interface and bonded tests with `iperf3`
+- Generates comparison reports to verify bandwidth aggregation
+- Requires: Linux server with root, `tc`, `iperf3`
+
+```bash
+# Server side
+sudo ./scripts/test_bonding_e2e.sh --server --netem
+
+# Client side
+sudo ./scripts/test_bonding_e2e.sh --client SERVER_IP --ifaces eth0,wlan0 --duration 30
+```
+
+**Diagnostic Collection** (`scripts/diagnose.sh`):
+- Collects comprehensive system info (OS, CPU, memory, network buffers)
+- Reports interface details (state, IP, MTU, gateway, driver, speed)
+- Tests connectivity (DNS, TCP, ICMP, PMTUD)
+- Dumps routing tables and firewall rules
+- Provides performance recommendations
+
+```bash
+sudo ./scripts/diagnose.sh --server SERVER_IP --full --output /tmp/report.txt
+```
+
+**Client TUI Diagnostics**:
+- Use the "DIAG" button in the client TUI for interactive diagnostics
+- Reports: system info, interface status, server connectivity, certificate verification, TLS handshake, PMTUD probe, routing dump, performance recommendations

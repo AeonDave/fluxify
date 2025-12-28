@@ -2,23 +2,20 @@ package main
 
 import (
 	"testing"
+	"time"
 )
 
-func TestPickBestConnRoundRobinSkipsDown(t *testing.T) {
+func TestPickBestConnSkipsDown(t *testing.T) {
 	c1 := &clientConn{}
 	c2 := &clientConn{}
 	c1.alive.Store(true)
 	c2.alive.Store(true)
 
-	state := &clientState{mode: modeBonding, conns: []*clientConn{c1, c2}}
+	state := &clientState{mode: modeBonding, conns: []*clientConn{c1, c2}, cfg: clientConfig{ReorderFlushTimeout: 50 * time.Millisecond}, schedDeficit: make(map[*clientConn]float64)}
 
-	first := state.pickBestConn()
-	second := state.pickBestConn()
-	if first == nil || second == nil {
-		t.Fatalf("expected conns, got first=%v second=%v", first, second)
-	}
-	if first == second {
-		t.Fatalf("expected round-robin to advance, got same conn twice (%v)", first)
+	got := state.pickBestConn()
+	if got == nil {
+		t.Fatalf("expected a conn, got nil")
 	}
 
 	// Mark one down; should always pick the alive one

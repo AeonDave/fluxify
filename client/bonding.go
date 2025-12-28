@@ -87,21 +87,40 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &clientState{
-		serverUDP:  serverUDP,
-		sessionID:  sessID,
-		sessionKey: key,
-		clientIP:   clientIP,
-		clientIPv6: clientIPv6,
-		mode:       cfg.Mode,
-		ctx:        ctx,
-		cancel:     cancel,
-		ctrlAddr:   ctrlAddr,
-		cfg:        cfg,
-		rateByConn: make(map[*clientConn]*ifaceRate),
+		serverUDP:     serverUDP,
+		sessionID:     sessID,
+		sessionKey:    key,
+		clientIP:      clientIP,
+		clientIPv6:    clientIPv6,
+		mode:          cfg.Mode,
+		ctx:           ctx,
+		cancel:        cancel,
+		ctrlAddr:      ctrlAddr,
+		cfg:           cfg,
+		rateByConn:    make(map[*clientConn]*ifaceRate),
+		schedDeficit:  make(map[*clientConn]float64),
+		stopInReorder: make(chan struct{}),
+	}
+	// Inbound reorder buffer is required for server->client packet striping.
+	bufSize := cfg.ReorderBufferSize
+	if bufSize <= 0 {
+		bufSize = 128
+	}
+	flush := cfg.ReorderFlushTimeout
+	if flush <= 0 {
+		flush = 50 * time.Millisecond
+	}
+	state.inReorder = newClientReorderBuffer(bufSize, flush)
+	state.wg.Add(1)
+	go state.inboundReorderFlushLoop()
+	if cfg.CompressionSampleSize > 0 {
+		state.compStats.sampleSize.Store(uint32(cfg.CompressionSampleSize))
+	} else {
+		state.compStats.sampleSize.Store(10)
 	}
 
 	vlogf("bonding: creating TUN device")
-	tun, err := createTunDevice()
+	tun, err := platform.CreateTunDevice()
 	if err != nil {
 		cancel()
 		return nil, nil, fmt.Errorf("tun: %w", err)
@@ -119,8 +138,31 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	if enableIPv6 {
 		ipv6CIDR = addIPv6CIDR(clientIPv6)
 	}
-	vlogf("bonding: configuring TUN with %s/24 (IPv4) and %s (IPv6)", clientIP, ipv6CIDR)
-	if err := common.ConfigureTUN(common.TUNConfig{IfaceName: tun.Name(), CIDR: clientIP + "/24", IPv6CIDR: ipv6CIDR, MTU: common.MTU}); err != nil {
+	// Determine MTU to use
+	mtu := common.MTU
+	if cfg.MTU > 0 {
+		mtu = cfg.MTU
+		vlogf("bonding: using custom MTU %d", mtu)
+	}
+
+	// Probe PMTUD if requested
+	if cfg.ProbePMTUD && ctrlHost != "" {
+		vlogf("bonding: probing path MTU to %s...", ctrlHost)
+		probeResult := common.ProbePMTUD(ctrlHost, mtu, 5*time.Second)
+		if probeResult.Success {
+			log.Printf("PMTUD: %s", common.FormatPMTUDResult(probeResult))
+		} else {
+			log.Printf("WARNING: %s", common.FormatPMTUDResult(probeResult))
+			if probeResult.SuggestMTU > 0 && cfg.MTU == 0 {
+				// Auto-reduce MTU if not explicitly set
+				log.Printf("PMTUD: auto-reducing MTU from %d to %d", mtu, probeResult.SuggestMTU)
+				mtu = probeResult.SuggestMTU
+			}
+		}
+	}
+
+	vlogf("bonding: configuring TUN with %s/24 (IPv4) and %s (IPv6), MTU=%d", clientIP, ipv6CIDR, mtu)
+	if err := common.ConfigureTUN(common.TUNConfig{IfaceName: tun.Name(), CIDR: clientIP + "/24", IPv6CIDR: ipv6CIDR, MTU: mtu}); err != nil {
 		_ = state.tun.Close()
 		cancel()
 		return nil, nil, err
@@ -305,6 +347,9 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 
 	stop := func() {
 		cancel()
+		if state.stopInReorder != nil {
+			close(state.stopInReorder)
+		}
 		state.connMu.Lock()
 		for _, c := range state.conns {
 			c.mu.Lock()
@@ -319,6 +364,10 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 			_ = state.tun.Close()
 		}
 		state.wg.Wait()
+		if state.inReorder != nil {
+			state.inReorder.Close()
+			state.inReorder = nil
+		}
 		if state.revertDNS != nil {
 			state.revertDNS()
 		}
@@ -330,6 +379,24 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		}
 	}
 	return state, stop, nil
+}
+
+func (c *clientState) inboundReorderFlushLoop() {
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-c.stopInReorder:
+			return
+		case <-c.inReorder.flushCh:
+			c.inReorderStats.flushes.Add(1)
+			pkts := c.inReorder.FlushTimeout()
+			for _, p := range pkts {
+				c.enqueueTunWrite(p)
+			}
+		}
+	}
 }
 
 func addHostRoute(ip, via, dev string, useAdd bool) error {
@@ -765,20 +832,59 @@ func (c *clientState) readLoop(cc *clientConn) {
 			}
 			common.PutBuffer(plainBuf)
 		case common.PacketIP:
-			// Handle compression
+			// In bonding mode we do packet-level striping on server->client too.
+			// That implies out-of-order delivery is normal and must be reordered here.
+			//
+			// Ownership rules:
+			// - We must end with a pool-backed buffer containing the IP payload.
+			// - We transfer ownership of that buffer to the reorder buffer.
+			// - Only packets returned by Insert/FlushTimeout are enqueued to TUN and will be PutBuffer()'d by tunWriteLoop.
+			var dataBuf []byte
+			var data []byte
 			if h.Reserved[0] == common.CompressionGzip {
-				// Decompress into yet another buffer
 				outBuf := common.GetBuffer()
 				dec, err := common.DecompressPayloadInto(outBuf, payload, common.MaxPacketSize)
-				if err == nil {
-					c.enqueueTunWrite(dec)
-				} else {
+				if err != nil {
 					log.Printf("decompress err: %v", err)
 					common.PutBuffer(outBuf)
+					common.PutBuffer(plainBuf)
+					continue
 				}
-				common.PutBuffer(plainBuf) // Release compressed payload buffer
+				dataBuf = outBuf
+				data = dec
+				// We no longer need the compressed plaintext buffer.
+				common.PutBuffer(plainBuf)
 			} else {
-				c.enqueueTunWrite(plainBuf[:len(payload)])
+				dataBuf = plainBuf
+				data = plainBuf[:len(payload)]
+			}
+
+			if !isIPPacket(data) {
+				c.inReorderStats.packetsDropped.Add(1)
+				common.PutBuffer(dataBuf)
+				continue
+			}
+			if c.inReorder == nil {
+				// Fallback (should not happen in bonding mode, but keep safe).
+				c.enqueueTunWrite(dataBuf[:len(data)])
+				continue
+			}
+			if len(c.inReorder.packets) > 0 {
+				c.inReorderStats.packetsBuffered.Add(1)
+			}
+			ordered := c.inReorder.Insert(h.SeqNum, dataBuf[:len(data)])
+			// If we delivered more than one, it implies out-of-order buffering happened.
+			if len(ordered) > 1 {
+				c.inReorderStats.packetsReordered.Add(1)
+			}
+			// Track max depth (best-effort, racy read is fine for stats).
+			if d := uint32(len(c.inReorder.packets)); d > 0 {
+				if cur := c.inReorderStats.maxDepth.Load(); d > cur {
+					c.inReorderStats.maxDepth.Store(d)
+				}
+			}
+			for _, p := range ordered {
+				c.enqueueTunWrite(p)
 			}
 		default:
 			common.PutBuffer(plainBuf)
@@ -908,29 +1014,71 @@ func (c *clientState) workerLoop(workCh <-chan []byte) {
 }
 
 func (c *clientState) processAndSend(data []byte) {
-	// Compression
+	// Dynamic compression
 	compressed := data
 	compressFlag := common.CompressionNone
 
-	// Try compression into a new buffer
-	compBuf := common.GetBuffer()
-	if comp, err := common.CompressPayloadInto(compBuf, data); err == nil {
-		if len(comp) < len(data) {
-			compressed = comp
-			compressFlag = common.CompressionGzip
+	attempts := c.compStats.attempts.Load()
+	sampleSize := uint64(c.compStats.sampleSize.Load())
+	if sampleSize == 0 {
+		sampleSize = 10
+	}
+
+	// Sampling phase: first 10 packets
+	// Note: we only increment attempts when compression is enabled.
+	// If compression was disabled, attempts will stop increasing and we won't re-decide.
+	if attempts < sampleSize {
+		c.compStats.samplingPhase.Store(true)
+		c.compStats.enabled.Store(true) // Try compression during sampling
+	} else if attempts == sampleSize {
+		// Decision phase: check if compression is beneficial
+		savings := c.compStats.savings.Load()
+		if savings <= 0 {
+			c.compStats.enabled.Store(false)
+			vlogf("compression: disabled (savings=%d bytes after %d attempts)", savings, attempts)
+		} else {
+			c.compStats.enabled.Store(true)
+			vlogf("compression: enabled (savings=%d bytes after %d attempts)", savings, attempts)
+		}
+		c.compStats.samplingPhase.Store(false)
+	}
+
+	// If compression is disabled, but we haven't reached 10 attempts yet,
+	// keep moving attempts forward so the decision logic can't get stuck.
+	if !c.compStats.enabled.Load() && attempts < sampleSize {
+		c.compStats.attempts.Add(1)
+	}
+
+	// Try compression if enabled
+	var compBuf []byte
+	usedComp := false
+
+	if c.compStats.enabled.Load() {
+		compBuf = common.GetBuffer()
+		if comp, err := common.CompressPayloadInto(compBuf, data); err == nil {
+			savingsThisPacket := int64(len(data) - len(comp))
+			c.compStats.savings.Add(savingsThisPacket)
+			c.compStats.attempts.Add(1)
+
+			if len(comp) < len(data) {
+				compressed = comp
+				compressFlag = common.CompressionGzip
+				usedComp = true
+			} else {
+				// Compression made it larger, don't use it
+				common.PutBuffer(compBuf)
+			}
+		} else {
+			common.PutBuffer(compBuf)
 		}
 	}
-	// If we didn't use compBuf (compression failed or larger), return it.
-	// If we used it, we must return it later.
-	usedComp := (compressFlag == common.CompressionGzip)
-	if !usedComp {
-		common.PutBuffer(compBuf)
-	} else {
-		defer common.PutBuffer(compBuf) // Return compressed buffer at end
+
+	if usedComp {
+		defer common.PutBuffer(compBuf)
 	}
 
 	seq := c.nextSeqSend.Add(1)
-	cc := c.pickBestConn()
+	cc := c.pickConnForPacket(data)
 	if cc == nil {
 		return
 	}
@@ -959,26 +1107,61 @@ func (c *clientState) processAndSend(data []byte) {
 	cc.bytesSent.Add(uint64(len(data)))
 }
 
-func (c *clientState) pickBestConn() *clientConn {
-	c.connMu.RLock()
-	defer c.connMu.RUnlock()
-	if len(c.conns) == 0 {
+// pickConnForPacket selects a connection for a packet.
+// In bonding mode this is flow-based: packets from the same 5-tuple flow
+// are pinned to the same conn to avoid TCP collapse due to reordering.
+// If flow key cannot be extracted, it falls back to the weighted scheduler.
+func (c *clientState) pickConnForPacket(pkt []byte) *clientConn {
+	if c.mode != modeBonding {
+		return c.pickBestConn()
+	}
+	key, ok := common.FlowKeyFromIPPacket(pkt)
+	if !ok {
+		return c.pickBestConn()
+	}
+
+	// First: if we already pinned this flow, try to use the same conn if still alive.
+	c.flowMu.Lock()
+	if c.flowToConn == nil {
+		c.flowToConn = make(map[common.FlowKey]*clientConn)
+	}
+	if cc, exists := c.flowToConn[key]; exists {
+		if cc != nil && cc.alive.Load() {
+			c.flowMu.Unlock()
+			return cc
+		}
+		delete(c.flowToConn, key)
+	}
+	c.flowMu.Unlock()
+
+	// Pick a new conn for this flow using the (phase1) strict scheduler.
+	cc := c.pickBestConn()
+	if cc == nil {
 		return nil
 	}
-	if c.mode == modeBonding {
-		start := int(c.nextConnRR.Add(1)-1) % len(c.conns)
-		for i := 0; i < len(c.conns); i++ {
-			cand := c.conns[(start+i)%len(c.conns)]
-			if cand.alive.Load() {
-				return cand
-			}
-		}
+	c.flowMu.Lock()
+	c.flowToConn[key] = cc
+	c.flowMu.Unlock()
+	return cc
+}
+
+func (c *clientState) pickBestConn() *clientConn {
+	c.connMu.RLock()
+	if len(c.conns) == 0 {
+		c.connMu.RUnlock()
 		return nil
+	}
+	mode := c.mode
+	conns := append([]*clientConn(nil), c.conns...)
+	c.connMu.RUnlock()
+
+	if mode == modeBonding {
+		return c.pickWeightedConn(conns)
 	}
 	// load-balance: pick lowest RTT alive
 	var best *clientConn
 	bestRTT := time.Duration(1<<63 - 1)
-	for _, cand := range c.conns {
+	for _, cand := range conns {
 		if !cand.alive.Load() {
 			continue
 		}
@@ -994,7 +1177,161 @@ func (c *clientState) pickBestConn() *clientConn {
 	if best != nil {
 		return best
 	}
-	return c.conns[0]
+	return conns[0]
+}
+
+func (c *clientState) pickWeightedConn(conns []*clientConn) *clientConn {
+	// Phase 1: strict bad-link exclusion to avoid single-flow TCP collapse.
+	// We still use deficit RR among eligible links, but we do not "trickle"
+	// traffic to bad links.
+	const minShare = 0.15
+
+	// Derive adaptive thresholds from reorder flush timeout.
+	flush := c.cfg.ReorderFlushTimeout
+	if flush <= 0 {
+		flush = 50 * time.Millisecond
+	}
+	// Strict thresholds: in real-world mixed links (ETH vs 5G hotspot)
+	// even a small share on a high-RTT/high-jitter link destroys throughput.
+	maxJitter := clampDuration(time.Duration(float64(flush)*0.3), 10*time.Millisecond, 25*time.Millisecond)
+	maxRttRatio := 1.5
+	maxLossPct := 2.0
+
+	alive := make([]*clientConn, 0, len(conns))
+	for _, cc := range conns {
+		if cc.alive.Load() {
+			alive = append(alive, cc)
+		}
+	}
+	if len(alive) == 0 {
+		return nil
+	}
+	if len(alive) == 1 {
+		return alive[0]
+	}
+
+	// Find min RTT among alive
+	minRTT := 500 * time.Millisecond
+	for _, cc := range alive {
+		rtt := time.Duration(cc.rttNano.Load())
+		if rtt > 0 && rtt < minRTT {
+			minRTT = rtt
+		}
+	}
+
+	good := make([]*clientConn, 0, len(alive))
+	// Keep bad for potential logging/metrics later, but we never schedule them.
+	bad := make([]*clientConn, 0, len(alive))
+	for _, cc := range alive {
+		rtt := time.Duration(cc.rttNano.Load())
+		if rtt <= 0 {
+			rtt = 500 * time.Millisecond
+		}
+		jitter := time.Duration(cc.jitterNano.Load())
+		loss := lossPercent(cc.hbSent.Load(), cc.hbRecv.Load())
+		lossPct := 0.0
+		if loss.ok {
+			lossPct = loss.percent
+		}
+		isBad := jitter > maxJitter || float64(rtt) > float64(minRTT)*maxRttRatio || lossPct > maxLossPct
+		if isBad {
+			bad = append(bad, cc)
+		} else {
+			good = append(good, cc)
+		}
+	}
+
+	// If everything is bad (e.g. initial RTT unknown), pick the best-RTT alive.
+	if len(good) == 0 {
+		var best *clientConn
+		bestRTT := time.Duration(1<<63 - 1)
+		for _, cc := range alive {
+			rtt := time.Duration(cc.rttNano.Load())
+			if rtt <= 0 {
+				rtt = 500 * time.Millisecond
+			}
+			if rtt < bestRTT {
+				bestRTT = rtt
+				best = cc
+			}
+		}
+		if best != nil {
+			return best
+		}
+		return alive[0]
+	}
+
+	// Compute weights for good conns: base floor + quality weight.
+	// Use stabilityScore (0..100) and rtt.
+	weights := make(map[*clientConn]float64, len(good))
+	for _, cc := range good {
+		rttMs := float64(time.Duration(cc.rttNano.Load())) / float64(time.Millisecond)
+		if rttMs <= 0 {
+			rttMs = 500
+		}
+		jitterMs := float64(time.Duration(cc.jitterNano.Load())) / float64(time.Millisecond)
+		loss := lossPercent(cc.hbSent.Load(), cc.hbRecv.Load())
+		lossPct := 0.0
+		if loss.ok {
+			lossPct = loss.percent
+		}
+		score := stabilityScore(lossPct, jitterMs, rttMs)
+		// Weight favors higher score and lower RTT.
+		weights[cc] = (score + 1.0) / (rttMs + 10.0)
+	}
+
+	// Normalize weights for the "remaining" share after floors.
+	remaining := 1.0 - minShare*float64(len(good))
+	if remaining < 0 {
+		remaining = 0
+	}
+	var wsum float64
+	for _, w := range weights {
+		wsum += w
+	}
+
+	final := make(map[*clientConn]float64, len(good))
+	for cc, w := range weights {
+		share := minShare
+		if remaining > 0 && wsum > 0 {
+			share += remaining * (w / wsum)
+		}
+		final[cc] = share
+	}
+
+	// Deficit round-robin step.
+	c.schedMu.Lock()
+	defer c.schedMu.Unlock()
+	if c.schedDeficit == nil {
+		c.schedDeficit = make(map[*clientConn]float64)
+	}
+	for cc, share := range final {
+		c.schedDeficit[cc] += share
+	}
+	_ = bad
+	var best *clientConn
+	bestDef := -1e18
+	for cc := range final {
+		if c.schedDeficit[cc] > bestDef {
+			bestDef = c.schedDeficit[cc]
+			best = cc
+		}
+	}
+	if best == nil {
+		return good[0]
+	}
+	c.schedDeficit[best] -= 1.0
+	return best
+}
+
+func clampDuration(v, minV, maxV time.Duration) time.Duration {
+	if v < minV {
+		return minV
+	}
+	if v > maxV {
+		return maxV
+	}
+	return v
 }
 
 func (c *clientState) sendHandshake(cc *clientConn) {
@@ -1392,6 +1729,19 @@ func (c *clientState) updateStats() {
 	}
 	lines = append(lines, fmt.Sprintf("[cyan]Active:[white] %d/%d  [cyan]Gain:[white] %.2fx  [cyan]Loss:[white] %s  [cyan]Jitter:[white] %s  [cyan]Score:[white] %s  [cyan]RTT:[white] %s  [cyan]Server:[white] %s",
 		active, len(c.conns), gain, lossText, jitterText, scoreText, rttLine, server))
+
+	// Inbound reorder stats (server -> client)
+	if c.inReorder != nil {
+		lines = append(lines, "")
+		lines = append(lines, "[yellow]Inbound Reorder (server->client):[white]")
+		lines = append(lines, fmt.Sprintf("  bufferedEvents: %d  reorderedEvents: %d  drops: %d  flushes: %d  maxDepth: %d",
+			c.inReorderStats.packetsBuffered.Load(),
+			c.inReorderStats.packetsReordered.Load(),
+			c.inReorderStats.packetsDropped.Load(),
+			c.inReorderStats.flushes.Load(),
+			c.inReorderStats.maxDepth.Load(),
+		))
+	}
 	c.statsView.SetText(strings.Join(lines, "\n"))
 }
 

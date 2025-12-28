@@ -2,9 +2,9 @@
 
 ## Setup commands
 - Install dependencies: `go mod tidy`
-- Build server: `go build -o server ./server`
+- Build server: `go build -o server ./server` (Linux only build-tag)
 - Build client: `go build -o client ./client`
-- Run server tests: `go test ./server/...`
+- Run server tests: `go test ./...` (server is in root package with linux build tags; `./server/...` may match no packages)
 - Run client tests: `go test ./client/...`
 - Run all tests: `go test ./...`
 - Run common tests: `go test ./common/...`
@@ -12,6 +12,14 @@
 ## Operational notes
 - Client and server must be started with admin/sudo privileges; do not add runtime elevation prompts.
 - Client debug log (`client_debug.log`) is written only when `-v` is enabled.
+
+## Bonding (important)
+- Target behavior: **packet-level striping + reorder** (bandwidth aggregation for single flows).
+- Server -> client now strips outbound packets across multiple UDP conns; client reorders inbound packets by `SeqNum`.
+- Client -> server already stripes outbound packets; server reorders inbound packets by `SeqNum`.
+- Related flags:
+  - Client: `-reorder-buffer-size` (inbound reorder, default 128)
+  - Client/Server: `-reorder-flush-timeout` (default 50ms)
 
 ## Code style
 - Go 1.24+ required

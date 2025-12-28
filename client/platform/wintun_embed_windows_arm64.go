@@ -1,7 +1,7 @@
 //go:build windows && arm64
 // +build windows,arm64
 
-package main
+package platform
 
 import _ "embed"
 

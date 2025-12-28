@@ -76,6 +76,46 @@ func TestHandlePacketIPDecompressesGzip(t *testing.T) {
 	}
 }
 
+func TestHandlePacketIPDecompressesGzip_UsesPool(t *testing.T) {
+	key, err := common.GenerateSessionKey()
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	sess := newServerSession(1, "test", key, nil, nil)
+
+	s := &Server{tunWriteCh: make(chan []byte, 1)}
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 12345}
+
+	plain := bytes.Repeat([]byte("B"), 256)
+	comp, err := common.CompressPayload(plain)
+	if err != nil {
+		t.Fatalf("compress: %v", err)
+	}
+
+	payloadBuf := common.GetBuffer()
+	copy(payloadBuf, comp)
+	hdr := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketIP, SessionID: sess.id, SeqNum: 1, Length: uint16(len(comp))}
+	hdr.Reserved[0] = common.CompressionGzip
+
+	s.handlePacket(sess, addr, hdr, payloadBuf[:len(comp)], payloadBuf)
+
+	select {
+	case got := <-s.tunWriteCh:
+		if !bytes.Equal(got, plain) {
+			common.PutBuffer(got)
+			t.Fatalf("decompressed mismatch")
+		}
+		// The server should enqueue pool-backed buffers.
+		if cap(got) != common.PoolBufSize {
+			common.PutBuffer(got)
+			t.Fatalf("expected pool-backed buffer cap=%d, got cap=%d", common.PoolBufSize, cap(got))
+		}
+		common.PutBuffer(got)
+	case <-time.After(time.Second):
+		t.Fatal("expected decompressed packet on tunWriteCh")
+	}
+}
+
 func TestHandlePacketIPDropsOnBadGzip(t *testing.T) {
 	key, err := common.GenerateSessionKey()
 	if err != nil {

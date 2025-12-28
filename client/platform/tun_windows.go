@@ -1,7 +1,7 @@
 //go:build windows
 // +build windows
 
-package main
+package platform
 
 import (
 	"fmt"
@@ -23,7 +23,7 @@ type wintunDevice struct {
 var wintunExtractOnce sync.Once
 var wintunExtractErr error
 
-func createTunDevice() (tunDevice, error) {
+func CreateTunDevice() (TunDevice, error) {
 	if err := ensureWintunDLL(); err != nil {
 		return nil, err
 	}

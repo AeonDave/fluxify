@@ -24,11 +24,17 @@ func main() {
 	ctrlPort := flag.Int("ctrl", 8443, "TLS control port")
 	ifaceName := flag.String("iface", "", "TUN interface name (optional)")
 	pkiDir := flag.String("pki", "./pki", "PKI directory")
+	reorderSize := flag.Int("reorder-buffer-size", defaultReorderBufferSize, "reorder buffer max packets")
+	reorderTimeout := flag.Duration("reorder-flush-timeout", defaultReorderFlushTimeout, "reorder buffer flush timeout (e.g. 50ms)")
+	mssClamp := flag.String("mss-clamp", "off", "TCP MSS clamp for traffic traversing TUN: off|pmtu|fixed:N")
 	tuiMode := flag.Bool("tui", false, "run server with TUI for cert management")
 	regen := flag.Bool("regen", false, "regenerate CA/server certs on start")
 	hosts := flag.String("hosts", "127.0.0.1,localhost", "comma-separated SANs for server cert")
 	verbose := flag.Bool("v", false, "enable verbose debug logging")
+	metricsEvery := flag.Duration("metrics-every", 0, "log per-session metrics every interval (0 to disable)")
 	flag.Parse()
+
+	setServerReorderConfig(*reorderSize, *reorderTimeout)
 
 	if !common.IsRoot() {
 		log.Fatalf("run the server with sudo/root on linux for TUN/NAT setup")
@@ -61,9 +67,21 @@ func main() {
 		return
 	}
 
+	mssCfg, err := parseMSSClampFlag(*mssClamp)
+	if err != nil {
+		log.Fatalf("invalid -mss-clamp: %v", err)
+	}
+
 	srv := NewServer(*port, *ctrlPort, *ifaceName, pki, *verbose)
 	if err := srv.Start(); err != nil {
 		log.Fatalf("server start error: %v", err)
+	}
+	// Optional: MSS clamp to avoid PMTUD/fragmentation throughput collapse.
+	if err := ensureMSSClampRules(nil, srv.tun.Name(), mssCfg); err != nil {
+		log.Printf("warning: mss clamp setup failed: %v", err)
+	}
+	if *metricsEvery > 0 {
+		go srv.metricsLoop(*metricsEvery)
 	}
 
 	sigc := make(chan os.Signal, 1)

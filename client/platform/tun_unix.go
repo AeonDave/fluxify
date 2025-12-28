@@ -1,11 +1,11 @@
 //go:build !windows
 // +build !windows
 
-package main
+package platform
 
 import "github.com/songgao/water"
 
-func createTunDevice() (tunDevice, error) {
+func CreateTunDevice() (TunDevice, error) {
 	conf := water.Config{DeviceType: water.TUN}
 	return water.New(conf)
 }

@@ -1059,62 +1059,137 @@ func (d diagReport) errString() string {
 }
 
 func runDiagnostics(cfg clientConfig) (diagReport, error) {
-	lines := []string{"[yellow]Diagnostics[white]"}
-	if cfg.Server == "" {
-		err := fmt.Errorf("server missing")
-		lines = append(lines, "[red]Server: missing[white]")
-		return diagReport{summary: "server missing", details: strings.Join(lines, "\n"), err: err}, err
+	lines := []string{"[yellow]PPP Fluxify Diagnostics PPP[white]"}
+	lines = append(lines, fmt.Sprintf("Time: %s", time.Now().Format("2006-01-02 15:04:05")))
+	lines = append(lines, fmt.Sprintf("OS: %s/%s", runtime.GOOS, runtime.GOARCH))
+	lines = append(lines, "")
+
+	// System Information
+	lines = append(lines, "[cyan] System [white]")
+	lines = append(lines, fmt.Sprintf("  Go version: %s", runtime.Version()))
+	lines = append(lines, fmt.Sprintf("  NumCPU: %d", runtime.NumCPU()))
+	lines = append(lines, fmt.Sprintf("  NumGoroutine: %d", runtime.NumGoroutine()))
+	lines = append(lines, "")
+
+	// Interface Discovery
+	lines = append(lines, "[cyan] Interfaces [white]")
+	ifaces, _ := net.Interfaces()
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		stateTag := "[red]DOWN[white]"
+		if iface.Flags&net.FlagUp != 0 {
+			stateTag = "[green]UP[white]"
+		}
+		addrs, _ := iface.Addrs()
+		var ipv4, ipv6 string
+		for _, a := range addrs {
+			if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP != nil {
+				if v4 := ipNet.IP.To4(); v4 != nil {
+					ipv4 = v4.String()
+				} else if ipv6 == "" {
+					ipv6 = ipNet.IP.String()
+				}
+			}
+		}
+		if ipv4 == "" {
+			ipv4 = "-"
+		}
+		lines = append(lines, fmt.Sprintf("  %s %s MTU:%d IPv4:%s", iface.Name, stateTag, iface.MTU, ipv4))
+
+		// Gateway detection
+		if iface.Flags&net.FlagUp != 0 {
+			gw, _ := platform.GatewayForIface(tuiRunner{}, iface.Name)
+			if gw != "" {
+				lines = append(lines, fmt.Sprintf("    Gateway: %s", gw))
+			}
+		}
 	}
+	lines = append(lines, "")
+
+	// Server Connectivity (only for bonding mode)
+	if cfg.Server == "" {
+		lines = append(lines, "[cyan] Server [white]")
+		lines = append(lines, "  [yellow]Server not configured (load-balance mode?)[white]")
+		lines = append(lines, "")
+		lines = append(lines, "[yellow]Routing[white]")
+		lines = appendRouteDump(lines)
+		report := diagReport{summary: "diagnostics ok (no server)", details: strings.Join(lines, "\n"), err: nil}
+		return report, nil
+	}
+
 	host, port, err := parseServerAddr(cfg.Server, cfg.Ctrl)
 	if err != nil {
 		lines = append(lines, fmt.Sprintf("[red]Server: %v[white]", err))
 		return diagReport{summary: "invalid server", details: strings.Join(lines, "\n"), err: err}, err
 	}
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-	lines = append(lines, fmt.Sprintf("Server: %s", addr))
+
+	lines = append(lines, "[cyan] Server Connectivity [white]")
+	lines = append(lines, fmt.Sprintf("  Target: %s", addr))
+
+	// DNS resolution
 	if ip := net.ParseIP(host); ip == nil {
 		ips, err := net.LookupIP(host)
 		if err != nil {
-			lines = append(lines, fmt.Sprintf("[yellow]DNS: %v[white]", err))
+			lines = append(lines, fmt.Sprintf("  [yellow]DNS: failed (%v)[white]", err))
 		} else if len(ips) > 0 {
 			var ipStrs []string
 			for _, ip := range ips {
 				ipStrs = append(ipStrs, ip.String())
 			}
-			lines = append(lines, "DNS: "+strings.Join(ipStrs, ", "))
+			lines = append(lines, "  [green]DNS: "+strings.Join(ipStrs, ", ")+"[white]")
 		}
 	}
 
+	// TCP connectivity with timing
 	start := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	if err != nil {
-		lines = append(lines, fmt.Sprintf("[red]TCP: failed (%s)[white]", err))
+		lines = append(lines, fmt.Sprintf("  [red]TCP: failed (%s)[white]", err))
+		lines = append(lines, "")
+		lines = append(lines, "[yellow]Routing[white]")
+		lines = appendRouteDump(lines)
 		report := diagReport{summary: "tcp connect failed", details: strings.Join(lines, "\n"), err: err}
 		return report, err
 	}
+	tcpLatency := time.Since(start)
 	_ = conn.Close()
-	lines = append(lines, fmt.Sprintf("[green]TCP: ok (%s)[white]", time.Since(start).Round(time.Millisecond)))
+	lines = append(lines, fmt.Sprintf("  [green]TCP: ok (latency: %s)[white]", tcpLatency.Round(time.Millisecond)))
 
+	// Certificate checks
+	lines = append(lines, "")
+	lines = append(lines, "[cyan] Certificates [white]")
 	bundlePath := cfg.Cert
 	if bundlePath == "" {
 		bundlePath, err = detectClientBundlePath(cfg.PKI)
 	}
 	if err != nil {
-		lines = append(lines, fmt.Sprintf("[red]Bundle: %v[white]", err))
+		lines = append(lines, fmt.Sprintf("  [red]Bundle: %v[white]", err))
+		lines = append(lines, "")
+		lines = append(lines, "[yellow]Routing[white]")
+		lines = appendRouteDump(lines)
 		report := diagReport{summary: "bundle missing", details: strings.Join(lines, "\n"), err: err}
 		return report, err
 	}
-	lines = append(lines, "Bundle: "+bundlePath)
+	lines = append(lines, "  Bundle: "+bundlePath)
 	if name := bundleBaseName(bundlePath); name != "" {
-		lines = append(lines, "Cert: "+name)
+		lines = append(lines, "  Cert CN: "+name)
 	}
 	if caName, err := bundleCAName(bundlePath); err == nil && caName != "" {
-		lines = append(lines, "CA: "+caName)
+		lines = append(lines, "  CA CN: "+caName)
 	}
 
+	// TLS handshake
+	lines = append(lines, "")
+	lines = append(lines, "[cyan] TLS Handshake [white]")
 	tlsCfg, err := clientTLSConfig(cfg)
 	if err != nil {
-		lines = append(lines, fmt.Sprintf("[red]TLS config: %v[white]", err))
+		lines = append(lines, fmt.Sprintf("  [red]TLS config: %v[white]", err))
+		lines = append(lines, "")
+		lines = append(lines, "[yellow]Routing[white]")
+		lines = appendRouteDump(lines)
 		report := diagReport{summary: "tls config failed", details: strings.Join(lines, "\n"), err: err}
 		return report, err
 	}
@@ -1124,9 +1199,13 @@ func runDiagnostics(cfg clientConfig) (diagReport, error) {
 		tlsCfg = c
 	}
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	start = time.Now()
 	tcpConn, err := dialer.Dial("tcp", addr)
 	if err != nil {
-		lines = append(lines, fmt.Sprintf("[red]TLS: tcp connect failed (%s)[white]", err))
+		lines = append(lines, fmt.Sprintf("  [red]TLS: tcp connect failed (%s)[white]", err))
+		lines = append(lines, "")
+		lines = append(lines, "[yellow]Routing[white]")
+		lines = appendRouteDump(lines)
 		report := diagReport{summary: "tls tcp failed", details: strings.Join(lines, "\n"), err: err}
 		return report, err
 	}
@@ -1135,17 +1214,107 @@ func runDiagnostics(cfg clientConfig) (diagReport, error) {
 	if err := tlsConn.Handshake(); err != nil {
 		_ = tlsConn.Close()
 		tlsErr := classifyTLSError(err)
-		lines = append(lines, fmt.Sprintf("[red]TLS: failed (%s)[white]", tlsErr))
+		lines = append(lines, fmt.Sprintf("  [red]TLS: handshake failed[white]"))
+		lines = append(lines, fmt.Sprintf("  [red]  Error: %s[white]", tlsErr))
+		lines = append(lines, "")
+		lines = append(lines, "[yellow]Routing[white]")
+		lines = appendRouteDump(lines)
 		report := diagReport{summary: "tls failed", details: strings.Join(lines, "\n"), err: tlsErr}
 		return report, tlsErr
 	}
+	tlsLatency := time.Since(start)
+	connState := tlsConn.ConnectionState()
 	_ = tlsConn.Close()
-	lines = append(lines, "[green]TLS: ok[white]")
+	lines = append(lines, fmt.Sprintf("  [green]TLS: ok (latency: %s)[white]", tlsLatency.Round(time.Millisecond)))
+	lines = append(lines, fmt.Sprintf("  Version: TLS %s", tlsVersionName(connState.Version)))
+	lines = append(lines, fmt.Sprintf("  Cipher: %s", tls.CipherSuiteName(connState.CipherSuite)))
+
+	// Path MTU probe
 	lines = append(lines, "")
-	lines = append(lines, "[yellow]Routing[white]")
+	lines = append(lines, "[cyan] Path MTU Probe [white]")
+	pmtuResult := common.ProbePMTUD(host, 1400, 3*time.Second)
+	if pmtuResult.Success {
+		lines = append(lines, fmt.Sprintf("  [green]%s[white]", common.FormatPMTUDResult(pmtuResult)))
+	} else {
+		lines = append(lines, fmt.Sprintf("  [yellow]%s[white]", common.FormatPMTUDResult(pmtuResult)))
+		if pmtuResult.SuggestMTU > 0 {
+			lines = append(lines, fmt.Sprintf("  [yellow]Suggestion: use -mtu=%d[white]", pmtuResult.SuggestMTU))
+		}
+	}
+
+	// Routing
+	lines = append(lines, "")
+	lines = append(lines, "[cyan] Routing [white]")
 	lines = appendRouteDump(lines)
+
+	// Performance recommendations
+	lines = append(lines, "")
+	lines = append(lines, "[cyan] Recommendations [white]")
+	recommendations := collectRecommendations(tcpLatency, pmtuResult)
+	if len(recommendations) == 0 {
+		lines = append(lines, "  [green]No issues detected[white]")
+	} else {
+		for _, rec := range recommendations {
+			lines = append(lines, "  "+rec)
+		}
+	}
+
 	report := diagReport{summary: "diagnostics ok", details: strings.Join(lines, "\n"), err: nil}
 	return report, nil
+}
+
+func tlsVersionName(version uint16) string {
+	switch version {
+	case tls.VersionTLS10:
+		return "1.0"
+	case tls.VersionTLS11:
+		return "1.1"
+	case tls.VersionTLS12:
+		return "1.2"
+	case tls.VersionTLS13:
+		return "1.3"
+	default:
+		return fmt.Sprintf("0x%04X", version)
+	}
+}
+
+func collectRecommendations(tcpLatency time.Duration, pmtu common.PMTUDResult) []string {
+	var recs []string
+
+	if tcpLatency > 200*time.Millisecond {
+		recs = append(recs, fmt.Sprintf("[yellow]High latency (%s): consider using -reorder-flush-timeout=%s[white]",
+			tcpLatency.Round(time.Millisecond), (tcpLatency+30*time.Millisecond).Round(10*time.Millisecond)))
+	}
+
+	if !pmtu.Success && pmtu.SuggestMTU > 0 {
+		recs = append(recs, fmt.Sprintf("[yellow]MTU issues detected: use -mtu=%d or -probe-pmtud[white]", pmtu.SuggestMTU))
+	}
+
+	if runtime.GOOS == "linux" {
+		// Check socket buffer sizes (Linux only)
+		recs = appendLinuxRecommendations(recs)
+	}
+
+	return recs
+}
+
+func appendLinuxRecommendations(recs []string) []string {
+	// Try to read sysctl values
+	rmem, _ := os.ReadFile("/proc/sys/net/core/rmem_max")
+	if len(rmem) > 0 {
+		var rmemVal int
+		if _, err := fmt.Sscanf(string(rmem), "%d", &rmemVal); err == nil && rmemVal < 26214400 {
+			recs = append(recs, "[yellow]Low rmem_max: sudo sysctl -w net.core.rmem_max=26214400[white]")
+		}
+	}
+	wmem, _ := os.ReadFile("/proc/sys/net/core/wmem_max")
+	if len(wmem) > 0 {
+		var wmemVal int
+		if _, err := fmt.Sscanf(string(wmem), "%d", &wmemVal); err == nil && wmemVal < 26214400 {
+			recs = append(recs, "[yellow]Low wmem_max: sudo sysctl -w net.core.wmem_max=26214400[white]")
+		}
+	}
+	return recs
 }
 
 func appendRouteDump(lines []string) []string {
@@ -1270,6 +1439,9 @@ func (s *tuiState) buildConfig() clientConfig {
 		Ctrl:   s.ctrl,
 		DNS4:   s.dns4,
 		DNS6:   s.dns6,
+		// Defaults: allow reorder for server->client striping.
+		ReorderBufferSize:   128,
+		ReorderFlushTimeout: 50 * time.Millisecond,
 	}
 }
 

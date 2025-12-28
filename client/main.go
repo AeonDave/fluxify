@@ -102,6 +102,11 @@ func main() {
 	certPath := flag.String("cert", "", "path to client bundle (.pem with cert+key)")
 	dnsServers := flag.String("dns", "", "comma-separated DNS servers for TUN (optional)")
 	ctrlPort := flag.Int("ctrl", 8443, "control TLS port")
+	compressionSampleSize := flag.Int("compression-sample-size", 10, "number of packets to sample to decide if compression is beneficial")
+	reorderBufferSize := flag.Int("reorder-buffer-size", 128, "reorder buffer max packets (client-side for inbound striping)")
+	reorderFlushTimeout := flag.Duration("reorder-flush-timeout", 50*time.Millisecond, "server reorder flush timeout; used to tune client adaptive bonding")
+	mtuOverride := flag.Int("mtu", 0, "TUN MTU override (0=auto/default 1400, or specify e.g. 1280, 1350)")
+	probePMTUD := flag.Bool("probe-pmtud", false, "probe path MTU at startup and warn if default MTU may cause blackhole")
 	verbose := flag.Bool("v", false, "enable verbose logs")
 	flag.Parse()
 	setVerboseLogging(*verbose)
@@ -114,15 +119,20 @@ func main() {
 	dns4, dns6, err := parseDNSServers(splitCSV(*dnsServers))
 	exitIf(err != nil, "invalid -dns: %v", err)
 	initialCfg := clientConfig{
-		Server: *server,
-		Ifaces: splitCSV(*ifacesStr),
-		IPs:    splitCSV(*localIPs),
-		Mode:   modeBonding,
-		PKI:    chosenPKI,
-		Cert:   *certPath,
-		Ctrl:   *ctrlPort,
-		DNS4:   dns4,
-		DNS6:   dns6,
+		Server:                *server,
+		Ifaces:                splitCSV(*ifacesStr),
+		IPs:                   splitCSV(*localIPs),
+		Mode:                  modeBonding,
+		PKI:                   chosenPKI,
+		Cert:                  *certPath,
+		Ctrl:                  *ctrlPort,
+		DNS4:                  dns4,
+		DNS6:                  dns6,
+		CompressionSampleSize: *compressionSampleSize,
+		ReorderBufferSize:     *reorderBufferSize,
+		ReorderFlushTimeout:   *reorderFlushTimeout,
+		MTU:                   *mtuOverride,
+		ProbePMTUD:            *probePMTUD,
 	}
 
 	// If -pki was explicitly provided, don't let stored config override it.

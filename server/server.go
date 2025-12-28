@@ -50,6 +50,33 @@ type Server struct {
 	running atomic.Bool
 }
 
+func (s *Server) metricsLoop(every time.Duration) {
+	if every <= 0 {
+		return
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for s.running.Load() {
+		<-t.C
+		s.logMetricsOnce()
+	}
+}
+
+func (s *Server) logMetricsOnce() {
+	// Snapshot sessions under read lock.
+	s.sessMu.RLock()
+	sessions := make([]*serverSession, 0, len(s.sessions))
+	for _, sess := range s.sessions {
+		sessions = append(sessions, sess)
+	}
+	s.sessMu.RUnlock()
+
+	for _, sess := range sessions {
+		m := sess.snapshotMetrics()
+		log.Printf("[METRICS] %s", formatServerSessionMetrics(m))
+	}
+}
+
 type outboundJob struct {
 	sess *serverSession
 	data []byte
@@ -199,14 +226,13 @@ func (s *Server) tunReadLoop() {
 func (s *Server) outboundWorker() {
 	defer s.wg.Done()
 	for job := range s.outboundCh {
-		best := job.sess.pickBestConn()
-		if best != nil {
-			s.logDebug("UDP send: %d bytes to %s", len(job.data), best.addr)
+		// Phase 2: flow-based scheduling for server->client.
+		// Keep packets of the same flow on the same conn to avoid TCP collapse due to reordering.
+		chosen := job.sess.pickConnForIPPacket(job.data)
+		if chosen != nil {
+			s.logDebug("UDP send: %d bytes to %s", len(job.data), chosen.addr)
 			job.sess.touch()
-			// Compress & Encrypt & Send
-			// This might allocate new buffers for encryption.
-			// The input 'job.data' is from pool, we must free it after use.
-			_ = job.sess.encryptAndSend(best, common.PacketIP, job.data, true)
+			_ = job.sess.encryptAndSend(chosen, common.PacketIP, job.data, true)
 		}
 		// Return the READ buffer to pool
 		// (Note: job.data is a slice of the buffer from GetBuffer)
@@ -263,12 +289,7 @@ func (s *Server) udpReadLoop(id int) {
 func (s *Server) handlePacket(sess *serverSession, addr *net.UDPAddr, h common.PacketHeader, payload []byte, payloadBuf []byte) {
 	// Ensure we return the buffer if we don't pass it to tunWriteCh
 	// We use a flag to track ownership transfer
-	transferred := false
-	defer func() {
-		if !transferred {
-			common.PutBuffer(payloadBuf)
-		}
-	}()
+	defer common.PutBuffer(payloadBuf)
 
 	sess.touch()
 
@@ -286,8 +307,8 @@ func (s *Server) handlePacket(sess *serverSession, addr *net.UDPAddr, h common.P
 		var hb common.HeartbeatPayload
 		if err := hb.Unmarshal(payload); err == nil {
 			rtt := common.CalcRTT(hb.SendTime)
-			conn.lastRTT.Store(int64(rtt))
-			s.logDebug("Heartbeat from %s (rtt=%v)", addr, rtt)
+			updateServerConnRTT(conn, rtt)
+			s.logDebug("Heartbeat from %s (rtt=%v jitter=%v)", addr, rtt, time.Duration(conn.jitterNano.Load()))
 		}
 		// Echo back immediately (using session write)
 		// Payload is small, we can just send it back.
@@ -296,48 +317,61 @@ func (s *Server) handlePacket(sess *serverSession, addr *net.UDPAddr, h common.P
 			log.Printf("Debug: failed to echo heartbeat to %s: %v", addr, err)
 		}
 	case common.PacketIP:
-		s.logDebug("IP packet from %s len=%d", addr, len(payload))
-		// Handle decompression
+		s.logDebug("IP packet from %s len=%d seq=%d", addr, len(payload), h.SeqNum)
+
+		// Handle decompression.
+		// NOTE: common.DecompressPayload currently allocates; we immediately copy into a pool buffer below.
 		data := payload
 		if len(h.Reserved) > 0 && h.Reserved[0] == common.CompressionGzip {
-			if dec, err := common.DecompressPayload(payload, common.MaxPacketSize); err == nil {
-				data = dec
-				// data is now a NEW slice (allocated by decompress).
-				// payloadBuf is still backing 'payload'.
-				// We fall through.
-			} else {
+			outBuf := common.GetBuffer()
+			dec, err := common.DecompressPayloadInto(outBuf, payload, common.MaxPacketSize)
+			if err != nil {
+				common.PutBuffer(outBuf)
 				log.Printf("decompress error: %v", err)
 				return
 			}
+			data = dec
+			// outBuf now backs dec; we'll copy it into reorderBuf pool buffer below and then return outBuf.
+			defer common.PutBuffer(outBuf)
 		}
 		if !isIPPacket(data) {
 			s.logDebug("drop non-ip packet len=%d", len(data))
 			return
 		}
 
-		// Send to TUN writer
-		// Case 1: No compression. data == payload (backed by payloadBuf).
-		// We can pass payloadBuf to tunWriteCh.
-		if len(data) == len(payload) && &data[0] == &payload[0] {
-			select {
-			case s.tunWriteCh <- data: // passing the slice, which is backed by payloadBuf
-				transferred = true
-			default:
-				// dropped, defer will clean up
+		// Prepare pool buffer for reorder buffer (avoid heap alloc)
+		buf := common.GetBuffer()
+		if len(data) > cap(buf) {
+			common.PutBuffer(buf)
+			sess.reorderStats.packetsDropped.Add(1)
+			return
+		}
+		copy(buf, data)
+		bufferData := buf[:len(data)]
+		// Note: if data was heap-allocated by DecompressPayload, it becomes eligible for GC after this point.
+
+		// Insert into reorder buffer. Ownership of bufferData transfers to reorderBuf
+		// unless Insert returns it immediately.
+		orderedPackets := sess.reorderBuf.Insert(h.SeqNum, bufferData)
+
+		// Track reordering stats
+		bufDepth := uint32(len(sess.reorderBuf.packets))
+		if bufDepth > 0 {
+			sess.reorderStats.packetsReordered.Add(1)
+			if current := sess.reorderStats.maxBufferDepth.Load(); bufDepth > current {
+				sess.reorderStats.maxBufferDepth.Store(bufDepth)
 			}
-		} else {
-			// Case 2: Decompressed or otherwise modified (new buffer).
-			// We must copy it to a new Pool buffer for tunWriteLoop consistency.
-			// (Or modify tunWriteLoop to handle non-pool buffers? No, keep it simple).
-			newBuf := common.GetBuffer()
-			copy(newBuf, data)
+		}
+
+		// Send ordered packets to TUN (packets are pool-backed)
+		for _, pkt := range orderedPackets {
 			select {
-			case s.tunWriteCh <- newBuf[:len(data)]:
-				// tunWriteCh owns newBuf now
+			case s.tunWriteCh <- pkt:
+				// tunWriteCh owns pkt and will PutBuffer
 			default:
-				common.PutBuffer(newBuf)
+				common.PutBuffer(pkt)
+				sess.reorderStats.packetsDropped.Add(1)
 			}
-			// payloadBuf is NOT transferred, so defer will cleanup payloadBuf.
 		}
 	}
 }
@@ -486,6 +520,9 @@ func (s *Server) handleControl(conn net.Conn) {
 	sess := newServerSession(sessID, req.ClientName, key, clientIP, clientIPv6)
 	s.registerSession(sess)
 
+	// Start reorder buffer flush handler for this session
+	go s.reorderFlushHandler(sess)
+
 	resp := common.ControlResponse{
 		SessionID:  sessID,
 		SessionKey: common.EncodeKeyBase64(key),
@@ -530,6 +567,7 @@ func (s *Server) pruneSessions() {
 	for id, sess := range s.sessions {
 		if sess.isIdle() {
 			log.Printf("Session idle/expired: %s (id=%d) IP=%s", sess.name, id, sess.clientIP)
+			sess.Close() // Cleanup reorder buffer
 			delete(s.sessions, id)
 			if sess.name != "" {
 				delete(s.clientSessions, sess.name)
@@ -542,6 +580,28 @@ func (s *Server) pruneSessions() {
 			}
 		} else {
 			sess.pruneStaleConns()
+		}
+	}
+}
+
+// reorderFlushHandler handles timeout-based flushing for reorder buffer
+func (s *Server) reorderFlushHandler(sess *serverSession) {
+	for {
+		select {
+		case <-sess.stopReorder:
+			return
+		case <-sess.reorderBuf.flushCh:
+			// Timeout occurred, flush buffered packets
+			flushedPackets := sess.reorderBuf.FlushTimeout()
+			for _, pkt := range flushedPackets {
+				select {
+				case s.tunWriteCh <- pkt:
+					// tunWriteCh owns pkt and will PutBuffer
+				default:
+					common.PutBuffer(pkt)
+					sess.reorderStats.packetsDropped.Add(1)
+				}
+			}
 		}
 	}
 }

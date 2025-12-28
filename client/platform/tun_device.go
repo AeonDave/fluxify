@@ -1,8 +1,8 @@
-package main
+package platform
 
 import "io"
 
-type tunDevice interface {
+type TunDevice interface {
 	io.ReadWriteCloser
 	Name() string
 }

@@ -65,12 +65,12 @@ func TestSendToSessionSelectsLowestRTT(t *testing.T) {
 	sess.conns = []*serverConn{slowConn, fastConn}
 
 	// Logic replaced: explicit best selection + encryptAndSend
-	best := sess.pickBestConn()
+	best := sess.pickStripedConn()
 	if best == nil {
-		t.Fatal("pickBestConn returned nil")
+		t.Fatal("pickStripedConn returned nil")
 	}
 	if best != fastConn {
-		t.Fatal("pickBestConn picked slow conn")
+		t.Fatal("pickStripedConn picked slow conn")
 	}
 
 	payload := []byte("hello")
@@ -97,6 +97,28 @@ func TestSendToSessionSelectsLowestRTT(t *testing.T) {
 	recvSlow.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	if n, _, err := recvSlow.ReadFromUDP(buf); err == nil {
 		t.Fatalf("slow receiver should be idle, got %d bytes", n)
+	}
+}
+
+func TestPickStripedConnSkipsStaleConnections(t *testing.T) {
+	key, err := common.GenerateSessionKey()
+	if err != nil {
+		t.Fatalf("gen key: %v", err)
+	}
+	sess := newServerSession(1, "test", key, nil, nil)
+
+	stale := &serverConn{addr: &net.UDPAddr{IP: net.IPv4(1, 1, 1, 1), Port: 1111}}
+	fresh := &serverConn{addr: &net.UDPAddr{IP: net.IPv4(2, 2, 2, 2), Port: 2222}}
+	stale.alive.Store(true)
+	fresh.alive.Store(true)
+	stale.lastSeen.Store(time.Now().Add(-2 * connStaleTimeout).UnixNano())
+	fresh.lastSeen.Store(time.Now().UnixNano())
+	stale.lastRTT.Store(int64(1 * time.Millisecond))
+	fresh.lastRTT.Store(int64(100 * time.Millisecond))
+
+	sess.conns = []*serverConn{stale, fresh}
+	if best := sess.pickStripedConn(); best != fresh {
+		t.Fatalf("expected fresh conn, got %#v", best)
 	}
 }
 

@@ -14,5 +14,6 @@
 go.work
 go.work.sum
 out/
+build/
 client/client
 server/server
