@@ -1,10 +1,7 @@
 package main
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
-	"encoding/pem"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -34,22 +31,6 @@ var homeDirFunc = os.UserHomeDir
 var lookupUser = user.Lookup
 var isRoot = common.IsRoot
 var panicHandlerEnabled = true
-
-// splitCSV splits a comma-separated string into trimmed parts.
-func splitCSV(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
-	}
-	parts := strings.Split(s, ",")
-	var out []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
 
 func parseDNSServers(list []string) ([]string, []string, error) {
 	var dns4 []string
@@ -102,37 +83,35 @@ func main() {
 	certPath := flag.String("cert", "", "path to client bundle (.pem with cert+key)")
 	dnsServers := flag.String("dns", "", "comma-separated DNS servers for TUN (optional)")
 	ctrlPort := flag.Int("ctrl", 8443, "control TLS port")
-	compressionSampleSize := flag.Int("compression-sample-size", 10, "number of packets to sample to decide if compression is beneficial")
-	reorderBufferSize := flag.Int("reorder-buffer-size", 128, "reorder buffer max packets (client-side for inbound striping)")
-	reorderFlushTimeout := flag.Duration("reorder-flush-timeout", 50*time.Millisecond, "server reorder flush timeout; used to tune client adaptive bonding")
 	mtuOverride := flag.Int("mtu", 0, "TUN MTU override (0=auto/default 1400, or specify e.g. 1280, 1350)")
 	probePMTUD := flag.Bool("probe-pmtud", false, "probe path MTU at startup and warn if default MTU may cause blackhole")
 	verbose := flag.Bool("v", false, "enable verbose logs")
+	telemetryPath := flag.String("telemetry", "", "write MP-QUIC telemetry to file (JSON lines, snapshot every 5s)")
 	flag.Parse()
 	setVerboseLogging(*verbose)
 	platform.SetVerbose(*verbose)
+
+	exitIf(*bondingFlag && *loadBalanceFlag, "-b and -l are mutually exclusive")
 
 	chosenPKI := *pkiDir
 	if chosenPKI == "" || chosenPKI == "./pki" {
 		chosenPKI = defaultPKIDir()
 	}
-	dns4, dns6, err := parseDNSServers(splitCSV(*dnsServers))
+	dns4, dns6, err := parseDNSServers(common.SplitCSV(*dnsServers))
 	exitIf(err != nil, "invalid -dns: %v", err)
 	initialCfg := clientConfig{
-		Server:                *server,
-		Ifaces:                splitCSV(*ifacesStr),
-		IPs:                   splitCSV(*localIPs),
-		Mode:                  modeBonding,
-		PKI:                   chosenPKI,
-		Cert:                  *certPath,
-		Ctrl:                  *ctrlPort,
-		DNS4:                  dns4,
-		DNS6:                  dns6,
-		CompressionSampleSize: *compressionSampleSize,
-		ReorderBufferSize:     *reorderBufferSize,
-		ReorderFlushTimeout:   *reorderFlushTimeout,
-		MTU:                   *mtuOverride,
-		ProbePMTUD:            *probePMTUD,
+		Server:     *server,
+		Ifaces:     common.SplitCSV(*ifacesStr),
+		IPs:        common.SplitCSV(*localIPs),
+		Mode:       modeBonding,
+		PKI:        chosenPKI,
+		Cert:       *certPath,
+		Telemetry:  *telemetryPath,
+		Ctrl:       *ctrlPort,
+		DNS4:       dns4,
+		DNS6:       dns6,
+		MTU:        *mtuOverride,
+		ProbePMTUD: *probePMTUD,
 	}
 
 	// If -pki was explicitly provided, don't let stored config override it.
@@ -167,18 +146,29 @@ func main() {
 	exitIf(len(cfg.Ifaces) < 2, "need at least 2 interfaces (found %d)", len(cfg.Ifaces))
 	exitIf(cfg.Mode == modeBonding && cfg.Server == "", "server is required in bonding mode")
 	if cfg.Mode == modeBonding && cfg.Cert == "" {
-		path, err := detectClientBundlePath(cfg.PKI)
+		path, err := common.DetectClientBundlePath(cfg.PKI)
 		exitIf(err != nil, "client cert: %v", err)
 		cfg.Cert = path
 	}
 	if cfg.Cert != "" {
-		cfg.Cert = expandPath(cfg.Cert)
+		cfg.Cert = common.ExpandPath(cfg.Cert)
 	}
 
 	stop, err := startClient(cfg)
 	if err != nil {
 		logFatalf("start: %v", err)
 	}
+
+	// Ensure cleanup on panic
+	defer func() {
+		if r := recover(); r != nil {
+			if stop != nil {
+				stop()
+			}
+			panic(r)
+		}
+	}()
+
 	saveStoredConfig(storedConfig{Server: cfg.Server, Mode: cfg.Mode, Ifaces: cfg.Ifaces, Cert: cfg.Cert, PKI: cfg.PKI, Ctrl: cfg.Ctrl})
 	log.Printf("running in %s mode; press Ctrl-C to stop", cfg.Mode)
 
@@ -223,7 +213,7 @@ func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI, certFromCLI bool) clien
 	// Normalize legacy /pki suffix to flat layout
 	cfg.PKI = normalizePKIPath(cfg.PKI)
 	// Expand to absolute path for consistent config usage.
-	cfg.PKI = expandPath(cfg.PKI)
+	cfg.PKI = common.ExpandPath(cfg.PKI)
 	if cfg.Cert == "" {
 		if storedClient != "" && !certFromCLI {
 			cfg.Cert = filepath.Join(cfg.PKI, storedClient+".pem")
@@ -288,20 +278,6 @@ func userConfigDir() (string, error) {
 	return filepath.Join(home, ".fluxify"), nil
 }
 
-// expandPath resolves leading "~" to the user home and returns a cleaned path.
-func expandPath(p string) string {
-	if p == "" {
-		return p
-	}
-	if strings.HasPrefix(p, "~") {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			return filepath.Clean(filepath.Join(home, strings.TrimPrefix(p, "~")))
-		}
-	}
-	return filepath.Clean(p)
-}
-
 func defaultPKIDir() string {
 	base, err := userConfigDir()
 	if err != nil || base == "" {
@@ -322,7 +298,7 @@ func ensureConfigAndPKI(pkiDir string) error {
 	if pkiDir == "" {
 		pkiDir = defaultPKIDir()
 	}
-	pkiPath := expandPath(pkiDir)
+	pkiPath := common.ExpandPath(pkiDir)
 	if err := os.MkdirAll(pkiPath, 0o700); err != nil {
 		return err
 	}
@@ -397,153 +373,6 @@ func pathWithinHome(p, home string) bool {
 		return false
 	}
 	return !strings.HasPrefix(rel, ".."+string(os.PathSeparator))
-}
-
-// detectClientBundlePath scans pkiDir for a single bundle .pem containing cert+key.
-// Ignores ca.pem, config.json, and files without a private key.
-func detectClientBundlePath(pkiDir string) (string, error) {
-	pkiDir = expandPath(pkiDir)
-	ents, err := os.ReadDir(pkiDir)
-	if err != nil {
-		return "", fmt.Errorf("read dir %s: %w", pkiDir, err)
-	}
-	var bundles []string
-	for _, ent := range ents {
-		if ent.IsDir() {
-			continue
-		}
-		name := ent.Name()
-		if !(strings.HasSuffix(name, ".pem") || strings.HasSuffix(name, ".bundle")) {
-			continue
-		}
-		// Skip well-known non-client files
-		if name == "ca.pem" || name == "server.pem" || name == "server-key.pem" {
-			continue
-		}
-		full := filepath.Join(pkiDir, name)
-		// Must be a bundle with private key inside
-		if hasCertAndKey(full) {
-			bundles = append(bundles, full)
-		}
-	}
-	if len(bundles) == 0 {
-		return "", fmt.Errorf("no client bundle found in %s (need .pem/.bundle with cert+key)", pkiDir)
-	}
-	if len(bundles) > 1 {
-		var names []string
-		for _, b := range bundles {
-			names = append(names, filepath.Base(b))
-		}
-		return "", fmt.Errorf("multiple client bundles found: %s", strings.Join(names, ", "))
-	}
-	return bundles[0], nil
-}
-
-// detectClientCertName returns the base name of the only bundle in pkiDir.
-func detectClientCertName(pkiDir string) (string, error) {
-	path, err := detectClientBundlePath(pkiDir)
-	if err != nil {
-		return "", err
-	}
-	return bundleBaseName(path), nil
-}
-
-func bundleBaseName(path string) string {
-	base := filepath.Base(path)
-	if strings.HasSuffix(base, ".pem") {
-		return strings.TrimSuffix(base, ".pem")
-	}
-	if strings.HasSuffix(base, ".bundle") {
-		return strings.TrimSuffix(base, ".bundle")
-	}
-	return base
-}
-
-// hasCertAndKey reports whether the PEM file contains at least one CERTIFICATE and one private key.
-func hasCertAndKey(path string) bool {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	var hasCert, hasKey bool
-	rem := b
-	for {
-		var blk *pem.Block
-		blk, rem = pem.Decode(rem)
-		if blk == nil {
-			break
-		}
-		switch blk.Type {
-		case "CERTIFICATE":
-			hasCert = true
-		case "PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY", "ENCRYPTED PRIVATE KEY":
-			hasKey = true
-		}
-	}
-	return hasCert && hasKey
-}
-
-// parseBundlePEM reads a single PEM file and extracts CA pool, client cert, and key.
-// Expected content: CA cert(s), client cert, private key (order flexible).
-func parseBundlePEM(path string) (caPool *x509.CertPool, cert tls.Certificate, err error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, tls.Certificate{}, err
-	}
-	var certs [][]byte
-	var keyDER []byte
-	var keyType string
-	rem := b
-	for {
-		var blk *pem.Block
-		blk, rem = pem.Decode(rem)
-		if blk == nil {
-			break
-		}
-		switch blk.Type {
-		case "CERTIFICATE":
-			certs = append(certs, blk.Bytes)
-		case "PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY":
-			if keyDER == nil {
-				keyDER = blk.Bytes
-				keyType = blk.Type
-			}
-		}
-	}
-	if len(certs) < 2 {
-		return nil, tls.Certificate{}, fmt.Errorf("bundle needs CA + client cert (found %d certs)", len(certs))
-	}
-	if keyDER == nil {
-		return nil, tls.Certificate{}, fmt.Errorf("no private key in bundle")
-	}
-	// First cert(s) except last are CA chain; last is client cert
-	caPool = x509.NewCertPool()
-	for i := 0; i < len(certs)-1; i++ {
-		c, err := x509.ParseCertificate(certs[i])
-		if err != nil {
-			return nil, tls.Certificate{}, fmt.Errorf("parse CA cert: %w", err)
-		}
-		caPool.AddCert(c)
-	}
-	// Last cert is client cert
-	clientCertDER := certs[len(certs)-1]
-	var privKey interface{}
-	switch keyType {
-	case "RSA PRIVATE KEY":
-		privKey, err = x509.ParsePKCS1PrivateKey(keyDER)
-	case "EC PRIVATE KEY":
-		privKey, err = x509.ParseECPrivateKey(keyDER)
-	default:
-		privKey, err = x509.ParsePKCS8PrivateKey(keyDER)
-	}
-	if err != nil {
-		return nil, tls.Certificate{}, fmt.Errorf("parse private key: %w", err)
-	}
-	cert = tls.Certificate{
-		Certificate: [][]byte{clientCertDER},
-		PrivateKey:  privKey,
-	}
-	return caPool, cert, nil
 }
 
 // startClient boots the data-plane; returns a stop func.

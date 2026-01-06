@@ -296,22 +296,22 @@ func updateLBStats(ups *uplinkSet) {
 		}
 		loss := combinedLoss(u)
 		jitterMs, jitterOk := combinedJitterMs(u)
-		score := stabilityScore(loss.percent, jitterMs, 0)
+		score := stabilityScore(loss.Percent, jitterMs, 0)
 		if jitterOk {
 			jitterSum += jitterMs
 			jitterCount++
 			scoreSum += score
 		}
 		lossText := "-"
-		if loss.ok {
-			lossText = fmt.Sprintf("%.1f%%", loss.percent)
+		if loss.Ok {
+			lossText = fmt.Sprintf("%.1f%%", loss.Percent)
 		}
 		jitterText := "-"
 		if jitterOk {
 			jitterText = fmt.Sprintf("%.1f ms", jitterMs)
 		}
 		scoreText := "-"
-		if loss.ok || jitterOk {
+		if loss.Ok || jitterOk {
 			scoreText = fmt.Sprintf("%.0f", score)
 		}
 		lines = append(lines, fmt.Sprintf("  %s (%s) %s %s | share: %3.0f%% | TX: %s (%.1f kbps) | RX: %s (%.1f kbps)",
@@ -337,18 +337,18 @@ func updateLBStats(ups *uplinkSet) {
 	ups.statsView.SetText(strings.Join(lines, "\n"))
 }
 
-func combinedLoss(u uplink) lossStats {
-	s4 := lossPercent(u.pingSent4, u.pingRecv4)
-	s6 := lossPercent(u.pingSent6, u.pingRecv6)
+func combinedLoss(u uplink) common.LossStats {
+	s4 := common.LossPercent(u.pingSent4, u.pingRecv4)
+	s6 := common.LossPercent(u.pingSent6, u.pingRecv6)
 	switch {
-	case s4.ok && s6.ok:
-		return lossPercent(u.pingSent4+u.pingSent6, u.pingRecv4+u.pingRecv6)
-	case s4.ok:
+	case s4.Ok && s6.Ok:
+		return common.LossPercent(u.pingSent4+u.pingSent6, u.pingRecv4+u.pingRecv6)
+	case s4.Ok:
 		return s4
-	case s6.ok:
+	case s6.Ok:
 		return s6
 	default:
-		return lossStats{percent: 0, ok: false}
+		return common.LossStats{}
 	}
 }
 

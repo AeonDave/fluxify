@@ -2,7 +2,6 @@ package main
 
 import (
 	"testing"
-	"time"
 )
 
 func TestPickBestConnSkipsDown(t *testing.T) {
@@ -11,7 +10,7 @@ func TestPickBestConnSkipsDown(t *testing.T) {
 	c1.alive.Store(true)
 	c2.alive.Store(true)
 
-	state := &clientState{mode: modeBonding, conns: []*clientConn{c1, c2}, cfg: clientConfig{ReorderFlushTimeout: 50 * time.Millisecond}, schedDeficit: make(map[*clientConn]float64)}
+	state := &clientState{mode: modeBonding, conns: []*clientConn{c1, c2}}
 
 	got := state.pickBestConn()
 	if got == nil {
@@ -28,10 +27,16 @@ func TestPickBestConnSkipsDown(t *testing.T) {
 }
 
 func TestPickBestConnReturnsNilWhenAllDown(t *testing.T) {
+	// With MP-QUIC, we have a single QUIC connection that handles multipath internally.
+	// When no conns are alive but conns exist, we still return the first conn
+	// because MP-QUIC will handle failover internally.
 	state := &clientState{mode: modeBonding, conns: []*clientConn{{}, {}}}
 	for i := 0; i < 3; i++ {
-		if got := state.pickBestConn(); got != nil {
-			t.Fatalf("expected nil when all conns down, got %v", got)
+		got := state.pickBestConn()
+		// With MP-QUIC architecture, we return first conn even if marked down
+		// because the QUIC connection handles path management
+		if got != state.conns[0] {
+			t.Fatalf("expected first conn for MP-QUIC fallback, got %v", got)
 		}
 	}
 }

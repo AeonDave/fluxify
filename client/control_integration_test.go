@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"io"
 	"math/big"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -46,14 +45,9 @@ func startTempControlServer(t *testing.T, pki common.PKIPaths) (addr string, sto
 					return
 				}
 				sessID, _ := rand.Int(rand.Reader, big.NewInt(1<<31))
-				key, err := common.GenerateSessionKey()
-				if err != nil {
-					return
-				}
 				resp := common.ControlResponse{
 					SessionID:  uint32(sessID.Int64()),
-					SessionKey: common.EncodeKeyBase64(key),
-					UDPPort:    7777,
+					DataPort:   7777,
 					ClientIP:   "10.8.0.2",
 					ClientIPv6: "fd00:8:0::2",
 				}
@@ -71,41 +65,29 @@ func TestFetchSessionEndToEnd(t *testing.T) {
 	if err := common.EnsureBasePKI(pki, []string{"127.0.0.1", "localhost"}, false); err != nil {
 		t.Fatalf("ensure pki: %v", err)
 	}
-	certPath, keyPath, err := common.GenerateClientCert(pki, "bob", false)
+	bundlePath, err := common.GenerateClientBundle(pki, "bob")
 	if err != nil {
-		t.Fatalf("gen client: %v", err)
-	}
-	// Create bundle: CA + client cert + key in single file
-	bundlePath := filepath.Join(pki.Dir, "bob.pem")
-	caBytes, _ := os.ReadFile(pki.CACert)
-	certBytes, _ := os.ReadFile(certPath)
-	keyBytes, _ := os.ReadFile(keyPath)
-	bundle := append(caBytes, '\n')
-	bundle = append(bundle, certBytes...)
-	bundle = append(bundle, '\n')
-	bundle = append(bundle, keyBytes...)
-	if err := os.WriteFile(bundlePath, bundle, 0o600); err != nil {
-		t.Fatalf("write bundle: %v", err)
+		t.Fatalf("gen client bundle: %v", err)
 	}
 
 	addr, stop := startTempControlServer(t, pki)
 	defer stop()
 
 	cfg := clientConfig{Server: addr, PKI: pki.Dir, Cert: bundlePath, Ctrl: 0}
-	key, sessID, udpPort, clientIP, clientIPv6, err := fetchSession(addr, cfg)
+	sessID, dataPort, clientIP, clientIPv6, err := fetchSession(addr, cfg)
 	if err != nil {
 		t.Fatalf("fetchSession: %v", err)
 	}
-	if sessID == 0 || udpPort != 7777 || clientIP == "" {
-		t.Fatalf("unexpected response: id=%d udp=%d ip=%s", sessID, udpPort, clientIP)
+	if sessID == 0 || dataPort != 7777 || clientIP == "" {
+		t.Fatalf("unexpected response: id=%d data=%d ip=%s", sessID, dataPort, clientIP)
 	}
 	if clientIPv6 != "" {
 		if !strings.HasPrefix(clientIPv6, "fd00:") {
 			t.Fatalf("unexpected ipv6: %s", clientIPv6)
 		}
 	}
-	if len(key) != common.SessionKeySize {
-		t.Fatalf("key size mismatch: %d", len(key))
+	if clientIP == "" {
+		t.Fatalf("missing client ip")
 	}
 }
 
@@ -120,7 +102,7 @@ func TestFetchSessionRejectsWithoutCert(t *testing.T) {
 
 	// Missing client cert/key should fail during tls.Dial
 	cfg := clientConfig{Server: addr, PKI: pki.Dir, Cert: filepath.Join(pki.Dir, "missing.pem"), Ctrl: 0}
-	if _, _, _, _, _, err := fetchSession(addr, cfg); err == nil {
+	if _, _, _, _, err := fetchSession(addr, cfg); err == nil {
 		t.Fatalf("expected error without client cert")
 	}
 }

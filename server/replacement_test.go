@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"fluxify/common"
 )
@@ -17,19 +18,18 @@ func TestSessionReplacementReusesIP(t *testing.T) {
 	if err := common.EnsureBasePKI(pki, []string{"127.0.0.1", "localhost"}, false); err != nil {
 		t.Fatalf("ensure pki: %v", err)
 	}
-	if _, _, err := common.GenerateClientCert(pki, "alice", false); err != nil {
-		t.Fatalf("gen client: %v", err)
+	bundlePath, err := common.GenerateClientBundle(pki, "alice")
+	if err != nil {
+		t.Fatalf("gen client bundle: %v", err)
 	}
 
-	st := NewServer(9999, 0, "", pki, false)
+	st := NewServer(9999, 0, "", pki, false, 128, 50*time.Millisecond)
 	addr, stop := startTestControlServer(t, st, pki)
 	defer stop()
 
 	// Helper to dial and get session
 	getSession := func() (uint32, string, string) {
-		tlsCfg, err := common.ClientTLSConfig(pki,
-			filepath.Join(pki.ClientsDir, "alice.pem"),
-			filepath.Join(pki.ClientsDir, "alice-key.pem"))
+		tlsCfg, err := common.LoadClientBundle(bundlePath)
 		if err != nil {
 			t.Fatalf("client tls config: %v", err)
 		}

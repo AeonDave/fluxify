@@ -7,6 +7,7 @@ import (
 	"crypto/tls"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"fluxify/common"
 )
@@ -42,17 +43,16 @@ func TestControlServerIssuesSession(t *testing.T) {
 	if err := common.EnsureBasePKI(pki, []string{"127.0.0.1", "localhost"}, false); err != nil {
 		t.Fatalf("ensure pki: %v", err)
 	}
-	if _, _, err := common.GenerateClientCert(pki, "alice", false); err != nil {
-		t.Fatalf("gen client: %v", err)
+	bundlePath, err := common.GenerateClientBundle(pki, "alice")
+	if err != nil {
+		t.Fatalf("gen client bundle: %v", err)
 	}
 
-	st := NewServer(9999, 0, "", pki, false) // Use constructor to init maps
+	st := NewServer(9999, 0, "", pki, false, 128, 50*time.Millisecond)
 	addr, stop := startTestControlServer(t, st, pki)
 	defer stop()
 
-	tlsCfg, err := common.ClientTLSConfig(pki,
-		filepath.Join(pki.ClientsDir, "alice.pem"),
-		filepath.Join(pki.ClientsDir, "alice-key.pem"))
+	tlsCfg, err := common.LoadClientBundle(bundlePath)
 	if err != nil {
 		t.Fatalf("client tls config: %v", err)
 	}
@@ -81,15 +81,8 @@ func TestControlServerIssuesSession(t *testing.T) {
 	if err := resp.Unmarshal(respBytes[:n]); err != nil {
 		t.Fatalf("unmarshal resp: %v", err)
 	}
-	if resp.SessionID == 0 || resp.SessionKey == "" || resp.UDPPort != 9999 || resp.ClientIP == "" {
+	if resp.SessionID == 0 || resp.DataPort != 9999 || resp.ClientIP == "" {
 		t.Fatalf("unexpected resp: %+v", resp)
-	}
-	key, err := common.DecodeKeyBase64(resp.SessionKey)
-	if err != nil {
-		t.Fatalf("decode key: %v", err)
-	}
-	if len(key) != common.SessionKeySize {
-		t.Fatalf("key size: %d", len(key))
 	}
 
 	// session stored
@@ -104,17 +97,16 @@ func TestControlServerUsesCertCNWhenClientNameEmpty(t *testing.T) {
 	if err := common.EnsureBasePKI(pki, []string{"127.0.0.1", "localhost"}, false); err != nil {
 		t.Fatalf("ensure pki: %v", err)
 	}
-	if _, _, err := common.GenerateClientCert(pki, "alice", false); err != nil {
-		t.Fatalf("gen client: %v", err)
+	bundlePath, err := common.GenerateClientBundle(pki, "alice")
+	if err != nil {
+		t.Fatalf("gen client bundle: %v", err)
 	}
 
-	st := NewServer(9999, 0, "", pki, false)
+	st := NewServer(9999, 0, "", pki, false, 128, 50*time.Millisecond)
 	addr, stop := startTestControlServer(t, st, pki)
 	defer stop()
 
-	tlsCfg, err := common.ClientTLSConfig(pki,
-		filepath.Join(pki.ClientsDir, "alice.pem"),
-		filepath.Join(pki.ClientsDir, "alice-key.pem"))
+	tlsCfg, err := common.LoadClientBundle(bundlePath)
 	if err != nil {
 		t.Fatalf("client tls config: %v", err)
 	}

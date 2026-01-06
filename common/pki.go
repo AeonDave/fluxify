@@ -2,19 +2,20 @@ package common
 
 import (
 	"bytes"
+	"compress/gzip"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"os"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
 	"time"
 )
@@ -28,7 +29,6 @@ type PKIPaths struct {
 	ClientsDir string
 }
 
-// DefaultPKI returns default paths under the given base directory (e.g., "./pki").
 func DefaultPKI(base string) PKIPaths {
 	return PKIPaths{
 		Dir:        base,
@@ -40,415 +40,205 @@ func DefaultPKI(base string) PKIPaths {
 	}
 }
 
-// EnsureBasePKI creates CA and server certs if missing or regenerate is true.
-// hostnames is used for server SANs.
 func EnsureBasePKI(paths PKIPaths, hostnames []string, regenerate bool) error {
-	if err := os.MkdirAll(paths.Dir, 0o700); err != nil {
-		return err
+	_ = os.MkdirAll(paths.Dir, 0700)
+	_ = os.MkdirAll(paths.ClientsDir, 0700)
+	if regenerate || !FileExists(paths.CACert) {
+		_ = createCA(paths.CACert, paths.CAKey)
 	}
-	if err := os.MkdirAll(paths.ClientsDir, 0o700); err != nil {
-		return err
-	}
-
-	needCA := regenerate || !fileExists(paths.CACert) || !fileExists(paths.CAKey)
-	if needCA {
-		if err := createCA(paths.CACert, paths.CAKey); err != nil {
-			return fmt.Errorf("create CA: %w", err)
-		}
-	}
-
-	needServer := regenerate || !fileExists(paths.ServerCert) || !fileExists(paths.ServerKey)
-	if needServer {
-		caCert, caKey, err := loadCA(paths.CACert, paths.CAKey)
-		if err != nil {
-			return fmt.Errorf("load CA: %w", err)
-		}
-		if err := createServerCert(paths.ServerCert, paths.ServerKey, caCert, caKey, hostnames); err != nil {
-			return fmt.Errorf("create server cert: %w", err)
-		}
+	if regenerate || !FileExists(paths.ServerCert) {
+		ca, cakey, _ := loadCA(paths.CACert, paths.CAKey)
+		_ = createServerCert(paths.ServerCert, paths.ServerKey, ca, cakey, hostnames)
 	}
 	return nil
 }
 
-// GenerateClientCert creates a client cert/key signed by CA.
-func GenerateClientCert(paths PKIPaths, clientName string, regenerate bool) (certFile, keyFile string, err error) {
-	cleanName, err := sanitizeClientName(clientName)
-	if err != nil {
-		return "", "", err
-	}
-	if err := os.MkdirAll(paths.ClientsDir, 0o700); err != nil {
-		return "", "", err
-	}
-	certFile = filepath.Join(paths.ClientsDir, fmt.Sprintf("%s.pem", cleanName))
-	keyFile = filepath.Join(paths.ClientsDir, fmt.Sprintf("%s-key.pem", cleanName))
-	if !regenerate && fileExists(certFile) && fileExists(keyFile) {
-		return certFile, keyFile, nil
-	}
-	caCert, caKey, err := loadCA(paths.CACert, paths.CAKey)
-	if err != nil {
-		return "", "", err
-	}
-	if err := createClientCert(certFile, keyFile, caCert, caKey, cleanName); err != nil {
-		return "", "", err
-	}
-	return certFile, keyFile, nil
-}
-
-// GenerateDatedClientCert creates a client cert/key with a timestamped filename.
-// Only the dated pair is written to disk; callers can resolve the latest pair via FindLatestDatedClientCert.
-func GenerateDatedClientCert(paths PKIPaths, clientName string, ts time.Time) (datedCert, datedKey, canonicalCert, canonicalKey string, err error) {
-	cleanName, err := sanitizeClientName(clientName)
-	if err != nil {
-		return "", "", "", "", err
-	}
-	if ts.IsZero() {
-		ts = time.Now()
-	}
-	if err := os.MkdirAll(paths.ClientsDir, 0o700); err != nil {
-		return "", "", "", "", err
-	}
-	// Remove previous dated pairs for this client to keep a single cert/key.
-	_ = removeDatedClientCerts(paths.ClientsDir, cleanName)
-
-	stamp := ts.UTC().Format("20060102-150405")
-	datedCert = filepath.Join(paths.ClientsDir, fmt.Sprintf("%s-%s.pem", cleanName, stamp))
-	datedKey = filepath.Join(paths.ClientsDir, fmt.Sprintf("%s-%s-key.pem", cleanName, stamp))
-	caCert, caKey, err := loadCA(paths.CACert, paths.CAKey)
-	if err != nil {
-		return "", "", "", "", err
-	}
-	if err := createClientCert(datedCert, datedKey, caCert, caKey, cleanName); err != nil {
-		return "", "", "", "", err
-	}
-	// canonical paths are left empty to signal dated-only outputs
-	return datedCert, datedKey, "", "", nil
-}
-
-// removeDatedClientCerts deletes existing dated cert/key pairs for a client (best effort).
-func removeDatedClientCerts(dir, client string) error {
-	matches, err := filepath.Glob(filepath.Join(dir, fmt.Sprintf("%s-*.pem", client)))
-	if err != nil {
-		return err
-	}
-	for _, m := range matches {
-		_ = os.Remove(m)
-	}
-	return nil
-}
-
-// FindLatestDatedClientCert returns the newest timestamped cert/key for the given client.
-// It expects files named <name>-YYYYMMDD-HHMMSS.pem and corresponding -key.pem.
-func FindLatestDatedClientCert(paths PKIPaths, clientName string) (certFile, keyFile string, err error) {
-	cleanName, err := sanitizeClientName(clientName)
-	if err != nil {
-		return "", "", err
-	}
-	pattern := fmt.Sprintf("%s-*.pem", cleanName)
-	matches, err := filepath.Glob(filepath.Join(paths.ClientsDir, pattern))
-	if err != nil {
-		return "", "", err
-	}
-	type pair struct {
-		cert string
-		key  string
-		ts   time.Time
-	}
-	pairs := make([]pair, 0)
-	for _, cert := range matches {
-		if strings.HasSuffix(cert, "-key.pem") {
-			continue
-		}
-		base := filepath.Base(cert)
-		if !strings.HasPrefix(base, cleanName+"-") {
-			continue
-		}
-		stamp := strings.TrimPrefix(base, cleanName+"-")
-		stamp = strings.TrimSuffix(stamp, ".pem")
-		ts, parseErr := time.Parse("20060102-150405", stamp)
-		if parseErr != nil {
-			continue
-		}
-		key := strings.TrimSuffix(cert, ".pem") + "-key.pem"
-		if !fileExists(key) {
-			if k, splitErr := splitClientBundle(cert); splitErr == nil {
-				key = k
-			} else {
-				continue
-			}
-		}
-		pairs = append(pairs, pair{cert: cert, key: key, ts: ts})
-	}
-	if len(pairs) == 0 {
-		return "", "", fmt.Errorf("no dated certs for %s", cleanName)
-	}
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].ts.After(pairs[j].ts) })
-	return pairs[0].cert, pairs[0].key, nil
-}
-
-// ResolveClientCertKey returns the best client cert/key pair, splitting combined bundles when necessary.
-// Prefers the latest dated cert; falls back to canonical filenames under ClientsDir.
-func ResolveClientCertKey(paths PKIPaths, clientName string) (certFile, keyFile string, err error) {
-	cleanName, err := sanitizeClientName(clientName)
-	if err != nil {
-		return "", "", err
-	}
-	if c, k, err := FindLatestDatedClientCert(paths, cleanName); err == nil {
-		return c, k, nil
-	}
-	certPath := filepath.Join(paths.ClientsDir, fmt.Sprintf("%s.pem", cleanName))
-	keyPath := filepath.Join(paths.ClientsDir, fmt.Sprintf("%s-key.pem", cleanName))
-	if !fileExists(certPath) {
-		return "", "", fmt.Errorf("client cert not found for %s", cleanName)
-	}
-	if !fileExists(keyPath) {
-		k, splitErr := splitClientBundle(certPath)
-		if splitErr != nil {
-			return "", "", fmt.Errorf("client key missing for %s: %w", cleanName, splitErr)
-		}
-		keyPath = k
-	}
-	return certPath, keyPath, nil
-}
-
-var clientNameRe = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
-
-func sanitizeClientName(name string) (string, error) {
-	name = strings.TrimSpace(name)
-	if name == "" {
-		return "", fmt.Errorf("client name required")
-	}
-	cleaned := clientNameRe.ReplaceAllString(name, "_")
-	cleaned = strings.Trim(cleaned, "-_ ")
-	if cleaned == "" {
-		return "", fmt.Errorf("client name invalid")
-	}
-	return cleaned, nil
-}
-
-// ServerTLSConfig builds a TLS config requiring client certs signed by the CA.
-func ServerTLSConfig(paths PKIPaths) (*tls.Config, error) {
-	caPool, err := loadCAPool(paths.CACert)
-	if err != nil {
-		return nil, err
-	}
-	cert, err := tls.LoadX509KeyPair(paths.ServerCert, paths.ServerKey)
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-		ClientCAs:    caPool,
-		MinVersion:   tls.VersionTLS12,
-	}, nil
-}
-
-// ClientTLSConfig builds a TLS config with mutual auth using provided cert/key and CA.
-func ClientTLSConfig(paths PKIPaths, certFile, keyFile string) (*tls.Config, error) {
-	caPool, err := loadCAPool(paths.CACert)
-	if err != nil {
-		return nil, err
-	}
-	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      caPool,
-		MinVersion:   tls.VersionTLS12,
-	}, nil
-}
-
-// ---------- helpers ----------
-
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-// splitClientBundle extracts a private key from a combined cert+key PEM file.
-// It rewrites the cert file to contain only certificate blocks and writes the key to the derived -key.pem path.
-func splitClientBundle(certPath string) (keyPath string, err error) {
-	b, err := os.ReadFile(certPath)
-	if err != nil {
-		return "", err
-	}
-	var certPEMs [][]byte
-	var keyBlock *pem.Block
-	rest := b
-	for {
-		var blk *pem.Block
-		blk, rest = pem.Decode(rest)
-		if blk == nil {
-			break
-		}
-		switch blk.Type {
-		case "CERTIFICATE":
-			certPEMs = append(certPEMs, pem.EncodeToMemory(blk))
-		case "PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY":
-			if keyBlock == nil {
-				keyBlock = blk
-			}
-		}
-	}
-	if keyBlock == nil || len(certPEMs) == 0 {
-		return "", fmt.Errorf("combined cert/key not found in %s", certPath)
-	}
-	if err := os.WriteFile(certPath, bytes.Join(certPEMs, []byte{}), 0o644); err != nil {
-		return "", err
-	}
-	keyPath = strings.TrimSuffix(certPath, ".pem") + "-key.pem"
-	if err := os.WriteFile(keyPath, pem.EncodeToMemory(keyBlock), 0o600); err != nil {
-		return "", err
-	}
-	return keyPath, nil
-}
-
-func randSerial() (*big.Int, error) {
-	limit := new(big.Int).Lsh(big.NewInt(1), 128)
-	return rand.Int(rand.Reader, limit)
-}
-
-func createCA(certFile, keyFile string) error {
-	serial, _ := randSerial()
-	tmpl := x509.Certificate{
-		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: "fluxify-CA"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(3650 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-	}
-	key, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		return err
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
-	if err != nil {
-		return err
-	}
-	if err := writeCertKey(certFile, keyFile, der, key); err != nil {
-		return err
-	}
-	return nil
-}
-
-func createServerCert(certFile, keyFile string, caCert *x509.Certificate, caKey *rsa.PrivateKey, hosts []string) error {
+func GenerateClientBundle(paths PKIPaths, clientName string) (string, error) {
+	ca, cakey, _ := loadCA(paths.CACert, paths.CAKey)
+	key, _ := rsa.GenerateKey(rand.Reader, 4096)
 	serial, _ := randSerial()
 	tmpl := x509.Certificate{
 		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: "fluxify-server"},
-		NotBefore:    time.Now().Add(-time.Hour),
-		NotAfter:     time.Now().Add(3650 * 24 * time.Hour),
-		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	}
-	for _, h := range hosts {
-		if ip := net.ParseIP(h); ip != nil {
-			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
-		} else {
-			tmpl.DNSNames = append(tmpl.DNSNames, h)
-		}
-	}
-	key, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		return err
-	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, caCert, &key.PublicKey, caKey)
-	if err != nil {
-		return err
-	}
-	return writeCertKey(certFile, keyFile, der, key)
-}
-
-func createClientCert(certFile, keyFile string, caCert *x509.Certificate, caKey *rsa.PrivateKey, name string) error {
-	serial, _ := randSerial()
-	tmpl := x509.Certificate{
-		SerialNumber: serial,
-		Subject:      pkix.Name{CommonName: name},
+		Subject:      pkix.Name{CommonName: clientName},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(3650 * 24 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 	}
-	if ip := net.ParseIP(name); ip != nil {
-		tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
-	} else {
-		tmpl.DNSNames = append(tmpl.DNSNames, name)
+	der, _ := x509.CreateCertificate(rand.Reader, &tmpl, ca, &key.PublicKey, cakey)
+	var b bytes.Buffer
+	// IMPORTANT: tls.X509KeyPair expects the first CERTIFICATE block to match the private key.
+	// Therefore write the client cert first, then append the CA cert.
+	_ = pem.Encode(&b, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+	cb, _ := os.ReadFile(paths.CACert)
+	_, _ = b.Write(cb)
+	_ = pem.Encode(&b, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+
+	// Compress with gzip
+	var gzBuf bytes.Buffer
+	zw := gzip.NewWriter(&gzBuf)
+	_, _ = zw.Write(b.Bytes())
+	_ = zw.Close()
+
+	// Encode to base64
+	b64Data := base64.StdEncoding.EncodeToString(gzBuf.Bytes())
+
+	// Write base64-encoded bundle to disk
+	out := filepath.Join(paths.ClientsDir, clientName+".bundle")
+	if err := os.WriteFile(out, []byte(b64Data), 0600); err != nil {
+		return "", fmt.Errorf("write bundle: %w", err)
+	}
+	return out, nil
+}
+
+func LoadClientBundle(path string) (*tls.Config, error) {
+	// Read base64-encoded gzip bundle
+	b64Data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read bundle: %w", err)
+	}
+
+	// Decode base64
+	gzData, err := base64.StdEncoding.DecodeString(string(b64Data))
+	if err != nil {
+		return nil, fmt.Errorf("decode base64: %w", err)
+	}
+
+	// Decompress gzip
+	zr, err := gzip.NewReader(bytes.NewReader(gzData))
+	if err != nil {
+		return nil, fmt.Errorf("gzip decompress: %w", err)
+	}
+	defer zr.Close()
+
+	data, err := io.ReadAll(zr)
+	if err != nil {
+		return nil, fmt.Errorf("read gzip data: %w", err)
+	}
+
+	// Parse PEM bundle
+	cert, err := tls.X509KeyPair(data, data)
+	if err != nil {
+		return nil, fmt.Errorf("parse key pair: %w", err)
+	}
+	cp := x509.NewCertPool()
+	if !cp.AppendCertsFromPEM(data) {
+		return nil, fmt.Errorf("no valid certificates in bundle")
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}, RootCAs: cp, MinVersion: tls.VersionTLS12}, nil
+}
+
+func ServerTLSConfig(paths PKIPaths) (*tls.Config, error) {
+	cb, err := os.ReadFile(paths.CACert)
+	if err != nil {
+		return nil, fmt.Errorf("read CA cert: %w", err)
+	}
+	cp := x509.NewCertPool()
+	if !cp.AppendCertsFromPEM(cb) {
+		return nil, fmt.Errorf("no valid CA certificates found in %s", paths.CACert)
+	}
+	cert, err := tls.LoadX509KeyPair(paths.ServerCert, paths.ServerKey)
+	if err != nil {
+		return nil, fmt.Errorf("load server key pair: %w", err)
+	}
+	return &tls.Config{Certificates: []tls.Certificate{cert}, ClientAuth: tls.RequireAndVerifyClientCert, ClientCAs: cp, MinVersion: tls.VersionTLS12}, nil
+}
+
+func DetectClientBundlePath(dir string) (string, error) {
+	m, _ := filepath.Glob(filepath.Join(dir, "*.bundle"))
+	if len(m) == 0 {
+		return "", fmt.Errorf("no .bundle file found in %s", dir)
+	}
+	if len(m) > 1 {
+		return "", fmt.Errorf("multiple .bundle files found in %s (found %d), specify -cert explicitly", dir, len(m))
+	}
+	return m[0], nil
+}
+
+func FileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
+func createCA(c, k string) error {
+	key, _ := rsa.GenerateKey(rand.Reader, 4096)
+	serial, _ := randSerial()
+	tmpl := x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(3650 * 24 * time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+	}
+	der, _ := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &key.PublicKey, key)
+	return writeCertKey(c, k, der, key)
+}
+
+func createServerCert(c, k string, ca *x509.Certificate, cak *rsa.PrivateKey, h []string) error {
+	serial, _ := randSerial()
+	tmpl := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "server"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(3650 * 24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	// Add SANs (Subject Alternative Names)
+	for _, name := range h {
+		if ip := net.ParseIP(name); ip != nil {
+			tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
+		} else {
+			tmpl.DNSNames = append(tmpl.DNSNames, name)
+		}
 	}
 	key, err := rsa.GenerateKey(rand.Reader, 4096)
 	if err != nil {
 		return err
 	}
-	der, err := x509.CreateCertificate(rand.Reader, &tmpl, caCert, &key.PublicKey, caKey)
-	if err != nil {
-		return err
-	}
-	return writeCertKey(certFile, keyFile, der, key)
+	der, _ := x509.CreateCertificate(rand.Reader, &tmpl, ca, &key.PublicKey, cak)
+	return writeCertKey(c, k, der, key)
 }
 
-func writeCertKey(certFile, keyFile string, der []byte, key *rsa.PrivateKey) error {
-	certOut, err := os.Create(certFile)
-	if err != nil {
-		return err
-	}
-	defer func(certOut *os.File) {
-		_ = certOut.Close()
-	}(certOut)
-	if err := pem.Encode(certOut, &pem.Block{Type: "CERTIFICATE", Bytes: der}); err != nil {
-		return err
-	}
-	keyOut, err := os.OpenFile(keyFile, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
-	if err != nil {
-		return err
-	}
-	defer func(keyOut *os.File) {
-		_ = keyOut.Close()
-	}(keyOut)
-	if err := pem.Encode(keyOut, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}); err != nil {
-		return err
-	}
+func writeCertKey(c, k string, der []byte, key *rsa.PrivateKey) error {
+	fc, _ := os.Create(c)
+	_ = pem.Encode(fc, &pem.Block{Type: "CERTIFICATE", Bytes: der})
+	_ = fc.Close()
+	fk, _ := os.Create(k)
+	_ = pem.Encode(fk, &pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+	_ = fk.Close()
 	return nil
 }
 
-func loadCA(certFile, keyFile string) (*x509.Certificate, *rsa.PrivateKey, error) {
-	certPEM, err := os.ReadFile(certFile)
-	if err != nil {
-		return nil, nil, err
-	}
-	keyPEM, err := os.ReadFile(keyFile)
-	if err != nil {
-		return nil, nil, err
-	}
-	certBlock, _ := pem.Decode(certPEM)
-	if certBlock == nil {
-		return nil, nil, fmt.Errorf("invalid ca cert")
-	}
-	keyBlock, _ := pem.Decode(keyPEM)
-	if keyBlock == nil {
-		return nil, nil, fmt.Errorf("invalid ca key")
-	}
-	cert, err := x509.ParseCertificate(certBlock.Bytes)
-	if err != nil {
-		return nil, nil, err
-	}
-	key, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
-	if err != nil {
-		return nil, nil, err
-	}
-	return cert, key, nil
+func loadCA(c, k string) (*x509.Certificate, *rsa.PrivateKey, error) {
+	cb, _ := os.ReadFile(c)
+	kb, _ := os.ReadFile(k)
+	bc, _ := pem.Decode(cb)
+	bk, _ := pem.Decode(kb)
+	crt, _ := x509.ParseCertificate(bc.Bytes)
+	key, _ := x509.ParsePKCS1PrivateKey(bk.Bytes)
+	return crt, key, nil
 }
 
-func loadCAPool(caFile string) (*x509.CertPool, error) {
-	b, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, err
+func randSerial() (*big.Int, error) {
+	return rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+}
+
+func sanitizeClientName(n string) (string, error) {
+	return strings.TrimSpace(n), nil
+}
+
+// BundleBaseName extracts the client name from a bundle file path.
+// Removes .pem or .bundle extension.
+func BundleBaseName(path string) string {
+	base := filepath.Base(path)
+	if strings.HasSuffix(base, ".pem") {
+		return strings.TrimSuffix(base, ".pem")
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(b) {
-		return nil, fmt.Errorf("failed to append CA")
+	if strings.HasSuffix(base, ".bundle") {
+		return strings.TrimSuffix(base, ".bundle")
 	}
-	return pool, nil
+	return base
 }

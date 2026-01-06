@@ -8,10 +8,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/rivo/tview"
 
 	"fluxify/client/platform"
-	"fluxify/common"
 )
 
 const (
@@ -21,53 +21,53 @@ const (
 )
 
 type clientConn struct {
-	udp           *net.UDPConn
-	addr          *net.UDPAddr
-	iface         string
-	localIP       string
-	alive         atomic.Bool
-	ifaceUp       atomic.Bool
-	bytesSent     atomic.Uint64
-	bytesRecv     atomic.Uint64
-	rttNano       atomic.Int64
-	jitterNano    atomic.Int64
-	lastRTTSample atomic.Int64
-	hbSent        atomic.Uint64
-	hbRecv        atomic.Uint64
-	lastRecv      atomic.Int64
-	lastConn      atomic.Int64
-	mu            sync.Mutex
+	// MP-QUIC connection (replaces udp)
+	quicConn   *quic.Conn
+	packetConn net.PacketConn
+	addr       string // server address as string
+	iface      string
+	localIP    string
+	alive      atomic.Bool
+	ifaceUp    atomic.Bool
+	bytesSent  atomic.Uint64
+	bytesRecv  atomic.Uint64
+	rttNano    atomic.Int64
+	jitterNano atomic.Int64
+	hbSent     atomic.Uint64
+	hbRecv     atomic.Uint64
+	lastRecv   atomic.Int64
+	lastConn   atomic.Int64
+	mu         sync.Mutex
 }
 
 type clientState struct {
-	serverUDP   *net.UDPAddr
-	sessionID   uint32
-	sessionKey  []byte
-	clientIP    string
-	clientIPv6  string
-	conns       []*clientConn
-	connMu      sync.RWMutex
-	nextSeqSend atomic.Uint32
-	nextConnRR  atomic.Uint32
-	tun         platform.TunDevice
-	tunWriteCh  chan []byte
-	mode        string
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg          sync.WaitGroup
-	revertRoute func()
-	revertDNS   func()
-	ifaceDNS    []ifaceDNSBackup
-	statsView   *tview.TextView // for dynamic updates
-	ctrlAddr    string
-	cfg         clientConfig
-	sessMu      sync.RWMutex
-	serverAlive atomic.Bool
-	reconnectOn atomic.Bool
-	ipv6Enabled bool
-	rateMu      sync.Mutex
-	rateByConn  map[*clientConn]*ifaceRate
-	compStats   compressionStats
+	serverAddr   string // server address for QUIC connection
+	sessionID    uint32
+	clientIP     string
+	clientIPv6   string
+	conns        []*clientConn
+	connMu       sync.RWMutex
+	nextSeqSend  atomic.Uint32
+	nextConnRR   atomic.Uint32
+	tun          platform.TunDevice
+	tunWriteCh   chan []byte
+	mode         string
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	revertRoute  func()
+	revertDNS    func()
+	ifaceDNS     []ifaceDNSBackup
+	statsView    *tview.TextView // for dynamic updates
+	ctrlAddr     string
+	cfg          clientConfig
+	sessMu       sync.RWMutex
+	serverAlive  atomic.Bool
+	reconnectOn  atomic.Bool
+	ipv6Enabled  bool
+	rateMu       sync.Mutex
+	rateByConn   map[*clientConn]*ifaceRate
+	mpController *quic.DefaultMultipathController // MP-QUIC path controller
 
 	// Inbound reorder (server -> client) for packet-level striping.
 	inReorder      *reorderBuffer
@@ -79,39 +79,23 @@ type clientState struct {
 		flushes          atomic.Uint64
 		maxDepth         atomic.Uint32
 	}
-
-	// Weighted scheduler state (bonding mode)
-	schedMu      sync.Mutex
-	schedDeficit map[*clientConn]float64
-
-	// Flow scheduler (bonding mode): keep packets of same flow on same conn.
-	flowMu     sync.Mutex
-	flowToConn map[common.FlowKey]*clientConn
-}
-
-type compressionStats struct {
-	attempts      atomic.Uint64
-	savings       atomic.Int64 // bytes saved (negative = waste)
-	enabled       atomic.Bool
-	samplingPhase atomic.Bool
-	sampleSize    atomic.Uint32
 }
 
 type clientConfig struct {
-	Server                string
-	Ifaces                []string
-	IPs                   []string
-	Mode                  string
-	PKI                   string
-	Cert                  string
-	Ctrl                  int
-	DNS4                  []string
-	DNS6                  []string
-	CompressionSampleSize int
-	ReorderBufferSize     int
-	ReorderFlushTimeout   time.Duration
-	MTU                   int  // 0 = use default (common.MTU), >0 = override
-	ProbePMTUD            bool // if true, probe PMTUD at startup and warn if fails
+	Server              string
+	Ifaces              []string
+	IPs                 []string
+	Mode                string
+	PKI                 string
+	Cert                string
+	Telemetry           string
+	Ctrl                int
+	DNS4                []string
+	DNS6                []string
+	ReorderBufferSize   int
+	ReorderFlushTimeout time.Duration
+	MTU                 int  // 0 = use default (common.MTU), >0 = override
+	ProbePMTUD          bool // if true, probe PMTUD at startup and warn if fails
 }
 
 type storedConfig struct {
@@ -179,6 +163,14 @@ func stabilityScore(lossPct, jitterMs, rttMs float64) float64 {
 		return 100
 	}
 	return score
+}
+
+// GetMPPathStats returns MP-QUIC path statistics if the controller is set.
+func (c *clientState) GetMPPathStats() map[quic.PathID]quic.PathStatistics {
+	if c.mpController == nil {
+		return nil
+	}
+	return c.mpController.GetStatistics()
 }
 
 // pickIndex picks element i modulo len(list) or empty string.

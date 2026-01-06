@@ -9,16 +9,127 @@ import (
 	"io"
 	"log"
 	"net"
+	"net/netip"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	quic "github.com/AeonDave/mp-quic-go"
 	"github.com/rivo/tview"
 
 	"fluxify/client/platform"
 	"fluxify/common"
 )
+
+func isUsableLocalIP(ip net.IP, wantV4 bool) bool {
+	if ip == nil {
+		return false
+	}
+	if wantV4 {
+		ip = ip.To4()
+		if ip == nil {
+			return false
+		}
+	} else {
+		if ip.To4() != nil {
+			return false
+		}
+		ip = ip.To16()
+		if ip == nil {
+			return false
+		}
+	}
+
+	// Exclude loopback + link-local; RFC1918 / ULA are fine.
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+		return false
+	}
+	return ip.IsGlobalUnicast()
+}
+
+// collectLocalAddrs builds a strict allowlist of local IPs for the selected interfaces.
+// If cfg.IPs provides an entry for an interface, that IP is used (no iface lookup).
+// Otherwise, we try to discover a usable address on that interface.
+func collectLocalAddrs(ifaces []string, ips []string, wantV4 bool) ([]net.IP, error) {
+	var out []net.IP
+	seen := make(map[string]struct{})
+
+	for i, ifaceName := range ifaces {
+		ipStr := ""
+		if i < len(ips) {
+			ipStr = strings.TrimSpace(ips[i])
+		}
+
+		if ipStr != "" {
+			parsed := net.ParseIP(ipStr)
+			if !isUsableLocalIP(parsed, wantV4) {
+				return nil, fmt.Errorf("invalid local IP %q for iface %q", ipStr, ifaceName)
+			}
+			key := parsed.String()
+			if _, ok := seen[key]; !ok {
+				seen[key] = struct{}{}
+				out = append(out, parsed)
+			}
+			continue
+		}
+
+		iface, err := net.InterfaceByName(ifaceName)
+		if err != nil {
+			return nil, fmt.Errorf("lookup iface %q: %w", ifaceName, err)
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			return nil, fmt.Errorf("list addrs for iface %q: %w", ifaceName, err)
+		}
+
+		var picked net.IP
+		for _, a := range addrs {
+			var ip net.IP
+			switch v := a.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			default:
+				continue
+			}
+			if isUsableLocalIP(ip, wantV4) {
+				picked = ip
+				break
+			}
+		}
+		if picked == nil {
+			if wantV4 {
+				return nil, fmt.Errorf("no usable IPv4 address found on iface %q", ifaceName)
+			}
+			return nil, fmt.Errorf("no usable IPv6 address found on iface %q", ifaceName)
+		}
+		key := picked.String()
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			out = append(out, picked)
+		}
+	}
+
+	// Keep list deterministic.
+	stable := make([]net.IP, 0, len(out))
+	stableSeen := make(map[string]struct{}, len(out))
+	for _, ip := range out {
+		addr, ok := netip.AddrFromSlice(ip)
+		if !ok {
+			continue
+		}
+		k := addr.String()
+		if _, ok := stableSeen[k]; ok {
+			continue
+		}
+		stableSeen[k] = struct{}{}
+		stable = append(stable, ip)
+	}
+
+	return stable, nil
+}
 
 type bondingRunner struct{}
 
@@ -75,21 +186,17 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	ctrlAddr := net.JoinHostPort(ctrlHost, fmt.Sprintf("%d", ctrlPort))
 
 	vlogf("bonding: fetching session from %s", ctrlAddr)
-	key, sessID, udpPort, clientIP, clientIPv6, err := fetchSession(ctrlAddr, cfg)
+	sessID, dataPort, clientIP, clientIPv6, err := fetchSession(ctrlAddr, cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("control: %w", err)
 	}
-	vlogf("bonding: session id=%d udp=%d ip4=%s ip6=%s", sessID, udpPort, clientIP, clientIPv6)
+	vlogf("bonding: session id=%d data_port=%d ip4=%s ip6=%s", sessID, dataPort, clientIP, clientIPv6)
 
-	serverUDP, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ctrlHost, fmt.Sprintf("%d", udpPort)))
-	if err != nil {
-		return nil, nil, err
-	}
+	serverAddr := net.JoinHostPort(ctrlHost, fmt.Sprintf("%d", dataPort))
 	ctx, cancel := context.WithCancel(context.Background())
 	state := &clientState{
-		serverUDP:     serverUDP,
+		serverAddr:    serverAddr,
 		sessionID:     sessID,
-		sessionKey:    key,
 		clientIP:      clientIP,
 		clientIPv6:    clientIPv6,
 		mode:          cfg.Mode,
@@ -98,7 +205,6 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		ctrlAddr:      ctrlAddr,
 		cfg:           cfg,
 		rateByConn:    make(map[*clientConn]*ifaceRate),
-		schedDeficit:  make(map[*clientConn]float64),
 		stopInReorder: make(chan struct{}),
 	}
 	// Inbound reorder buffer is required for server->client packet striping.
@@ -113,10 +219,10 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	state.inReorder = newClientReorderBuffer(bufSize, flush)
 	state.wg.Add(1)
 	go state.inboundReorderFlushLoop()
-	if cfg.CompressionSampleSize > 0 {
-		state.compStats.sampleSize.Store(uint32(cfg.CompressionSampleSize))
-	} else {
-		state.compStats.sampleSize.Store(10)
+	telemetryStop, err := startTelemetryLogger(ctx, state, cfg.Telemetry)
+	if err != nil {
+		cancel()
+		return nil, nil, err
 	}
 
 	vlogf("bonding: creating TUN device")
@@ -186,197 +292,107 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		state.ifaceDNS = applyIfaceDNS(cfg.Ifaces, dns4, dns6)
 	}
 
-	isLoopback := serverUDP.IP != nil && serverUDP.IP.IsLoopback()
-	serverIsV4 := serverUDP.IP.To4() != nil
-	routeTarget := ""
-	var fallbackVia, fallbackDev, fallbackVia6, fallbackDev6 string
-	if !isLoopback {
-		vlogf("bonding: setting up routing")
-		oldRoute, via, dev, err := common.GetDefaultRoute()
-		if err != nil {
-			_ = state.tun.Close()
-			cancel()
-			return nil, nil, fmt.Errorf("get default route: %w", err)
-		}
-		fallbackVia = via
-		fallbackDev = dev
-		oldRoute6, via6, dev6, err := common.GetDefaultRoute6()
-		if err != nil {
-			_ = state.tun.Close()
-			cancel()
-			return nil, nil, fmt.Errorf("get default route v6: %w", err)
-		}
-		fallbackVia6 = via6
-		fallbackDev6 = dev6
-		serverHost, _, _ := net.SplitHostPort(cfg.Server)
-		serverIP := serverUDP.IP.String()
-		routeTarget = serverHost
-		if net.ParseIP(routeTarget) == nil && serverIP != "" {
-			routeTarget = serverIP
-		}
-		if routeTarget == "" {
-			routeTarget = serverIP
-		}
-		runner := bondingRunner{}
-		routesAdded := 0
-		useAddRoute := runtime.GOOS == "windows"
-		if serverIsV4 {
-			if useAddRoute {
-				_ = common.DeleteHostRoute(routeTarget)
-			}
-			for _, iface := range cfg.Ifaces {
-				gw, err := platform.GatewayForIface(runner, iface)
-				if err != nil || gw == "" {
-					continue
-				}
-				if err := addHostRoute(routeTarget, gw, iface, useAddRoute); err != nil {
-					log.Printf("bonding: warning: host route via %s/%s failed: %v", iface, gw, err)
-					continue
-				}
-				routesAdded++
-			}
-			if routesAdded == 0 {
-				if err := addHostRoute(routeTarget, via, dev, useAddRoute); err != nil {
-					return nil, nil, fmt.Errorf("host route to server failed: %w", err)
-				}
-				routesAdded++
-			}
+	// Configure VPN routing: save old default route, add host route for server, set default via TUN
+	vlogf("bonding: configuring VPN routes")
+	oldRoute, oldVia, oldDev, err := common.GetDefaultRoute()
+	if err != nil {
+		log.Printf("bonding: warning: could not get default route: %v", err)
+	}
+	var oldRoute6, oldVia6, oldDev6 string
+	if enableIPv6 {
+		oldRoute6, oldVia6, oldDev6, _ = common.GetDefaultRoute6()
+	}
+
+	// Add host route for VPN server so traffic to server goes via original gateway
+	serverIP, _, _ := net.SplitHostPort(serverAddr)
+	if serverIP != "" && oldVia != "" && oldDev != "" {
+		if err := common.EnsureHostRoute(serverIP, oldVia, oldDev); err != nil {
+			log.Printf("bonding: warning: could not add host route for server: %v", err)
 		} else {
-			if useAddRoute {
-				_ = common.DeleteHostRoute6(routeTarget)
-			}
-			for _, iface := range cfg.Ifaces {
-				gw6, err := platform.GatewayForIface6(runner, iface)
-				if err != nil || gw6 == "" {
-					continue
-				}
-				if err := addHostRoute6(routeTarget, gw6, iface, useAddRoute); err != nil {
-					log.Printf("bonding: warning: host route v6 via %s/%s failed: %v", iface, gw6, err)
-					continue
-				}
-				routesAdded++
-			}
-			if routesAdded == 0 {
-				if err := addHostRoute6(routeTarget, via6, dev6, useAddRoute); err != nil {
-					return nil, nil, fmt.Errorf("host route v6 to server failed: %w", err)
-				}
-				routesAdded++
-			}
+			vlogf("bonding: added host route for %s via %s/%s", serverIP, oldVia, oldDev)
 		}
-		if runtime.GOOS == "windows" {
-			gw := defaultGatewayIP(clientIP)
-			if err := common.SetDefaultRouteDevWithGateway(tun.Name(), gw); err != nil {
-				if serverIsV4 {
-					_ = common.DeleteHostRoute(routeTarget)
-				} else {
-					_ = common.DeleteHostRoute6(routeTarget)
-				}
-				_ = state.tun.Close()
-				cancel()
-				return nil, nil, fmt.Errorf("set default route: %w", err)
-			}
-		} else if err := common.SetDefaultRouteDev(tun.Name()); err != nil {
-			if serverIsV4 {
-				_ = common.DeleteHostRoute(routeTarget)
-			} else {
-				_ = common.DeleteHostRoute6(routeTarget)
-			}
-			_ = state.tun.Close()
-			cancel()
-			return nil, nil, fmt.Errorf("set default route: %w", err)
-		}
-		if enableIPv6 {
-			if err := common.SetDefaultRouteDev6(tun.Name()); err != nil {
-				log.Printf("bonding: warning: failed to set IPv6 default via TUN: %v", err)
-			}
-		}
-		state.revertRoute = func() {
-			_ = common.ReplaceDefaultRoute(oldRoute)
-			if enableIPv6 && oldRoute6 != "" {
-				_ = common.ReplaceDefaultRoute6(oldRoute6)
-			}
-			if serverIsV4 {
-				_ = common.DeleteHostRoute(routeTarget)
-			} else {
-				_ = common.DeleteHostRoute6(routeTarget)
-			}
-		}
+	}
+
+	// Set default route via TUN
+	// On Windows, use on-link routing (no explicit gateway) for TUN point-to-point
+	if err := common.SetDefaultRouteDev(tun.Name()); err != nil {
+		log.Printf("bonding: warning: could not set default route via TUN: %v", err)
 	} else {
-		vlogf("bonding: loopback server detected (%s); skipping route changes and iface binding for testing", serverUDP.String())
+		vlogf("bonding: set default route via %s (on-link)", tun.Name())
 	}
-
-	numConns := len(cfg.Ifaces)
-	for i := 0; i < numConns; i++ {
-		iface := pickIndex(cfg.Ifaces, i)
-		ip := pickIndex(cfg.IPs, i)
-		if isLoopback {
-			iface = ""
-			ip = ""
+	if enableIPv6 && clientIPv6 != "" {
+		if err := common.SetDefaultRouteDev6(tun.Name()); err != nil {
+			log.Printf("bonding: warning: could not set IPv6 default route via TUN: %v", err)
 		}
-		cc := &clientConn{addr: serverUDP, iface: iface, localIP: ip}
-		cc.ifaceUp.Store(ifaceUp(iface))
-		state.connMu.Lock()
-		state.conns = append(state.conns, cc)
-		state.connMu.Unlock()
-		state.wg.Add(1)
-		go state.readLoop(cc)
 	}
 
-	if runtime.GOOS == "linux" && !isLoopback && routeTarget != "" {
-		state.wg.Add(1)
-		go state.routeMonitor(routeTarget, cfg.Ifaces, serverIsV4, fallbackVia, fallbackDev, fallbackVia6, fallbackDev6)
+	// Save revert function
+	state.revertRoute = func() {
+		vlogf("bonding: restoring original routes")
+		if oldRoute != "" {
+			if err := common.ReplaceDefaultRoute(oldRoute); err != nil {
+				log.Printf("bonding: warning: could not restore default route: %v", err)
+			}
+		}
+		if enableIPv6 && oldRoute6 != "" {
+			if err := common.ReplaceDefaultRoute6(oldRoute6); err != nil {
+				log.Printf("bonding: warning: could not restore IPv6 default route: %v", err)
+			}
+		}
+		// Remove host route for server
+		if serverIP != "" {
+			_ = common.DeleteHostRoute(serverIP)
+		}
 	}
+	// Suppress unused variable warnings
+	_, _, _ = oldVia6, oldDev6, oldRoute6
 
-	// Worker pool for TUN -> UDP
-	numWorkers := runtime.NumCPU()
-	workCh := make(chan []byte, numWorkers*10)
+	// Create single MP-QUIC connection for multipath bonding
+	cc := &clientConn{addr: serverAddr, iface: "multipath"}
+	cc.alive.Store(true)
+	state.connMu.Lock()
+	state.conns = append(state.conns, cc)
+	state.connMu.Unlock()
 
+	// Start MP-QUIC read loop (handles datagram reception)
 	state.wg.Add(1)
+	go state.mpquicReadLoop(cc)
+
+	// Start heartbeat loop (server alive + RTT/jitter sampling)
+	state.wg.Add(1)
+	go state.heartbeatLoop(cc)
+
+	// Start TUN write loop
 	go state.tunWriteLoop()
 
-	state.wg.Add(1)
+	// Start TUN reader with worker pool for sending
+	workCh := make(chan []byte, 256)
 	go state.tunReader(workCh)
-
+	numWorkers := runtime.NumCPU()
+	if numWorkers < 2 {
+		numWorkers = 2
+	}
 	for i := 0; i < numWorkers; i++ {
 		state.wg.Add(1)
 		go state.workerLoop(workCh)
 	}
 
-	state.wg.Add(1)
-	go state.heartbeat()
-
 	stop := func() {
 		cancel()
-		if state.stopInReorder != nil {
-			close(state.stopInReorder)
-		}
-		state.connMu.Lock()
-		for _, c := range state.conns {
-			c.mu.Lock()
-			if c.udp != nil {
-				_ = c.udp.Close()
-				c.udp = nil
-			}
-			c.mu.Unlock()
-		}
-		state.connMu.Unlock()
-		if state.tun != nil {
-			_ = state.tun.Close()
-		}
-		state.wg.Wait()
-		if state.inReorder != nil {
-			state.inReorder.Close()
-			state.inReorder = nil
+		telemetryStop()
+		close(state.stopInReorder)
+		if state.revertRoute != nil {
+			state.revertRoute()
 		}
 		if state.revertDNS != nil {
 			state.revertDNS()
 		}
-		if len(state.ifaceDNS) > 0 {
-			restoreIfaceDNS(state.ifaceDNS)
+		restoreIfaceDNS(state.ifaceDNS)
+		if state.tun != nil {
+			_ = state.tun.Close()
 		}
-		if state.revertRoute != nil {
-			state.revertRoute()
-		}
+		state.closeAllConns()
+		state.wg.Wait()
 	}
 	return state, stop, nil
 }
@@ -489,7 +505,7 @@ func (c *clientState) reconnectLoop() {
 		default:
 		}
 		vlogf("bonding: reconnecting control plane...")
-		key, sessID, udpPort, clientIP, clientIPv6, err := fetchSession(c.ctrlAddr, c.cfg)
+		sessID, dataPort, clientIP, clientIPv6, err := fetchSession(c.ctrlAddr, c.cfg)
 		if err != nil {
 			vlogf("bonding: control reconnect failed: %v", err)
 			if !sleepWithContext(c.ctx, backoff) {
@@ -498,7 +514,7 @@ func (c *clientState) reconnectLoop() {
 			backoff = nextBackoff(backoff)
 			continue
 		}
-		if err := c.updateSession(key, sessID, udpPort, clientIP, clientIPv6); err != nil {
+		if err := c.updateSession(sessID, dataPort, clientIP, clientIPv6); err != nil {
 			log.Printf("bonding: session update failed: %v", err)
 			if !sleepWithContext(c.ctx, backoff) {
 				return
@@ -512,21 +528,17 @@ func (c *clientState) reconnectLoop() {
 	}
 }
 
-func (c *clientState) updateSession(key []byte, sessID uint32, udpPort int, clientIP, clientIPv6 string) error {
+func (c *clientState) updateSession(sessID uint32, dataPort int, clientIP, clientIPv6 string) error {
 	host, _, err := net.SplitHostPort(c.ctrlAddr)
 	if err != nil {
 		host = c.ctrlAddr
 	}
-	serverUDP, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, fmt.Sprintf("%d", udpPort)))
-	if err != nil {
-		return err
-	}
+	serverAddr := net.JoinHostPort(host, fmt.Sprintf("%d", dataPort))
 	c.sessMu.Lock()
 	oldIP := c.clientIP
 	oldIPv6 := c.clientIPv6
-	c.sessionKey = key
 	c.sessionID = sessID
-	c.serverUDP = serverUDP
+	c.serverAddr = serverAddr
 	c.clientIP = clientIP
 	c.clientIPv6 = clientIPv6
 	c.sessMu.Unlock()
@@ -548,26 +560,14 @@ func (c *clientState) resetConns(reason string) {
 	defer c.connMu.RUnlock()
 	for _, cc := range c.conns {
 		cc.mu.Lock()
-		udp := cc.udp
+		qc := cc.quicConn
 		cc.mu.Unlock()
-		if udp != nil {
+		if qc != nil {
 			c.setConnState(cc, false, reason)
-			c.closeConn(cc, udp)
+			_ = qc.CloseWithError(0, reason)
 		}
 		cc.lastRecv.Store(0)
 	}
-}
-
-func (c *clientState) sessionSnapshot() ([]byte, uint32, *net.UDPAddr) {
-	c.sessMu.RLock()
-	defer c.sessMu.RUnlock()
-	return c.sessionKey, c.sessionID, c.serverUDP
-}
-
-func (c *clientState) sessionServer() *net.UDPAddr {
-	c.sessMu.RLock()
-	defer c.sessMu.RUnlock()
-	return c.serverUDP
 }
 
 func (c *clientState) routeMonitor(routeTarget string, ifaces []string, serverIsV4 bool, fallbackVia, fallbackDev, fallbackVia6, fallbackDev6 string) {
@@ -667,11 +667,15 @@ func sleepWithContext(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-func (c *clientState) closeConn(cc *clientConn, udp *net.UDPConn) {
+func (c *clientState) closeConn(cc *clientConn) {
 	cc.mu.Lock()
-	if cc.udp == udp {
-		_ = cc.udp.Close()
-		cc.udp = nil
+	if cc.quicConn != nil {
+		_ = cc.quicConn.CloseWithError(0, "close")
+		cc.quicConn = nil
+	}
+	if cc.packetConn != nil {
+		_ = cc.packetConn.Close()
+		cc.packetConn = nil
 	}
 	cc.mu.Unlock()
 }
@@ -680,12 +684,11 @@ func (c *clientState) resetConnTelemetry(cc *clientConn) {
 	cc.hbSent.Store(0)
 	cc.hbRecv.Store(0)
 	cc.jitterNano.Store(0)
-	cc.lastRTTSample.Store(0)
 	cc.rttNano.Store(0)
 }
 
 func (c *clientState) updateConnRTT(cc *clientConn, sample time.Duration) {
-	prev := cc.lastRTTSample.Load()
+	prev := cc.rttNano.Load()
 	if prev > 0 {
 		delta := sample - time.Duration(prev)
 		if delta < 0 {
@@ -695,20 +698,7 @@ func (c *clientState) updateConnRTT(cc *clientConn, sample time.Duration) {
 		j += (delta - j) / 16
 		cc.jitterNano.Store(int64(j))
 	}
-	cc.lastRTTSample.Store(int64(sample))
 	cc.rttNano.Store(int64(sample))
-}
-
-func dialUDPWithFallback(server *net.UDPAddr, iface, ip string) (*net.UDPConn, string, error) {
-	udp, err := dialUDP(server, iface, ip)
-	if err == nil || ip == "" {
-		return udp, ip, err
-	}
-	udp, err = dialUDP(server, iface, "")
-	if err != nil {
-		return nil, ip, err
-	}
-	return udp, "", nil
 }
 
 func isIPPacket(pkt []byte) bool {
@@ -723,206 +713,6 @@ func isIPPacket(pkt []byte) bool {
 		return len(pkt) >= 40
 	default:
 		return false
-	}
-}
-
-func (c *clientState) readLoop(cc *clientConn) {
-	defer c.wg.Done()
-	// Reuse buffer for reading UDP packets.
-	buf := common.GetBuffer()
-	defer common.PutBuffer(buf)
-	backoff := bondingDialBackoff
-
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		default:
-		}
-		cc.mu.Lock()
-		udp := cc.udp
-		cc.mu.Unlock()
-		if udp == nil {
-			up := ifaceUp(cc.iface)
-			c.setIfaceState(cc, up)
-			if !up {
-				c.setConnState(cc, false, "interface down")
-				if !sleepWithContext(c.ctx, backoff) {
-					return
-				}
-				continue
-			}
-			server := c.sessionServer()
-			if server == nil {
-				c.setConnState(cc, false, "no server")
-				if !sleepWithContext(c.ctx, backoff) {
-					return
-				}
-				backoff = nextBackoff(backoff)
-				continue
-			}
-			udp, usedIP, err := dialUDPWithFallback(server, cc.iface, cc.localIP)
-			if err != nil {
-				c.setConnState(cc, false, "dial error")
-				vlogf("conn %s dial err: %v", cc.iface, err)
-				if !sleepWithContext(c.ctx, backoff) {
-					return
-				}
-				backoff = nextBackoff(backoff)
-				continue
-			}
-			cc.localIP = usedIP
-			backoff = bondingDialBackoff
-			cc.mu.Lock()
-			cc.udp = udp
-			cc.mu.Unlock()
-			c.resetConnTelemetry(cc)
-			cc.lastConn.Store(time.Now().UnixNano())
-			c.setConnState(cc, true, "connected")
-			c.sendHandshake(cc)
-		}
-
-		cc.mu.Lock()
-		udp = cc.udp
-		cc.mu.Unlock()
-		if udp == nil {
-			continue
-		}
-		_ = udp.SetReadDeadline(time.Now().Add(2 * time.Second))
-		n, err := udp.Read(buf)
-		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				select {
-				case <-c.ctx.Done():
-					return
-				default:
-					continue
-				}
-			}
-			c.setConnState(cc, false, "read error")
-			vlogf("conn %s read err: %v", cc.iface, err)
-			c.closeConn(cc, udp)
-			continue
-		}
-
-		cc.lastRecv.Store(time.Now().UnixNano())
-		c.setConnState(cc, true, "traffic")
-
-		// Decrypt into a separate buffer to avoid invalid overlap (panic).
-		plainBuf := common.GetBuffer()
-		key, _, _ := c.sessionSnapshot()
-		if len(key) == 0 {
-			common.PutBuffer(plainBuf)
-			continue
-		}
-		h, payload, err := common.DecryptPacketInto(plainBuf, key, buf[:n])
-		if err != nil {
-			common.PutBuffer(plainBuf)
-			continue
-		}
-		cc.bytesRecv.Add(uint64(len(payload)))
-
-		switch h.Type {
-		case common.PacketHeartbeat:
-			var hb common.HeartbeatPayload
-			if err := hb.Unmarshal(payload); err == nil {
-				c.updateConnRTT(cc, common.CalcRTT(hb.SendTime))
-				cc.hbRecv.Add(1)
-			}
-			common.PutBuffer(plainBuf)
-		case common.PacketIP:
-			// In bonding mode we do packet-level striping on server->client too.
-			// That implies out-of-order delivery is normal and must be reordered here.
-			//
-			// Ownership rules:
-			// - We must end with a pool-backed buffer containing the IP payload.
-			// - We transfer ownership of that buffer to the reorder buffer.
-			// - Only packets returned by Insert/FlushTimeout are enqueued to TUN and will be PutBuffer()'d by tunWriteLoop.
-			var dataBuf []byte
-			var data []byte
-			if h.Reserved[0] == common.CompressionGzip {
-				outBuf := common.GetBuffer()
-				dec, err := common.DecompressPayloadInto(outBuf, payload, common.MaxPacketSize)
-				if err != nil {
-					log.Printf("decompress err: %v", err)
-					common.PutBuffer(outBuf)
-					common.PutBuffer(plainBuf)
-					continue
-				}
-				dataBuf = outBuf
-				data = dec
-				// We no longer need the compressed plaintext buffer.
-				common.PutBuffer(plainBuf)
-			} else {
-				dataBuf = plainBuf
-				data = plainBuf[:len(payload)]
-			}
-
-			if !isIPPacket(data) {
-				c.inReorderStats.packetsDropped.Add(1)
-				common.PutBuffer(dataBuf)
-				continue
-			}
-			if c.inReorder == nil {
-				// Fallback (should not happen in bonding mode, but keep safe).
-				c.enqueueTunWrite(dataBuf[:len(data)])
-				continue
-			}
-			if len(c.inReorder.packets) > 0 {
-				c.inReorderStats.packetsBuffered.Add(1)
-			}
-			ordered := c.inReorder.Insert(h.SeqNum, dataBuf[:len(data)])
-			// If we delivered more than one, it implies out-of-order buffering happened.
-			if len(ordered) > 1 {
-				c.inReorderStats.packetsReordered.Add(1)
-			}
-			// Track max depth (best-effort, racy read is fine for stats).
-			if d := uint32(len(c.inReorder.packets)); d > 0 {
-				if cur := c.inReorderStats.maxDepth.Load(); d > cur {
-					c.inReorderStats.maxDepth.Store(d)
-				}
-			}
-			for _, p := range ordered {
-				c.enqueueTunWrite(p)
-			}
-		default:
-			common.PutBuffer(plainBuf)
-		}
-	}
-}
-
-func (c *clientState) enqueueTunWrite(buf []byte) {
-	if len(buf) == 0 {
-		common.PutBuffer(buf)
-		return
-	}
-	select {
-	case <-c.ctx.Done():
-		common.PutBuffer(buf)
-	case c.tunWriteCh <- buf:
-	default:
-		vlogf("tun: drop inbound len=%d", len(buf))
-		common.PutBuffer(buf)
-	}
-}
-
-func (c *clientState) tunWriteLoop() {
-	defer c.wg.Done()
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case buf := <-c.tunWriteCh:
-			if c.tun == nil {
-				common.PutBuffer(buf)
-				continue
-			}
-			if _, err := c.tun.Write(buf); err != nil {
-				log.Printf("tun write err: %v", err)
-			}
-			common.PutBuffer(buf)
-		}
 	}
 }
 
@@ -962,460 +752,6 @@ func restoreIfaceDNS(backups []ifaceDNSBackup) {
 	}
 }
 
-func (c *clientState) tunReader(workCh chan<- []byte) {
-	defer c.wg.Done()
-	defer close(workCh)
-	for {
-		// Allocate buffer for new packet
-		buf := common.GetBuffer()
-		n, err := c.tun.Read(buf)
-		if err != nil {
-			common.PutBuffer(buf)
-			select {
-			case <-c.ctx.Done():
-				return
-			default:
-				log.Printf("tun read err: %v", err)
-				continue
-			}
-		}
-		if n == 0 {
-			common.PutBuffer(buf)
-			continue
-		}
-		pkt := buf[:n]
-		if !isIPPacket(pkt) {
-			vlogf("tun: dropping non-ip packet len=%d", n)
-			common.PutBuffer(buf)
-			continue
-		}
-		// Send valid slice to worker
-		select {
-		case workCh <- pkt:
-		case <-c.ctx.Done():
-			common.PutBuffer(buf)
-			return
-		}
-	}
-}
-
-func (c *clientState) workerLoop(workCh <-chan []byte) {
-	defer c.wg.Done()
-	for payload := range workCh {
-		c.processAndSend(payload)
-		// Return buffer to pool after processing
-		// payload is a slice of the buffer from GetBuffer (resliced in tunReader)
-		// We need to recover the original capacity-sized slice to Put properly?
-		// common.PutBuffer handles checking capacity.
-		// But payload is `buf[:n]`. `cap(payload)` should be `PoolBufSize`.
-		// So passing payload to PutBuffer is fine.
-		common.PutBuffer(payload)
-	}
-}
-
-func (c *clientState) processAndSend(data []byte) {
-	// Dynamic compression
-	compressed := data
-	compressFlag := common.CompressionNone
-
-	attempts := c.compStats.attempts.Load()
-	sampleSize := uint64(c.compStats.sampleSize.Load())
-	if sampleSize == 0 {
-		sampleSize = 10
-	}
-
-	// Sampling phase: first 10 packets
-	// Note: we only increment attempts when compression is enabled.
-	// If compression was disabled, attempts will stop increasing and we won't re-decide.
-	if attempts < sampleSize {
-		c.compStats.samplingPhase.Store(true)
-		c.compStats.enabled.Store(true) // Try compression during sampling
-	} else if attempts == sampleSize {
-		// Decision phase: check if compression is beneficial
-		savings := c.compStats.savings.Load()
-		if savings <= 0 {
-			c.compStats.enabled.Store(false)
-			vlogf("compression: disabled (savings=%d bytes after %d attempts)", savings, attempts)
-		} else {
-			c.compStats.enabled.Store(true)
-			vlogf("compression: enabled (savings=%d bytes after %d attempts)", savings, attempts)
-		}
-		c.compStats.samplingPhase.Store(false)
-	}
-
-	// If compression is disabled, but we haven't reached 10 attempts yet,
-	// keep moving attempts forward so the decision logic can't get stuck.
-	if !c.compStats.enabled.Load() && attempts < sampleSize {
-		c.compStats.attempts.Add(1)
-	}
-
-	// Try compression if enabled
-	var compBuf []byte
-	usedComp := false
-
-	if c.compStats.enabled.Load() {
-		compBuf = common.GetBuffer()
-		if comp, err := common.CompressPayloadInto(compBuf, data); err == nil {
-			savingsThisPacket := int64(len(data) - len(comp))
-			c.compStats.savings.Add(savingsThisPacket)
-			c.compStats.attempts.Add(1)
-
-			if len(comp) < len(data) {
-				compressed = comp
-				compressFlag = common.CompressionGzip
-				usedComp = true
-			} else {
-				// Compression made it larger, don't use it
-				common.PutBuffer(compBuf)
-			}
-		} else {
-			common.PutBuffer(compBuf)
-		}
-	}
-
-	if usedComp {
-		defer common.PutBuffer(compBuf)
-	}
-
-	seq := c.nextSeqSend.Add(1)
-	cc := c.pickConnForPacket(data)
-	if cc == nil {
-		return
-	}
-
-	key, sessID, _ := c.sessionSnapshot()
-	if len(key) == 0 || sessID == 0 {
-		return
-	}
-	head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketIP, SessionID: sessID, SeqNum: seq, Length: uint16(len(compressed))}
-	head.Reserved[0] = byte(compressFlag)
-
-	// Encrypt into new packet buffer
-	pktBuf := common.GetBuffer()
-	defer common.PutBuffer(pktBuf)
-
-	pkt, err := common.EncryptPacketInto(pktBuf, key, head, compressed)
-	if err != nil {
-		return
-	}
-
-	cc.mu.Lock()
-	if cc.udp != nil {
-		_, _ = cc.udp.Write(pkt)
-	}
-	cc.mu.Unlock()
-	cc.bytesSent.Add(uint64(len(data)))
-}
-
-// pickConnForPacket selects a connection for a packet.
-// In bonding mode this is flow-based: packets from the same 5-tuple flow
-// are pinned to the same conn to avoid TCP collapse due to reordering.
-// If flow key cannot be extracted, it falls back to the weighted scheduler.
-func (c *clientState) pickConnForPacket(pkt []byte) *clientConn {
-	if c.mode != modeBonding {
-		return c.pickBestConn()
-	}
-	key, ok := common.FlowKeyFromIPPacket(pkt)
-	if !ok {
-		return c.pickBestConn()
-	}
-
-	// First: if we already pinned this flow, try to use the same conn if still alive.
-	c.flowMu.Lock()
-	if c.flowToConn == nil {
-		c.flowToConn = make(map[common.FlowKey]*clientConn)
-	}
-	if cc, exists := c.flowToConn[key]; exists {
-		if cc != nil && cc.alive.Load() {
-			c.flowMu.Unlock()
-			return cc
-		}
-		delete(c.flowToConn, key)
-	}
-	c.flowMu.Unlock()
-
-	// Pick a new conn for this flow using the (phase1) strict scheduler.
-	cc := c.pickBestConn()
-	if cc == nil {
-		return nil
-	}
-	c.flowMu.Lock()
-	c.flowToConn[key] = cc
-	c.flowMu.Unlock()
-	return cc
-}
-
-func (c *clientState) pickBestConn() *clientConn {
-	c.connMu.RLock()
-	if len(c.conns) == 0 {
-		c.connMu.RUnlock()
-		return nil
-	}
-	mode := c.mode
-	conns := append([]*clientConn(nil), c.conns...)
-	c.connMu.RUnlock()
-
-	if mode == modeBonding {
-		return c.pickWeightedConn(conns)
-	}
-	// load-balance: pick lowest RTT alive
-	var best *clientConn
-	bestRTT := time.Duration(1<<63 - 1)
-	for _, cand := range conns {
-		if !cand.alive.Load() {
-			continue
-		}
-		rtt := time.Duration(cand.rttNano.Load())
-		if rtt == 0 {
-			rtt = 500 * time.Millisecond
-		}
-		if rtt < bestRTT {
-			bestRTT = rtt
-			best = cand
-		}
-	}
-	if best != nil {
-		return best
-	}
-	return conns[0]
-}
-
-func (c *clientState) pickWeightedConn(conns []*clientConn) *clientConn {
-	// Phase 1: strict bad-link exclusion to avoid single-flow TCP collapse.
-	// We still use deficit RR among eligible links, but we do not "trickle"
-	// traffic to bad links.
-	const minShare = 0.15
-
-	// Derive adaptive thresholds from reorder flush timeout.
-	flush := c.cfg.ReorderFlushTimeout
-	if flush <= 0 {
-		flush = 50 * time.Millisecond
-	}
-	// Strict thresholds: in real-world mixed links (ETH vs 5G hotspot)
-	// even a small share on a high-RTT/high-jitter link destroys throughput.
-	maxJitter := clampDuration(time.Duration(float64(flush)*0.3), 10*time.Millisecond, 25*time.Millisecond)
-	maxRttRatio := 1.5
-	maxLossPct := 2.0
-
-	alive := make([]*clientConn, 0, len(conns))
-	for _, cc := range conns {
-		if cc.alive.Load() {
-			alive = append(alive, cc)
-		}
-	}
-	if len(alive) == 0 {
-		return nil
-	}
-	if len(alive) == 1 {
-		return alive[0]
-	}
-
-	// Find min RTT among alive
-	minRTT := 500 * time.Millisecond
-	for _, cc := range alive {
-		rtt := time.Duration(cc.rttNano.Load())
-		if rtt > 0 && rtt < minRTT {
-			minRTT = rtt
-		}
-	}
-
-	good := make([]*clientConn, 0, len(alive))
-	// Keep bad for potential logging/metrics later, but we never schedule them.
-	bad := make([]*clientConn, 0, len(alive))
-	for _, cc := range alive {
-		rtt := time.Duration(cc.rttNano.Load())
-		if rtt <= 0 {
-			rtt = 500 * time.Millisecond
-		}
-		jitter := time.Duration(cc.jitterNano.Load())
-		loss := lossPercent(cc.hbSent.Load(), cc.hbRecv.Load())
-		lossPct := 0.0
-		if loss.ok {
-			lossPct = loss.percent
-		}
-		isBad := jitter > maxJitter || float64(rtt) > float64(minRTT)*maxRttRatio || lossPct > maxLossPct
-		if isBad {
-			bad = append(bad, cc)
-		} else {
-			good = append(good, cc)
-		}
-	}
-
-	// If everything is bad (e.g. initial RTT unknown), pick the best-RTT alive.
-	if len(good) == 0 {
-		var best *clientConn
-		bestRTT := time.Duration(1<<63 - 1)
-		for _, cc := range alive {
-			rtt := time.Duration(cc.rttNano.Load())
-			if rtt <= 0 {
-				rtt = 500 * time.Millisecond
-			}
-			if rtt < bestRTT {
-				bestRTT = rtt
-				best = cc
-			}
-		}
-		if best != nil {
-			return best
-		}
-		return alive[0]
-	}
-
-	// Compute weights for good conns: base floor + quality weight.
-	// Use stabilityScore (0..100) and rtt.
-	weights := make(map[*clientConn]float64, len(good))
-	for _, cc := range good {
-		rttMs := float64(time.Duration(cc.rttNano.Load())) / float64(time.Millisecond)
-		if rttMs <= 0 {
-			rttMs = 500
-		}
-		jitterMs := float64(time.Duration(cc.jitterNano.Load())) / float64(time.Millisecond)
-		loss := lossPercent(cc.hbSent.Load(), cc.hbRecv.Load())
-		lossPct := 0.0
-		if loss.ok {
-			lossPct = loss.percent
-		}
-		score := stabilityScore(lossPct, jitterMs, rttMs)
-		// Weight favors higher score and lower RTT.
-		weights[cc] = (score + 1.0) / (rttMs + 10.0)
-	}
-
-	// Normalize weights for the "remaining" share after floors.
-	remaining := 1.0 - minShare*float64(len(good))
-	if remaining < 0 {
-		remaining = 0
-	}
-	var wsum float64
-	for _, w := range weights {
-		wsum += w
-	}
-
-	final := make(map[*clientConn]float64, len(good))
-	for cc, w := range weights {
-		share := minShare
-		if remaining > 0 && wsum > 0 {
-			share += remaining * (w / wsum)
-		}
-		final[cc] = share
-	}
-
-	// Deficit round-robin step.
-	c.schedMu.Lock()
-	defer c.schedMu.Unlock()
-	if c.schedDeficit == nil {
-		c.schedDeficit = make(map[*clientConn]float64)
-	}
-	for cc, share := range final {
-		c.schedDeficit[cc] += share
-	}
-	_ = bad
-	var best *clientConn
-	bestDef := -1e18
-	for cc := range final {
-		if c.schedDeficit[cc] > bestDef {
-			bestDef = c.schedDeficit[cc]
-			best = cc
-		}
-	}
-	if best == nil {
-		return good[0]
-	}
-	c.schedDeficit[best] -= 1.0
-	return best
-}
-
-func clampDuration(v, minV, maxV time.Duration) time.Duration {
-	if v < minV {
-		return minV
-	}
-	if v > maxV {
-		return maxV
-	}
-	return v
-}
-
-func (c *clientState) sendHandshake(cc *clientConn) {
-	key, sessID, _ := c.sessionSnapshot()
-	if len(key) == 0 || sessID == 0 {
-		return
-	}
-	head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketHandshake, SessionID: sessID, SeqNum: 0, Length: 0}
-	pkt, err := common.EncryptPacket(key, head, nil)
-	if err != nil {
-		return
-	}
-	cc.mu.Lock()
-	if cc.udp != nil {
-		_, _ = cc.udp.Write(pkt)
-	}
-	cc.mu.Unlock()
-}
-
-func (c *clientState) heartbeat() {
-	defer c.wg.Done()
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		now := time.Now()
-		key, sessID, _ := c.sessionSnapshot()
-		if len(key) == 0 || sessID == 0 {
-			continue
-		}
-		hb := common.HeartbeatPayload{SendTime: common.NowMonoNano()}
-		payload := hb.Marshal()
-		c.connMu.RLock()
-		anyAlive := false
-		for _, cc := range c.conns {
-			up := ifaceUp(cc.iface)
-			c.setIfaceState(cc, up)
-			if !up {
-				c.setConnState(cc, false, "interface down")
-			}
-			if last := cc.lastRecv.Load(); last > 0 && now.Sub(time.Unix(0, last)) > bondingDeadAfter {
-				c.setConnState(cc, false, "timeout")
-				cc.mu.Lock()
-				udp := cc.udp
-				cc.mu.Unlock()
-				if udp != nil {
-					c.closeConn(cc, udp)
-				}
-			} else if last == 0 {
-				if connAt := cc.lastConn.Load(); connAt > 0 && now.Sub(time.Unix(0, connAt)) > bondingDeadAfter {
-					c.setConnState(cc, false, "no response")
-					cc.mu.Lock()
-					udp := cc.udp
-					cc.mu.Unlock()
-					if udp != nil {
-						c.closeConn(cc, udp)
-					}
-				}
-			}
-			if cc.alive.Load() {
-				anyAlive = true
-			}
-			head := common.PacketHeader{Version: common.ProtoVersion, Type: common.PacketHeartbeat, SessionID: sessID, SeqNum: 0, Length: uint16(len(payload))}
-			if pkt, err := common.EncryptPacket(key, head, payload); err == nil {
-				cc.mu.Lock()
-				if cc.udp != nil {
-					_, _ = cc.udp.Write(pkt)
-					cc.hbSent.Add(1)
-				}
-				cc.mu.Unlock()
-			}
-		}
-		c.connMu.RUnlock()
-		c.setServerState(anyAlive)
-		if !anyAlive {
-			c.ensureReconnect()
-		}
-	}
-}
-
 func parseServerAddr(server string, ctrlPort int) (host string, port int, err error) {
 	host, portStr, err := net.SplitHostPort(server)
 	if err != nil {
@@ -1434,10 +770,10 @@ func parseServerAddr(server string, ctrlPort int) (host string, port int, err er
 	return host, p, nil
 }
 
-func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, string, string, error) {
+func fetchSession(ctrlAddr string, cfg clientConfig) (uint32, int, string, string, error) {
 	tlsCfg, err := clientTLSConfig(cfg)
 	if err != nil {
-		return nil, 0, 0, "", "", err
+		return 0, 0, "", "", err
 	}
 	if host, _, herr := net.SplitHostPort(ctrlAddr); herr == nil {
 		c := tlsCfg.Clone()
@@ -1449,7 +785,7 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 
 	tcpConn, err := (&net.Dialer{}).DialContext(ctx, "tcp", ctrlAddr)
 	if err != nil {
-		return nil, 0, 0, "", "", classifyTLSError(err)
+		return 0, 0, "", "", classifyTLSError(err)
 	}
 	conn := tls.Client(tcpConn, tlsCfg)
 	deadline := time.Now().Add(controlTimeout)
@@ -1457,7 +793,7 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 
 	if err := conn.Handshake(); err != nil {
 		_ = conn.Close()
-		return nil, 0, 0, "", "", classifyTLSError(err)
+		return 0, 0, "", "", classifyTLSError(err)
 	}
 	defer func(conn *tls.Conn) {
 		_ = conn.Close()
@@ -1466,22 +802,18 @@ func fetchSession(ctrlAddr string, cfg clientConfig) ([]byte, uint32, int, strin
 	req := common.ControlRequest{}
 	buf, _ := req.Marshal()
 	if _, err := conn.Write(buf); err != nil {
-		return nil, 0, 0, "", "", err
+		return 0, 0, "", "", err
 	}
 	_ = conn.CloseWrite()
 	respData, err := io.ReadAll(conn)
 	if err != nil {
-		return nil, 0, 0, "", "", err
+		return 0, 0, "", "", err
 	}
 	var resp common.ControlResponse
 	if err := resp.Unmarshal(respData); err != nil {
-		return nil, 0, 0, "", "", err
+		return 0, 0, "", "", err
 	}
-	key, err := common.DecodeKeyBase64(resp.SessionKey)
-	if err != nil {
-		return nil, 0, 0, "", "", err
-	}
-	return key, resp.SessionID, resp.UDPPort, resp.ClientIP, resp.ClientIPv6, nil
+	return resp.SessionID, resp.DataPort, resp.ClientIP, resp.ClientIPv6, nil
 }
 
 func addIPv6CIDR(ip string) string {
@@ -1536,22 +868,14 @@ func clientTLSConfig(cfg clientConfig) (*tls.Config, error) {
 	bundlePath := cfg.Cert
 	if bundlePath == "" {
 		var err error
-		bundlePath, err = detectClientBundlePath(cfg.PKI)
+		bundlePath, err = common.DetectClientBundlePath(cfg.PKI)
 		if err != nil {
 			return nil, err
 		}
 	} else {
-		bundlePath = expandPath(bundlePath)
+		bundlePath = common.ExpandPath(bundlePath)
 	}
-	caPool, cert, err := parseBundlePEM(bundlePath)
-	if err != nil {
-		return nil, err
-	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-		RootCAs:      caPool,
-		MinVersion:   tls.VersionTLS12,
-	}, nil
+	return common.LoadClientBundle(bundlePath)
 }
 
 func dialUDP(server *net.UDPAddr, iface, ip string) (*net.UDPConn, error) {
@@ -1764,4 +1088,371 @@ func (c *clientState) connRates(cc *clientConn, tx, rx uint64, now time.Time) (f
 	rate.lastRx = rx
 	rate.lastAt = now
 	return rate.rateTxK, rate.rateRxK
+}
+
+// ============================================================================
+// MP-QUIC Functions
+// ============================================================================
+
+// mpquicReadLoop handles incoming QUIC datagrams (replaces old readLoop with UDP)
+func (c *clientState) mpquicReadLoop(cc *clientConn) {
+	defer c.wg.Done()
+	backoff := bondingDialBackoff
+
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		default:
+		}
+
+		cc.mu.Lock()
+		qc := cc.quicConn
+		cc.mu.Unlock()
+
+		if qc == nil {
+			// Dial QUIC multipath connection
+			vlogf("bonding: dialing QUIC multipath to %s", c.serverAddr)
+			conn, pconn, mpCtrl, err := dialQUICMultipath(c.ctx, c.serverAddr, c.cfg)
+			if err != nil {
+				vlogf("bonding: QUIC dial failed: %v, retry in %v", err, backoff)
+				if !sleepWithContext(c.ctx, backoff) {
+					return
+				}
+				backoff = nextBackoff(backoff)
+				continue
+			}
+			cc.mu.Lock()
+			cc.quicConn = conn
+			cc.packetConn = pconn
+			cc.mu.Unlock()
+			c.mpController = mpCtrl
+			cc.alive.Store(true)
+			c.serverAlive.Store(true)
+			backoff = bondingDialBackoff
+			vlogf("bonding: QUIC multipath connected")
+			qc = conn
+
+			// Give QUIC time to stabilize before receiving
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		// Receive datagram from QUIC connection
+		dat, err := qc.ReceiveDatagram(c.ctx)
+		if err != nil {
+			vlogf("bonding: QUIC receive error: %v", err)
+			cc.mu.Lock()
+			if cc.quicConn != nil {
+				_ = cc.quicConn.CloseWithError(0, "receive error")
+				if cc.packetConn != nil {
+					_ = cc.packetConn.Close()
+				}
+			}
+			cc.quicConn = nil
+			cc.packetConn = nil
+			cc.mu.Unlock()
+			cc.alive.Store(false)
+			c.serverAlive.Store(false)
+			continue
+		}
+
+		// Parse DataPlane datagram
+		h, payload, err := common.ParseDataPlaneDatagram(dat)
+		if err != nil {
+			vlogf("bonding: parse datagram error: %v", err)
+			continue
+		}
+
+		cc.bytesRecv.Add(uint64(len(payload)))
+		cc.lastRecv.Store(time.Now().UnixNano())
+
+		switch h.Type {
+		case common.DPTypeIP:
+			// Decompress if needed
+			if h.Flags&common.DPFlagCompression != 0 {
+				decompressed, err := common.DecompressPayload(payload, common.MTU*2)
+				if err != nil {
+					vlogf("bonding: decompress error: %v", err)
+					continue
+				}
+				payload = decompressed
+			}
+			vlogf("bonding: received IP packet seq=%d len=%d", h.SeqNum, len(payload))
+			// Insert into reorder buffer and deliver in-order packets
+			ordered := c.inReorder.Insert(h.SeqNum, payload)
+			for _, p := range ordered {
+				vlogf("bonding: writing to TUN len=%d", len(p))
+				c.enqueueTunWrite(p)
+			}
+
+		case common.DPTypeHeartbeat:
+			var hb common.HeartbeatPayload
+			if err := hb.Unmarshal(payload); err != nil {
+				continue
+			}
+			rtt := common.CalcRTT(hb.SendTime)
+			c.updateConnRTT(cc, rtt)
+			cc.hbRecv.Add(1)
+		}
+	}
+}
+
+func (c *clientState) heartbeatLoop(cc *clientConn) {
+	defer c.wg.Done()
+	t := time.NewTicker(2 * time.Second)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+			cc.mu.Lock()
+			qc := cc.quicConn
+			cc.mu.Unlock()
+			if qc == nil {
+				continue
+			}
+			hb := common.HeartbeatPayload{SendTime: common.NowMonoNano()}
+			head := common.DataPlaneHeader{Version: common.DataPlaneVersion, Type: common.DPTypeHeartbeat, SessionID: c.sessionID, SeqNum: 0, Flags: 0}
+			dg, err := common.BuildDataPlaneDatagram(nil, head, hb.Marshal())
+			if err != nil {
+				continue
+			}
+			if err := qc.SendDatagram(dg); err == nil {
+				cc.hbSent.Add(1)
+			}
+		}
+	}
+}
+
+// dialQUICMultipath creates a MP-QUIC connection with multipath support
+func dialQUICMultipath(ctx context.Context, addr string, cfg clientConfig) (*quic.Conn, net.PacketConn, *quic.DefaultMultipathController, error) {
+	tlsCfg, err := clientTLSConfig(cfg)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("tls config: %w", err)
+	}
+	tlsCfg = tlsCfg.Clone()
+	tlsCfg.NextProtos = []string{"fluxify-quic"}
+
+	// Configure multipath controller with low latency scheduler
+	mpCtrl := quic.NewDefaultMultipathController(quic.NewLowLatencyScheduler())
+	maxPaths := len(cfg.Ifaces)
+	if maxPaths < 2 {
+		maxPaths = 2
+	}
+	if maxPaths > 8 {
+		maxPaths = 8
+	}
+
+	// Resolve server address
+	ua, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("resolve addr: %w", err)
+	}
+
+	wantV4 := ua.IP.To4() != nil
+	localAddrs, err := collectLocalAddrs(cfg.Ifaces, cfg.IPs, wantV4)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("collect local addrs: %w", err)
+	}
+
+	qc := &quic.Config{
+		EnableDatagrams:        true,
+		MaxPaths:               maxPaths,
+		MultipathController:    mpCtrl,
+		MultipathAutoPaths:     true,
+		MultipathAutoAdvertise: len(localAddrs) > 0,
+		MultipathAutoAddrs:     localAddrs,
+	}
+
+	// Base socket determines the local port; the manager binds additional sockets to the same port.
+	baseIP := net.IPv4zero
+	if !wantV4 {
+		baseIP = net.IPv6unspecified
+	}
+	base, err := net.ListenUDP("udp", &net.UDPAddr{IP: baseIP, Port: 0})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("listen udp base: %w", err)
+	}
+	basePort := 0
+	if la, ok := base.LocalAddr().(*net.UDPAddr); ok {
+		basePort = la.Port
+	}
+
+	mgr, err := quic.NewMultiSocketManager(quic.MultiSocketManagerConfig{
+		BaseConn:        base,
+		ListenPort:      basePort,
+		LocalAddrs:      localAddrs,
+		RefreshInterval: 0,
+		IncludeLoopback: false,
+		AllowIPv6:       !wantV4,
+	})
+	if err != nil {
+		_ = base.Close()
+		return nil, nil, nil, fmt.Errorf("multi-socket manager: %w", err)
+	}
+
+	conn, err := quic.Dial(ctx, mgr, ua, tlsCfg, qc)
+	if err != nil {
+		_ = mgr.Close()
+		return nil, nil, nil, fmt.Errorf("quic dial: %w", err)
+	}
+
+	return conn, mgr, mpCtrl, nil
+}
+
+// tunWriteLoop writes packets to TUN device
+func (c *clientState) tunWriteLoop() {
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case buf, ok := <-c.tunWriteCh:
+			if !ok {
+				return
+			}
+			if c.tun != nil {
+				_, _ = c.tun.Write(buf)
+			}
+			common.PutBuffer(buf)
+		}
+	}
+}
+
+// tunReader reads from TUN and sends to worker channel
+func (c *clientState) tunReader(workCh chan<- []byte) {
+	for {
+		buf := common.GetBuffer()
+		n, err := c.tun.Read(buf)
+		if err != nil {
+			common.PutBuffer(buf)
+			select {
+			case <-c.ctx.Done():
+				return
+			default:
+				vlogf("bonding: TUN read error: %v", err)
+				return
+			}
+		}
+		select {
+		case workCh <- buf[:n]:
+		case <-c.ctx.Done():
+			common.PutBuffer(buf)
+			return
+		}
+	}
+}
+
+// workerLoop processes TUN packets and sends them via QUIC
+func (c *clientState) workerLoop(workCh <-chan []byte) {
+	defer c.wg.Done()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case data, ok := <-workCh:
+			if !ok {
+				return
+			}
+			c.processAndSend(data)
+		}
+	}
+}
+
+// processAndSend builds and sends a datagram via QUIC
+func (c *clientState) processAndSend(data []byte) {
+	cc := c.pickBestConn()
+	if cc == nil {
+		common.PutBuffer(data)
+		return
+	}
+
+	cc.mu.Lock()
+	qc := cc.quicConn
+	cc.mu.Unlock()
+	if qc == nil {
+		common.PutBuffer(data)
+		return
+	}
+
+	seq := c.nextSeqSend.Add(1)
+	flags := uint8(0)
+	payload := data
+
+	// Best-effort compression (only if it reduces size).
+	if compressed, err := common.CompressPayload(payload); err == nil && len(compressed) < len(payload) {
+		payload = compressed
+		flags |= common.DPFlagCompression
+	}
+
+	head := common.DataPlaneHeader{
+		Version:   common.DataPlaneVersion,
+		Type:      common.DPTypeIP,
+		SessionID: c.sessionID,
+		SeqNum:    seq,
+		Flags:     flags,
+	}
+
+	dgram, err := common.BuildDataPlaneDatagram(nil, head, payload)
+	if err != nil {
+		common.PutBuffer(data)
+		return
+	}
+
+	if err := qc.SendDatagram(dgram); err != nil {
+		vlogf("bonding: send datagram error: %v", err)
+	} else {
+		cc.bytesSent.Add(uint64(len(data)))
+	}
+	common.PutBuffer(data)
+}
+
+// enqueueTunWrite adds a packet to the TUN write queue
+func (c *clientState) enqueueTunWrite(buf []byte) {
+	select {
+	case c.tunWriteCh <- buf:
+	default:
+		// Queue full, drop packet
+		common.PutBuffer(buf)
+	}
+}
+
+// pickBestConn returns the best connection (MP-QUIC handles path selection internally)
+func (c *clientState) pickBestConn() *clientConn {
+	c.connMu.RLock()
+	defer c.connMu.RUnlock()
+	for _, cc := range c.conns {
+		if cc.alive.Load() {
+			return cc
+		}
+	}
+	if len(c.conns) > 0 {
+		return c.conns[0]
+	}
+	return nil
+}
+
+// closeAllConns closes all QUIC connections
+func (c *clientState) closeAllConns() {
+	c.connMu.Lock()
+	defer c.connMu.Unlock()
+	for _, cc := range c.conns {
+		cc.mu.Lock()
+		if cc.quicConn != nil {
+			_ = cc.quicConn.CloseWithError(0, "shutdown")
+		}
+		if cc.packetConn != nil {
+			_ = cc.packetConn.Close()
+		}
+		cc.quicConn = nil
+		cc.packetConn = nil
+		cc.mu.Unlock()
+	}
+}
+
+// sessionSnapshot returns current session info (no longer returns key)
+func (c *clientState) sessionSnapshot() (uint32, string) {
+	c.sessMu.RLock()
+	defer c.sessMu.RUnlock()
+	return c.sessionID, c.serverAddr
 }

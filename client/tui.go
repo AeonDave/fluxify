@@ -11,11 +11,13 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -49,6 +51,25 @@ func (tuiRunner) Output(name string, args ...string) ([]byte, error) {
 
 func (tuiRunner) OutputSafe(name string, args ...string) ([]byte, error) {
 	return common.RunPrivilegedOutput(name, args...)
+}
+
+// detectClientBundlePath wraps common.DetectClientBundlePath for TUI usage
+func detectClientBundlePath(pkiDir string) (string, error) {
+	return common.DetectClientBundlePath(pkiDir)
+}
+
+// bundleBaseName wraps common.BundleBaseName for TUI usage
+func bundleBaseName(path string) string {
+	return common.BundleBaseName(path)
+}
+
+// detectClientCertName returns the CN from the client bundle
+func detectClientCertName(pkiDir string) (string, error) {
+	bundlePath, err := common.DetectClientBundlePath(pkiDir)
+	if err != nil {
+		return "", err
+	}
+	return common.BundleBaseName(bundlePath), nil
 }
 
 // runTUI launches the interactive UI for bonding/load-balance configuration.
@@ -746,7 +767,31 @@ func runTUI(initial clientConfig) {
 		return event
 	})
 
+	// Handle OS signals (Ctrl+C, SIGTERM) to ensure cleanup happens
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigCh
+		// Cleanup before exit
+		if state.running != nil {
+			state.running()
+			state.running = nil
+		}
+		app.Stop()
+	}()
+
+	// Ensure cleanup on normal exit or panic
 	defer func() {
+		signal.Stop(sigCh)
+		if r := recover(); r != nil {
+			// Cleanup on panic
+			if state.running != nil {
+				state.running()
+				state.running = nil
+			}
+			panic(r) // re-panic after cleanup
+		}
+		// Cleanup on normal exit
 		if state.running != nil {
 			state.running()
 			state.running = nil
@@ -1214,7 +1259,7 @@ func runDiagnostics(cfg clientConfig) (diagReport, error) {
 	if err := tlsConn.Handshake(); err != nil {
 		_ = tlsConn.Close()
 		tlsErr := classifyTLSError(err)
-		lines = append(lines, fmt.Sprintf("  [red]TLS: handshake failed[white]"))
+		lines = append(lines, "  [red]TLS: handshake failed[white]")
 		lines = append(lines, fmt.Sprintf("  [red]  Error: %s[white]", tlsErr))
 		lines = append(lines, "")
 		lines = append(lines, "[yellow]Routing[white]")

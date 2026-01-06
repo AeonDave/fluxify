@@ -62,10 +62,10 @@ func (s *serverSession) snapshotMetrics() serverSessionMetrics {
 }
 
 func addrString(c *serverConn) string {
-	if c == nil || c.addr == nil {
+	if c == nil || c.addr == "" {
 		return "-"
 	}
-	return c.addr.String()
+	return c.addr
 }
 
 func formatServerSessionMetrics(m serverSessionMetrics) string {

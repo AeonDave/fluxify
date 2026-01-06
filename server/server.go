@@ -4,18 +4,20 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
 	"net"
-	"os/exec"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/songgao/water"
+
+	quic "github.com/AeonDave/mp-quic-go"
 
 	"fluxify/common"
 )
@@ -40,14 +42,19 @@ type Server struct {
 
 	nextIPOctet atomic.Uint32
 
-	tun     *water.Interface
-	udpConn *net.UDPConn
+	tun      *water.Interface
+	listener *quic.Listener
 
 	tunWriteCh chan []byte
 	outboundCh chan *outboundJob // packets from TUN to be sent to clients
 
 	wg      sync.WaitGroup
 	running atomic.Bool
+
+	reorderSize  int
+	reorderFlush time.Duration
+
+	mssClamp mssClampConfig
 }
 
 func (s *Server) metricsLoop(every time.Duration) {
@@ -63,7 +70,6 @@ func (s *Server) metricsLoop(every time.Duration) {
 }
 
 func (s *Server) logMetricsOnce() {
-	// Snapshot sessions under read lock.
 	s.sessMu.RLock()
 	sessions := make([]*serverSession, 0, len(s.sessions))
 	for _, sess := range s.sessions {
@@ -82,7 +88,7 @@ type outboundJob struct {
 	data []byte
 }
 
-func NewServer(port, ctrlPort int, iface string, pki common.PKIPaths, verbose bool) *Server {
+func NewServer(port, ctrlPort int, iface string, pki common.PKIPaths, verbose bool, rsize int, rflush time.Duration) *Server {
 	return &Server{
 		port:           port,
 		ctrlPort:       ctrlPort,
@@ -94,6 +100,8 @@ func NewServer(port, ctrlPort int, iface string, pki common.PKIPaths, verbose bo
 		clientSessions: make(map[string]*serverSession),
 		tunWriteCh:     make(chan []byte, 512),
 		outboundCh:     make(chan *outboundJob, 512),
+		reorderSize:    rsize,
+		reorderFlush:   rflush,
 	}
 }
 
@@ -105,67 +113,223 @@ func (s *Server) logDebug(format string, v ...interface{}) {
 
 func (s *Server) Start() error {
 	s.running.Store(true)
+	s.logDebug("Starting server (port=%d, ctrl=%d)", s.port, s.ctrlPort)
 
 	// Setup TUN
 	conf := water.Config{DeviceType: water.TUN}
 	if s.ifaceName != "" {
 		conf.Name = s.ifaceName
+		s.logDebug("TUN: using custom interface name: %s", s.ifaceName)
 	}
+	s.logDebug("TUN: creating device...")
 	tun, err := water.New(conf)
 	if err != nil {
 		return fmt.Errorf("create tun: %v", err)
 	}
 	s.tun = tun
 	log.Printf("TUN initialized: %s", tun.Name())
+	s.logDebug("TUN: device %s created successfully", tun.Name())
 
+	s.logDebug("TUN: configuring IP addresses (v4=%s, v6=%s, MTU=%d)", serverIPv4CIDR, serverIPv6CIDR, common.MTU)
 	if err := common.ConfigureTUN(common.TUNConfig{IfaceName: tun.Name(), CIDR: serverIPv4CIDR, IPv6CIDR: serverIPv6CIDR, MTU: common.MTU}); err != nil {
 		return fmt.Errorf("configure tun: %v", err)
 	}
-	_ = ensureNatRule()
-	_ = ensureNatRule6()
-	_ = ensureForwardRules(tun.Name())
-	_ = ensureForwardRules6(tun.Name())
-	enableForwarding()
-
-	// Setup UDP
-	udpAddr := &net.UDPAddr{Port: s.port}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		return fmt.Errorf("listen udp: %v", err)
+	// Best-effort: networking rules. These operations require root.
+	s.logDebug("iptables: configuring forwarding and NAT rules...")
+	if err := enableForwarding(execRunner{}); err != nil {
+		log.Printf("enable forwarding: %v", err)
+	} else {
+		s.logDebug("iptables: IP forwarding enabled")
 	}
-	s.udpConn = udpConn
-	log.Printf("UDP listening on :%d", s.port)
+	if err := ensureNatRule(execRunner{}); err != nil {
+		log.Printf("ensure nat v4: %v", err)
+	} else {
+		s.logDebug("iptables: IPv4 NAT rule configured")
+	}
+	if err := ensureNatRule6(execRunner{}); err != nil {
+		log.Printf("ensure nat v6: %v", err)
+	} else {
+		s.logDebug("iptables: IPv6 NAT rule configured")
+	}
+	if err := ensureForwardRules(execRunner{}, tun.Name()); err != nil {
+		log.Printf("ensure forward v4: %v", err)
+	} else {
+		s.logDebug("iptables: IPv4 forward rules configured for %s", tun.Name())
+	}
+	if err := ensureForwardRules6(execRunner{}, tun.Name()); err != nil {
+		log.Printf("ensure forward v6: %v", err)
+	} else {
+		s.logDebug("iptables: IPv6 forward rules configured for %s", tun.Name())
+	}
+	if err := ensureMSSClampRules(execRunner{}, tun.Name(), s.mssClamp); err != nil {
+		log.Printf("mss clamp: %v", err)
+	} else {
+		s.logDebug("iptables: MSS clamp rules configured")
+	}
 
-	// Start Control Plane
+	// Setup QUIC (multipath-capable)
+	s.logDebug("QUIC: loading TLS config from PKI (dir=%s)", s.pki.Dir)
+	tlsCfg, err := common.ServerTLSConfig(s.pki)
+	if err != nil {
+		return fmt.Errorf("quic tls config: %v", err)
+	}
+	s.logDebug("QUIC: TLS config loaded (NextProtos=[fluxify-quic])")
+	tlsCfg = tlsCfg.Clone()
+	tlsCfg.NextProtos = []string{"fluxify-quic"}
+
+	s.logDebug("QUIC: creating multipath config (MaxPaths=5, AutoPaths=true, Scheduler=LowLatency)")
+	qc := &quic.Config{
+		EnableDatagrams: true,
+		MaxPaths:        5,
+		MultipathController: quic.NewDefaultMultipathController(
+			quic.NewLowLatencyScheduler(),
+		),
+		MultipathAutoPaths:     true,
+		MultipathAutoAdvertise: true,
+	}
+
+	s.logDebug("QUIC: binding to port %d...", s.port)
+	ln, err := quic.ListenAddr(fmt.Sprintf(":%d", s.port), tlsCfg, qc)
+	if err != nil {
+		return fmt.Errorf("listen quic: %v", err)
+	}
+	s.listener = ln
+	log.Printf("QUIC listening on :%d", s.port)
+	s.logDebug("QUIC: listener initialized successfully")
+
+	s.logDebug("Starting control server goroutine...")
 	go s.controlServer()
 
-	// Start Workers
-	// 1. TUN Writer (Single Consumer to ensure thread safety on TUN write)
+	s.logDebug("Starting TUN write loop...")
 	s.wg.Add(1)
 	go s.tunWriteLoop()
 
-	// 2. TUN Reader (Single Producer)
+	s.logDebug("Starting TUN read loop...")
 	s.wg.Add(1)
 	go s.tunReadLoop()
 
-	// 3. UDP Readers (Multiple Consumers)
 	numReaders := runtime.NumCPU()
-	for i := 0; i < numReaders; i++ {
-		s.wg.Add(1)
-		go s.udpReadLoop(i)
-	}
+	s.logDebug("Starting QUIC accept loop with %d reader workers...", numReaders)
+	s.wg.Add(1)
+	go s.acceptLoop(numReaders)
 
-	// 4. Outbound Processors (TUN -> UDP encryption/compression workers)
+	s.logDebug("Starting %d outbound workers...", numReaders)
 	for i := 0; i < numReaders; i++ {
 		s.wg.Add(1)
 		go s.outboundWorker()
 	}
 
-	// 5. Cleanup Loop
+	s.logDebug("Starting session cleanup loop...")
 	s.wg.Add(1)
 	go s.cleanupLoop()
 
+	s.logDebug("Server startup complete")
 	return nil
+}
+
+func (s *Server) acceptLoop(numReaders int) {
+	defer s.wg.Done()
+	s.logDebug("acceptLoop: started")
+	for s.running.Load() {
+		conn, err := s.listener.Accept(context.Background())
+		if err != nil {
+			if s.running.Load() {
+				log.Printf("quic accept error: %v", err)
+			}
+			return
+		}
+		s.logDebug("acceptLoop: new QUIC connection from %s, starting %d readers", conn.RemoteAddr(), numReaders)
+		for i := 0; i < numReaders; i++ {
+			s.wg.Add(1)
+			go s.quicReadLoop(conn)
+		}
+	}
+	s.logDebug("acceptLoop: stopped")
+}
+
+func (s *Server) quicReadLoop(conn *quic.Conn) {
+	defer s.wg.Done()
+	for s.running.Load() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		dat, err := conn.ReceiveDatagram(ctx)
+		cancel()
+		if err != nil {
+			continue
+		}
+		h, payload, err := common.ParseDataPlaneDatagram(dat)
+		if err != nil {
+			s.logDebug("quicReadLoop: failed to parse datagram: %v", err)
+			continue
+		}
+		sess := s.getSession(h.SessionID)
+		if sess == nil {
+			s.logDebug("quicReadLoop: unknown session ID: %d", h.SessionID)
+			continue
+		}
+		s.logDebug("quicReadLoop: received %s datagram (session=%d, seq=%d, len=%d)", h.Type, h.SessionID, h.SeqNum, len(payload))
+		s.handleDatagram(conn, sess, h, payload)
+	}
+}
+
+func (s *Server) handleDatagram(conn *quic.Conn, sess *serverSession, h common.DataPlaneHeader, payload []byte) {
+	sess.touch()
+
+	sc := sess.updateOrAddConn(conn)
+	sc.bytesRecv.Add(uint64(len(payload)))
+
+	switch h.Type {
+	case common.DPTypeHandshake:
+		// keep-alive
+	case common.DPTypeHeartbeat:
+		var hb common.HeartbeatPayload
+		if err := hb.Unmarshal(payload); err == nil {
+			rtt := common.CalcRTT(hb.SendTime)
+			updateServerConnRTT(sc, rtt)
+			s.logDebug("handleDatagram: heartbeat from session %d, RTT=%v", sess.id, rtt)
+		}
+		// echo back
+		head := common.DataPlaneHeader{Version: common.DataPlaneVersion, Type: common.DPTypeHeartbeat, SessionID: sess.id, SeqNum: 0, Flags: 0}
+		dg, _ := common.BuildDataPlaneDatagram(nil, head, payload)
+		_ = conn.SendDatagram(dg)
+	case common.DPTypeIP:
+		data := payload
+		if (h.Flags & common.DPFlagCompression) != 0 {
+			s.logDebug("handleDatagram: decompressing packet (compressed_size=%d)", len(payload))
+			outBuf := common.GetBuffer()
+			dec, err := common.DecompressPayloadInto(outBuf, payload, common.MaxPacketSize)
+			if err != nil {
+				common.PutBuffer(outBuf)
+				return
+			}
+			data = dec
+			// Copy into pooled buffer for reorder buffer storage
+			storageBuf := common.GetBuffer()
+			copy(storageBuf, data)
+			common.PutBuffer(outBuf)
+			ordered := sess.reorderBuf.Insert(h.SeqNum, storageBuf[:len(data)])
+			for _, pkt := range ordered {
+				select {
+				case s.tunWriteCh <- pkt:
+				default:
+					common.PutBuffer(pkt)
+				}
+			}
+			return
+		}
+		if !common.IsIPPacket(data) {
+			return
+		}
+		storageBuf := common.GetBuffer()
+		copy(storageBuf, data)
+		ordered := sess.reorderBuf.Insert(h.SeqNum, storageBuf[:len(data)])
+		for _, pkt := range ordered {
+			select {
+			case s.tunWriteCh <- pkt:
+			default:
+				common.PutBuffer(pkt)
+			}
+		}
+	}
 }
 
 func (s *Server) tunWriteLoop() {
@@ -175,7 +339,6 @@ func (s *Server) tunWriteLoop() {
 		if _, err := s.tun.Write(data); err != nil {
 			log.Printf("tun write error: %v", err)
 		}
-		// Data buffer came from common.Pool via udpReadLoop -> handlePacket
 		common.PutBuffer(data)
 	}
 }
@@ -184,12 +347,8 @@ func (s *Server) tunReadLoop() {
 	defer s.wg.Done()
 	defer close(s.outboundCh)
 
-	// Need a separate buffer allocation strategy for TUN reads.
-	// Since we pass these to outboundCh, we can use the pool.
 	for s.running.Load() {
 		buf := common.GetBuffer()
-		// We read standard MTU size.
-		// Note: buf is MaxPacketSize + HeaderSize (~1522). TUN MTU is 1400. Safe.
 		n, err := s.tun.Read(buf)
 		if err != nil {
 			if s.running.Load() {
@@ -210,14 +369,11 @@ func (s *Server) tunReadLoop() {
 		sess := s.lookupSessionByIP(dstIP)
 		if sess != nil {
 			select {
-			case s.outboundCh <- &outboundJob{sess: sess, data: buf[:n]}: // Pass slice but backed by pool array
-				// ok
+			case s.outboundCh <- &outboundJob{sess: sess, data: buf[:n]}:
 			default:
-				// Drop if channel full
 				common.PutBuffer(buf)
 			}
 		} else {
-			// Unknown destination, drop
 			common.PutBuffer(buf)
 		}
 	}
@@ -226,153 +382,13 @@ func (s *Server) tunReadLoop() {
 func (s *Server) outboundWorker() {
 	defer s.wg.Done()
 	for job := range s.outboundCh {
-		// Phase 2: flow-based scheduling for server->client.
-		// Keep packets of the same flow on the same conn to avoid TCP collapse due to reordering.
-		chosen := job.sess.pickConnForIPPacket(job.data)
+		chosen := job.sess.pickBestConn()
 		if chosen != nil {
-			s.logDebug("UDP send: %d bytes to %s", len(job.data), chosen.addr)
+			s.logDebug("QUIC send: %d bytes", len(job.data))
 			job.sess.touch()
-			_ = job.sess.encryptAndSend(chosen, common.PacketIP, job.data, true)
+			_ = job.sess.sendDatagram(chosen, common.DPTypeIP, job.data, true)
 		}
-		// Return the READ buffer to pool
-		// (Note: job.data is a slice of the buffer from GetBuffer)
 		common.PutBuffer(job.data)
-	}
-}
-
-func (s *Server) udpReadLoop(id int) {
-	defer s.wg.Done()
-	for s.running.Load() {
-		buf := common.GetBuffer()
-		n, addr, err := s.udpConn.ReadFromUDP(buf)
-		if err != nil {
-			if s.running.Load() {
-				log.Printf("udp read error: %v", err)
-			}
-			common.PutBuffer(buf) // return on error
-			continue
-		}
-
-		packet := buf[:n]
-		var hdr common.PacketHeader
-		if err := hdr.Unmarshal(packet); err != nil {
-			// Malformed
-			common.PutBuffer(buf)
-			continue
-		}
-
-		sess := s.getSession(hdr.SessionID)
-		if sess == nil {
-			common.PutBuffer(buf)
-			continue
-		}
-
-		// Use a separate buffer for plaintext to avoid allocation
-		payloadBuf := common.GetBuffer()
-		h, payload, err := common.DecryptPacketInto(payloadBuf, sess.key, packet)
-		if err != nil {
-			log.Printf("decrypt error from %s: %v", addr, err)
-			common.PutBuffer(payloadBuf)
-			common.PutBuffer(buf)
-			continue
-		}
-
-		s.handlePacket(sess, addr, h, payload, payloadBuf)
-
-		// Input buffer is processed, return it
-		common.PutBuffer(buf)
-	}
-}
-
-// handlePacket processes the decrypted payload.
-// It takes ownership of payloadBuf (which backs payload).
-func (s *Server) handlePacket(sess *serverSession, addr *net.UDPAddr, h common.PacketHeader, payload []byte, payloadBuf []byte) {
-	// Ensure we return the buffer if we don't pass it to tunWriteCh
-	// We use a flag to track ownership transfer
-	defer common.PutBuffer(payloadBuf)
-
-	sess.touch()
-
-	// Update connection state
-	// Optimization: Only lock if we need to update?
-	// updateOrAddConn locks internally.
-	conn := sess.updateOrAddConn(s.udpConn, addr)
-
-	conn.bytesRecv.Add(uint64(len(payload)))
-
-	switch h.Type {
-	case common.PacketHandshake:
-		// Keep-alive
-	case common.PacketHeartbeat:
-		var hb common.HeartbeatPayload
-		if err := hb.Unmarshal(payload); err == nil {
-			rtt := common.CalcRTT(hb.SendTime)
-			updateServerConnRTT(conn, rtt)
-			s.logDebug("Heartbeat from %s (rtt=%v jitter=%v)", addr, rtt, time.Duration(conn.jitterNano.Load()))
-		}
-		// Echo back immediately (using session write)
-		// Payload is small, we can just send it back.
-		// We use sess.encryptAndSend which allocates new packet.
-		if err := sess.encryptAndSend(conn, common.PacketHeartbeat, payload, false); err != nil {
-			log.Printf("Debug: failed to echo heartbeat to %s: %v", addr, err)
-		}
-	case common.PacketIP:
-		s.logDebug("IP packet from %s len=%d seq=%d", addr, len(payload), h.SeqNum)
-
-		// Handle decompression.
-		// NOTE: common.DecompressPayload currently allocates; we immediately copy into a pool buffer below.
-		data := payload
-		if len(h.Reserved) > 0 && h.Reserved[0] == common.CompressionGzip {
-			outBuf := common.GetBuffer()
-			dec, err := common.DecompressPayloadInto(outBuf, payload, common.MaxPacketSize)
-			if err != nil {
-				common.PutBuffer(outBuf)
-				log.Printf("decompress error: %v", err)
-				return
-			}
-			data = dec
-			// outBuf now backs dec; we'll copy it into reorderBuf pool buffer below and then return outBuf.
-			defer common.PutBuffer(outBuf)
-		}
-		if !isIPPacket(data) {
-			s.logDebug("drop non-ip packet len=%d", len(data))
-			return
-		}
-
-		// Prepare pool buffer for reorder buffer (avoid heap alloc)
-		buf := common.GetBuffer()
-		if len(data) > cap(buf) {
-			common.PutBuffer(buf)
-			sess.reorderStats.packetsDropped.Add(1)
-			return
-		}
-		copy(buf, data)
-		bufferData := buf[:len(data)]
-		// Note: if data was heap-allocated by DecompressPayload, it becomes eligible for GC after this point.
-
-		// Insert into reorder buffer. Ownership of bufferData transfers to reorderBuf
-		// unless Insert returns it immediately.
-		orderedPackets := sess.reorderBuf.Insert(h.SeqNum, bufferData)
-
-		// Track reordering stats
-		bufDepth := uint32(len(sess.reorderBuf.packets))
-		if bufDepth > 0 {
-			sess.reorderStats.packetsReordered.Add(1)
-			if current := sess.reorderStats.maxBufferDepth.Load(); bufDepth > current {
-				sess.reorderStats.maxBufferDepth.Store(bufDepth)
-			}
-		}
-
-		// Send ordered packets to TUN (packets are pool-backed)
-		for _, pkt := range orderedPackets {
-			select {
-			case s.tunWriteCh <- pkt:
-				// tunWriteCh owns pkt and will PutBuffer
-			default:
-				common.PutBuffer(pkt)
-				sess.reorderStats.packetsDropped.Add(1)
-			}
-		}
 	}
 }
 
@@ -404,6 +420,7 @@ func (s *Server) registerSession(sess *serverSession) {
 	if sess.clientIPv6 != nil {
 		s.ipToSession[sess.clientIPv6.String()] = sess
 	}
+	s.logDebug("registerSession: registered session %d for client '%s' (IPv4=%s, IPv6=%s)", sess.id, sess.name, sess.clientIP, sess.clientIPv6)
 }
 
 func extractDstIP(pkt []byte) net.IP {
@@ -425,34 +442,21 @@ func extractDstIP(pkt []byte) net.IP {
 	return nil
 }
 
-func isIPPacket(pkt []byte) bool {
-	if len(pkt) < 1 {
-		return false
-	}
-	ver := pkt[0] >> 4
-	switch ver {
-	case 4:
-		return len(pkt) >= 20
-	case 6:
-		return len(pkt) >= 40
-	default:
-		return false
-	}
-}
-
-// Control server logic
 func (s *Server) controlServer() {
+	s.logDebug("controlServer: loading TLS config...")
 	tlsCfg, err := common.ServerTLSConfig(s.pki)
 	if err != nil {
 		log.Printf("control tls config err: %v", err)
 		return
 	}
+	s.logDebug("controlServer: binding to port %d...", s.ctrlPort)
 	ln, err := tls.Listen("tcp", fmt.Sprintf(":%d", s.ctrlPort), tlsCfg)
 	if err != nil {
 		log.Printf("control listen err: %v", err)
 		return
 	}
 	log.Printf("control TLS listening on :%d", s.ctrlPort)
+	s.logDebug("controlServer: ready to accept connections")
 
 	for s.running.Load() {
 		conn, err := ln.Accept()
@@ -462,47 +466,51 @@ func (s *Server) controlServer() {
 			}
 			continue
 		}
+		s.logDebug("controlServer: accepted connection from %s", conn.RemoteAddr())
 		go s.handleControl(conn)
 	}
+	s.logDebug("controlServer: stopped")
 }
 
 func (s *Server) handleControl(conn net.Conn) {
 	defer conn.Close()
+	s.logDebug("handleControl: starting TLS handshake with %s", conn.RemoteAddr())
 	peer := conn.(*tls.Conn)
 	if err := peer.Handshake(); err != nil {
+		s.logDebug("handleControl: TLS handshake failed: %v", err)
 		return
 	}
 	state := peer.ConnectionState()
 	if len(state.PeerCertificates) == 0 {
+		s.logDebug("handleControl: no peer certificates provided")
 		return
 	}
 	cn := state.PeerCertificates[0].Subject.CommonName
+	s.logDebug("handleControl: TLS handshake successful, client CN=%s", cn)
 
 	reqData, err := io.ReadAll(peer)
 	if err != nil {
+		s.logDebug("handleControl: failed to read request: %v", err)
 		return
 	}
 	var req common.ControlRequest
 	if err := req.Unmarshal(reqData); err != nil {
+		s.logDebug("handleControl: failed to unmarshal request: %v", err)
 		return
 	}
 	if req.ClientName == "" {
 		req.ClientName = cn
 	}
+	s.logDebug("handleControl: received session request from client '%s'", req.ClientName)
 
 	sessID := uint32(time.Now().UnixNano())
-	key, err := common.GenerateSessionKey()
-	if err != nil {
-		return
-	}
-
 	var clientIP, clientIPv6 net.IP
 
 	s.sessMu.Lock()
 	if old, ok := s.clientSessions[req.ClientName]; ok {
 		clientIP = old.clientIP
 		clientIPv6 = old.clientIPv6
-		// Delete old session to prevent ghosts
+		s.logDebug("handleControl: replacing existing session (old_id=%d, reusing_ips=%s/%s)", old.id, clientIP, clientIPv6)
 		delete(s.sessions, old.id)
 		delete(s.clientSessions, req.ClientName)
 		if old.clientIP != nil {
@@ -514,19 +522,18 @@ func (s *Server) handleControl(conn net.Conn) {
 		log.Printf("Replaced session for %s (old_id=%d) reusing IP=%s", req.ClientName, old.id, clientIP)
 	} else {
 		clientIP, clientIPv6 = s.assignClientIPs()
+		s.logDebug("handleControl: assigned new IPs for client (v4=%s, v6=%s)", clientIP, clientIPv6)
 	}
 	s.sessMu.Unlock()
 
-	sess := newServerSession(sessID, req.ClientName, key, clientIP, clientIPv6)
+	sess := newServerSession(sessID, req.ClientName, clientIP, clientIPv6, s.reorderSize, s.reorderFlush)
 	s.registerSession(sess)
 
-	// Start reorder buffer flush handler for this session
 	go s.reorderFlushHandler(sess)
 
 	resp := common.ControlResponse{
 		SessionID:  sessID,
-		SessionKey: common.EncodeKeyBase64(key),
-		UDPPort:    s.port,
+		DataPort:   s.port,
 		ClientIP:   clientIP.String(),
 		ClientIPv6: clientIPv6.String(),
 	}
@@ -538,7 +545,6 @@ func (s *Server) handleControl(conn net.Conn) {
 func (s *Server) assignClientIPs() (net.IP, net.IP) {
 	n := s.nextIPOctet.Add(1)
 	if n < 2 || n > 250 {
-		// Wrap to the first usable host (.2) and reset counter.
 		s.nextIPOctet.Store(2)
 		n = 2
 	}
@@ -549,6 +555,7 @@ func (s *Server) assignClientIPs() (net.IP, net.IP) {
 
 func (s *Server) cleanupLoop() {
 	defer s.wg.Done()
+	s.logDebug("cleanupLoop: started (interval=10s)")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -558,16 +565,20 @@ func (s *Server) cleanupLoop() {
 			s.pruneSessions()
 		}
 	}
+	s.logDebug("cleanupLoop: stopped")
 }
 
 func (s *Server) pruneSessions() {
 	s.sessMu.Lock()
 	defer s.sessMu.Unlock()
 
+	var pruned, active int
 	for id, sess := range s.sessions {
 		if sess.isIdle() {
+			pruned++
 			log.Printf("Session idle/expired: %s (id=%d) IP=%s", sess.name, id, sess.clientIP)
-			sess.Close() // Cleanup reorder buffer
+			s.logDebug("pruneSessions: removing idle session %d (client=%s)", id, sess.name)
+			sess.Close()
 			delete(s.sessions, id)
 			if sess.name != "" {
 				delete(s.clientSessions, sess.name)
@@ -579,24 +590,25 @@ func (s *Server) pruneSessions() {
 				delete(s.ipToSession, sess.clientIPv6.String())
 			}
 		} else {
+			active++
 			sess.pruneStaleConns()
 		}
 	}
+	if pruned > 0 || active > 0 {
+		s.logDebug("pruneSessions: checked %d sessions (active=%d, pruned=%d)", len(s.sessions)+pruned, active, pruned)
+	}
 }
 
-// reorderFlushHandler handles timeout-based flushing for reorder buffer
 func (s *Server) reorderFlushHandler(sess *serverSession) {
 	for {
 		select {
 		case <-sess.stopReorder:
 			return
-		case <-sess.reorderBuf.flushCh:
-			// Timeout occurred, flush buffered packets
-			flushedPackets := sess.reorderBuf.FlushTimeout()
-			for _, pkt := range flushedPackets {
+		case <-sess.reorderBuf.FlushCh():
+			pkts := sess.reorderBuf.FlushTimeout()
+			for _, pkt := range pkts {
 				select {
 				case s.tunWriteCh <- pkt:
-					// tunWriteCh owns pkt and will PutBuffer
 				default:
 					common.PutBuffer(pkt)
 					sess.reorderStats.packetsDropped.Add(1)
@@ -604,73 +616,4 @@ func (s *Server) reorderFlushHandler(sess *serverSession) {
 			}
 		}
 	}
-}
-
-// Helper functions (moved from main.go)
-
-func ensureNatRule() error {
-	if _, err := exec.LookPath("iptables"); err != nil {
-		return err
-	}
-	if exec.Command("iptables", "-t", "nat", "-C", "POSTROUTING", "-s", "10.8.0.0/24", "-j", "MASQUERADE").Run() == nil {
-		return nil
-	}
-	return exec.Command("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", "10.8.0.0/24", "-j", "MASQUERADE").Run()
-}
-
-func ensureNatRule6() error {
-	if _, err := exec.LookPath("ip6tables"); err != nil {
-		return err
-	}
-	if exec.Command("ip6tables", "-t", "nat", "-C", "POSTROUTING", "-s", "fd00:8:0::/64", "-j", "MASQUERADE").Run() == nil {
-		return nil
-	}
-	return exec.Command("ip6tables", "-t", "nat", "-A", "POSTROUTING", "-s", "fd00:8:0::/64", "-j", "MASQUERADE").Run()
-}
-
-func ensureForwardRules(iface string) error {
-	if iface == "" {
-		return nil
-	}
-	if _, err := exec.LookPath("iptables"); err != nil {
-		return err
-	}
-	rules := [][]string{
-		{"FORWARD", "-i", iface, "-j", "ACCEPT"},
-		{"FORWARD", "-o", iface, "-j", "ACCEPT"},
-	}
-	for _, rule := range rules {
-		_ = exec.Command("iptables", append([]string{"-D"}, rule...)...).Run()
-		add := append([]string{"-I", "FORWARD", "1"}, rule[1:]...)
-		if err := exec.Command("iptables", add...).Run(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func ensureForwardRules6(iface string) error {
-	if iface == "" {
-		return nil
-	}
-	if _, err := exec.LookPath("ip6tables"); err != nil {
-		return err
-	}
-	rules := [][]string{
-		{"FORWARD", "-i", iface, "-j", "ACCEPT"},
-		{"FORWARD", "-o", iface, "-j", "ACCEPT"},
-	}
-	for _, rule := range rules {
-		_ = exec.Command("ip6tables", append([]string{"-D"}, rule...)...).Run()
-		add := append([]string{"-I", "FORWARD", "1"}, rule[1:]...)
-		if err := exec.Command("ip6tables", add...).Run(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func enableForwarding() {
-	_ = exec.Command("sysctl", "-w", "net.ipv4.ip_forward=1").Run()
-	_ = exec.Command("sysctl", "-w", "net.ipv6.conf.all.forwarding=1").Run()
 }

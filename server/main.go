@@ -6,10 +6,7 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,51 +17,32 @@ import (
 )
 
 func main() {
-	port := flag.Int("port", 8000, "UDP data port")
-	ctrlPort := flag.Int("ctrl", 8443, "TLS control port")
-	ifaceName := flag.String("iface", "", "TUN interface name (optional)")
+	port := flag.Int("port", 8000, "QUIC data port")
+	ctrl := flag.Int("ctrl", 8443, "TLS control port")
+	iface := flag.String("iface", "", "TUN interface name")
 	pkiDir := flag.String("pki", "./pki", "PKI directory")
-	reorderSize := flag.Int("reorder-buffer-size", defaultReorderBufferSize, "reorder buffer max packets")
-	reorderTimeout := flag.Duration("reorder-flush-timeout", defaultReorderFlushTimeout, "reorder buffer flush timeout (e.g. 50ms)")
-	mssClamp := flag.String("mss-clamp", "off", "TCP MSS clamp for traffic traversing TUN: off|pmtu|fixed:N")
-	tuiMode := flag.Bool("tui", false, "run server with TUI for cert management")
-	regen := flag.Bool("regen", false, "regenerate CA/server certs on start")
-	hosts := flag.String("hosts", "127.0.0.1,localhost", "comma-separated SANs for server cert")
-	verbose := flag.Bool("v", false, "enable verbose debug logging")
-	metricsEvery := flag.Duration("metrics-every", 0, "log per-session metrics every interval (0 to disable)")
+	regen := flag.Bool("regen", false, "Regenerate CA and server certs")
+	hosts := flag.String("hosts", "", "Server SANs (comma-separated, auto-detect if empty)")
+	tuiMode := flag.Bool("tui", false, "Start certificate management TUI")
+	rsize := flag.Int("reorder-buffer-size", 128, "Inbound reorder buffer size")
+	rflush := flag.Duration("reorder-flush-timeout", 50*time.Millisecond, "Reorder flush timeout")
+	mssClamp := flag.String("mss-clamp", "off", "TCP MSS clamp (off|pmtu|fixed:N)")
+	metricsEvery := flag.Duration("metrics-every", 0, "Periodic metrics logging interval (0 to disable)")
+	verbose := flag.Bool("v", false, "Enable verbose output")
+
 	flag.Parse()
 
-	setServerReorderConfig(*reorderSize, *reorderTimeout)
-
-	if !common.IsRoot() {
-		log.Fatalf("run the server with sudo/root on linux for TUN/NAT setup")
-	}
-
 	pki := common.DefaultPKI(*pkiDir)
-	hostList := splitCSV(*hosts)
-	hostsProvided := false
-	flag.CommandLine.Visit(func(f *flag.Flag) {
-		if f.Name == "hosts" {
-			hostsProvided = true
-		}
-	})
-	if len(hostList) == 0 {
-		hostList = []string{"127.0.0.1", "localhost"}
-	}
-	if !hostsProvided {
-		if publicIP, err := fetchPublicIP(); err == nil && publicIP != "" {
-			hostList = addHostIfMissing(hostList, publicIP)
-		} else if err != nil {
-			log.Printf("warning: failed to fetch public IP for cert SANs: %v", err)
-		}
-	}
-	if err := common.EnsureBasePKI(pki, hostList, *regen); err != nil {
-		log.Fatalf("pki init error: %v", err)
-	}
+
+	sanList := detectOrParseSANs(*hosts, *verbose)
 
 	if *tuiMode {
-		runServerTUI(pki, hostList, *port, *ctrlPort, *ifaceName)
+		runServerTUI(pki, sanList, *port, *ctrl, *iface, *verbose)
 		return
+	}
+
+	if err := common.EnsureBasePKI(pki, sanList, *regen); err != nil {
+		log.Fatalf("PKI error: %v", err)
 	}
 
 	mssCfg, err := parseMSSClampFlag(*mssClamp)
@@ -72,66 +50,81 @@ func main() {
 		log.Fatalf("invalid -mss-clamp: %v", err)
 	}
 
-	srv := NewServer(*port, *ctrlPort, *ifaceName, pki, *verbose)
+	srv := NewServer(*port, *ctrl, *iface, pki, *verbose, *rsize, *rflush)
+	srv.mssClamp = mssCfg
 	if err := srv.Start(); err != nil {
-		log.Fatalf("server start error: %v", err)
+		log.Fatalf("Server failed: %v", err)
 	}
-	// Optional: MSS clamp to avoid PMTUD/fragmentation throughput collapse.
-	if err := ensureMSSClampRules(nil, srv.tun.Name(), mssCfg); err != nil {
-		log.Printf("warning: mss clamp setup failed: %v", err)
-	}
+
 	if *metricsEvery > 0 {
 		go srv.metricsLoop(*metricsEvery)
 	}
 
-	sigc := make(chan os.Signal, 1)
-	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
-	<-sigc
-	log.Println("Shutting down...")
+	fmt.Printf("Fluxify server running (data:%d, control:%d)\n", *port, *ctrl)
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	fmt.Println("\nShutting down...")
 }
 
-// splitCSV splits a comma-separated string into trimmed, non-empty parts.
-func splitCSV(s string) []string {
-	if strings.TrimSpace(s) == "" {
-		return nil
+func detectOrParseSANs(hostsFlag string, verbose bool) []string {
+	if hostsFlag != "" {
+		sans := strings.Split(hostsFlag, ",")
+		if verbose {
+			log.Printf("[DEBUG] Using explicit SANs from -hosts flag: %v", sans)
+		}
+		return sans
 	}
-	parts := strings.Split(s, ",")
-	var out []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			out = append(out, p)
+
+	// Collect local interface IPs
+	localIPs, err := common.GetLocalIPs()
+	if err != nil && verbose {
+		log.Printf("[DEBUG] Failed to detect local IPs: %v", err)
+	}
+
+	// Try to fetch public IP (for servers behind NAT)
+	if verbose {
+		log.Printf("[DEBUG] Fetching public IP from ipify.org...")
+	}
+	publicIP := common.GetPublicIP(3 * time.Second)
+	if publicIP != "" && verbose {
+		log.Printf("[DEBUG] Public IP detected: %s", publicIP)
+	} else if verbose {
+		log.Printf("[DEBUG] Could not detect public IP (offline or behind restrictive firewall)")
+	}
+
+	// Build SAN list: public IP first (if available), then local IPs, then localhost
+	seen := make(map[string]bool)
+	var sans []string
+
+	// Add public IP first (most important for external clients)
+	if publicIP != "" && !seen[publicIP] {
+		sans = append(sans, publicIP)
+		seen[publicIP] = true
+	}
+
+	// Add local IPs (for LAN clients)
+	for _, ip := range localIPs {
+		if !seen[ip] {
+			sans = append(sans, ip)
+			seen[ip] = true
 		}
 	}
-	return out
-}
 
-func addHostIfMissing(hosts []string, host string) []string {
-	for _, h := range hosts {
-		if strings.EqualFold(h, host) {
-			return hosts
+	// Always include localhost
+	if !seen["localhost"] {
+		sans = append(sans, "localhost")
+	}
+
+	if len(sans) == 0 {
+		sans = []string{"127.0.0.1", "localhost"}
+		if verbose {
+			log.Printf("[DEBUG] No IPs detected, using fallback: %v", sans)
 		}
+	} else if verbose {
+		log.Printf("[DEBUG] Auto-detected SANs: %v", sans)
 	}
-	return append(hosts, host)
-}
 
-func fetchPublicIP() (string, error) {
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Get("https://api.ipify.org")
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("ipify http %d", resp.StatusCode)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
-	if err != nil {
-		return "", err
-	}
-	ip := strings.TrimSpace(string(body))
-	if net.ParseIP(ip) == nil {
-		return "", fmt.Errorf("invalid ipify response: %q", ip)
-	}
-	return ip, nil
+	return sans
 }

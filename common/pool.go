@@ -2,11 +2,11 @@ package common
 
 import "sync"
 
-const PoolBufSize = HeaderSize + MaxPacketSize
+const PoolBufSize = DataPlaneHdrSize + MaxPacketSize
 
 var BufferPool = sync.Pool{
 	New: func() interface{} {
-		// Allocate a buffer large enough for header + payload
+		// Allocate a buffer large enough for dataplane header + payload
 		return make([]byte, PoolBufSize)
 	},
 }

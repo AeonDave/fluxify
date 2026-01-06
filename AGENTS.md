@@ -12,14 +12,15 @@
 ## Operational notes
 - Client and server must be started with admin/sudo privileges; do not add runtime elevation prompts.
 - Client debug log (`client_debug.log`) is written only when `-v` is enabled.
+- Client telemetry log: use `-telemetry=<file>` to write MP-QUIC path stats every 5s (timestamped JSON snapshots with aggregate metrics, reorder buffer stats, and per-path telemetry).
 
 ## Bonding (important)
-- Target behavior: **packet-level striping + reorder** (bandwidth aggregation for single flows).
-- Server -> client now strips outbound packets across multiple UDP conns; client reorders inbound packets by `SeqNum`.
-- Client -> server already stripes outbound packets; server reorders inbound packets by `SeqNum`.
-- Related flags:
-  - Client: `-reorder-buffer-size` (inbound reorder, default 128)
-  - Client/Server: `-reorder-flush-timeout` (default 50ms)
+- Architecture: **MP-QUIC single-conn multipath** (one QUIC connection with multiple paths).
+- Uses `github.com/AeonDave/mp-quic-go` with LowLatencyScheduler and OLIA congestion control.
+- MultiSocketManager creates UDP sockets bound to each selected interface (Linux `SO_BINDTODEVICE`).
+- MP-QUIC handles path selection internally based on RTT, congestion window, and packet loss.
+- Reorder buffers (128 packets, 50ms flush timeout) are hardcoded and optimal for MP-QUIC.
+- No tuning flags: compression sample size, reorder buffer settings are optimized internally.
 
 ## Code style
 - Go 1.24+ required
@@ -34,18 +35,20 @@
 ## Project Architecture
 
 ### Core Components
-- **Server**: Multipath VPN server with mTLS control plane and UDP data plane
-- **Client**: Multipath VPN client supporting bonding and load-balance modes
+- **Server**: MP-QUIC multipath VPN server with mTLS control plane and QUIC data plane
+- **Client**: MP-QUIC multipath VPN client supporting bonding and load-balance modes
 - **Common**: Shared utilities for crypto, protocol, networking, and PKI
 
 ### Key Features
-- AES-256-GCM encryption for data plane
+- MP-QUIC single-conn multipath architecture with LowLatencyScheduler and OLIA
+- QUIC datagrams (RFC 9221) with TLS 1.3 encryption/integrity for data plane
 - mTLS control plane for authentication
 - Optional gzip compression
 - TUN interfaces for IP traffic (bonding mode)
-- Multipath routing with RTT-based scheduling
-- Heartbeat-based connection monitoring
-- Text User Interface (TUI) for certificate management
+- MultiSocketManager for per-interface UDP socket binding
+- Reorder buffers for handling out-of-order datagrams
+- Heartbeat-based path monitoring
+- Text User Interface (TUI) for certificate management and telemetry display
 
 ### Testing
 - Unit tests cover protocol serialization, crypto, compression

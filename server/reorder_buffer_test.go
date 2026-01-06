@@ -11,7 +11,7 @@ import (
 )
 
 func TestReorderBuffer_Insert_InOrder(t *testing.T) {
-	rb := newReorderBuffer(16)
+	rb := common.NewReorderBuffer(16, 50*time.Millisecond)
 
 	p1 := common.GetBuffer()
 	copy(p1, []byte{1})
@@ -26,7 +26,7 @@ func TestReorderBuffer_Insert_InOrder(t *testing.T) {
 }
 
 func TestReorderBuffer_Insert_OutOfOrderThenFillGap(t *testing.T) {
-	rb := newReorderBuffer(16)
+	rb := common.NewReorderBuffer(16, 50*time.Millisecond)
 
 	p2 := common.GetBuffer()
 	copy(p2, []byte{2})
@@ -58,7 +58,7 @@ func TestReorderBuffer_Insert_OutOfOrderThenFillGap(t *testing.T) {
 }
 
 func TestReorderBuffer_Insert_DuplicateIsDroppedAndReturnedToPool(t *testing.T) {
-	rb := newReorderBuffer(16)
+	rb := common.NewReorderBuffer(16, 50*time.Millisecond)
 
 	p2 := common.GetBuffer()
 	copy(p2, []byte{2})
@@ -82,7 +82,7 @@ func TestReorderBuffer_Insert_DuplicateIsDroppedAndReturnedToPool(t *testing.T) 
 }
 
 func TestReorderBuffer_FlushTimeout_SkipsGap(t *testing.T) {
-	rb := newReorderBuffer(16)
+	rb := common.NewReorderBuffer(16, 50*time.Millisecond)
 
 	p3 := common.GetBuffer()
 	copy(p3, []byte{3})
@@ -97,14 +97,4 @@ func TestReorderBuffer_FlushTimeout_SkipsGap(t *testing.T) {
 		t.Fatalf("expected flushed [3], got %v", out)
 	}
 	common.PutBuffer(out[0])
-}
-
-func TestSetServerReorderConfig_Clamps(t *testing.T) {
-	setServerReorderConfig(0, 0)
-	if serverReorderBufferSize < 4 {
-		t.Fatalf("expected buffer size clamped to >=4, got %d", serverReorderBufferSize)
-	}
-	if serverReorderFlushTimeout < time.Millisecond {
-		t.Fatalf("expected flush timeout clamped to >=1ms, got %v", serverReorderFlushTimeout)
-	}
 }

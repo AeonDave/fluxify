@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
-	"runtime"
 	"strings"
 	"syscall"
 )
@@ -24,7 +23,7 @@ func NewBoundUDPDialer(iface, localIP string) (*net.Dialer, error) {
 		d.LocalAddr = la
 	}
 
-	if iface != "" && runtime.GOOS == "linux" {
+	if iface != "" {
 		d.Control = func(network, address string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
 				_ = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface)
@@ -37,9 +36,6 @@ func NewBoundUDPDialer(iface, localIP string) (*net.Dialer, error) {
 // EnsurePolicyRouting installs per-interface policy routing (Linux only). Best-effort, idempotent-ish.
 // It adds a dedicated table and rule for source IP.
 func EnsurePolicyRouting(tableID int, srcCIDR, gw, dev string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	// ip route replace table <id> default via <gw> dev <dev> src <src>
 	cmds := [][]string{
 		{"ip", "route", "replace", "table", fmt.Sprint(tableID), srcCIDR, "dev", dev},
@@ -57,9 +53,6 @@ func EnsurePolicyRouting(tableID int, srcCIDR, gw, dev string) error {
 // GetDefaultRoute returns the first default route line along with parsed via/dev (Linux only).
 // If no default route is found, via/dev are empty.
 func GetDefaultRoute() (line, via, dev string, err error) {
-	if runtime.GOOS != "linux" {
-		return "", "", "", nil
-	}
 	out, err := exec.Command("ip", "route", "show", "default").Output()
 	if err != nil {
 		return "", "", "", err
@@ -84,9 +77,6 @@ func GetDefaultRoute() (line, via, dev string, err error) {
 // ReplaceDefaultRoute replaces the default route using the full route fields (Linux only).
 // Example: line "default via 192.168.1.1 dev eth0".
 func ReplaceDefaultRoute(line string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return fmt.Errorf("empty route line")
@@ -97,9 +87,6 @@ func ReplaceDefaultRoute(line string) error {
 
 // SetDefaultRouteDev replaces the default route to point to the given device (Linux only).
 func SetDefaultRouteDev(dev string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	if dev == "" {
 		return fmt.Errorf("device required")
 	}
@@ -108,9 +95,6 @@ func SetDefaultRouteDev(dev string) error {
 
 // SetDefaultRouteDevWithGateway replaces the default route via gateway on the given device (Linux only).
 func SetDefaultRouteDevWithGateway(dev, gateway string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	if dev == "" {
 		return fmt.Errorf("device required")
 	}
@@ -123,9 +107,6 @@ func SetDefaultRouteDevWithGateway(dev, gateway string) error {
 // GetDefaultRoute6 returns the IPv6 default route line along with via/dev (Linux only).
 // If no default route is found, via/dev are empty.
 func GetDefaultRoute6() (line, via, dev string, err error) {
-	if runtime.GOOS != "linux" {
-		return "", "", "", nil
-	}
 	out, err := exec.Command("ip", "-6", "route", "show", "default").Output()
 	if err != nil {
 		return "", "", "", err
@@ -149,9 +130,6 @@ func GetDefaultRoute6() (line, via, dev string, err error) {
 
 // ReplaceDefaultRoute6 replaces the IPv6 default route using the full route fields (Linux only).
 func ReplaceDefaultRoute6(line string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	line = strings.TrimSpace(line)
 	if line == "" {
 		return fmt.Errorf("empty route line")
@@ -162,9 +140,6 @@ func ReplaceDefaultRoute6(line string) error {
 
 // SetDefaultRouteDev6 replaces the IPv6 default route to point to the given device (Linux only).
 func SetDefaultRouteDev6(dev string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	if dev == "" {
 		return fmt.Errorf("device required")
 	}
@@ -173,9 +148,6 @@ func SetDefaultRouteDev6(dev string) error {
 
 // EnsureHostRoute6 ensures a host route via the given gateway/device (Linux only).
 func EnsureHostRoute6(ip, via, dev string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	if ip == "" || dev == "" {
 		return fmt.Errorf("ip and dev required")
 	}
@@ -193,9 +165,6 @@ func AddHostRoute6(ip, via, dev string) error {
 
 // DeleteHostRoute6 removes an IPv6 host route if present (best-effort, Linux only).
 func DeleteHostRoute6(ip string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	if ip == "" {
 		return nil
 	}
@@ -204,9 +173,6 @@ func DeleteHostRoute6(ip string) error {
 
 // EnsureHostRoute ensures a host route via the given gateway/device (Linux only).
 func EnsureHostRoute(ip, via, dev string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	if ip == "" || dev == "" {
 		return fmt.Errorf("ip and dev required")
 	}
@@ -224,16 +190,8 @@ func AddHostRoute(ip, via, dev string) error {
 
 // DeleteHostRoute removes a host route if present (best-effort, Linux only).
 func DeleteHostRoute(ip string) error {
-	if runtime.GOOS != "linux" {
-		return nil
-	}
 	if ip == "" {
 		return nil
 	}
 	return RunPrivileged("ip", "route", "del", ip)
-}
-
-// IsLinux reports whether the current GOOS is linux.
-func IsLinux() bool {
-	return runtime.GOOS == "linux"
 }

@@ -8,11 +8,10 @@ type ControlRequest struct {
 	ClientName string `json:"client_name"`
 }
 
-// ControlResponse returns session parameters and a base64-encoded session key.
+// ControlResponse returns session parameters for the QUIC data plane.
 type ControlResponse struct {
 	SessionID  uint32 `json:"session_id"`
-	SessionKey string `json:"session_key"`
-	UDPPort    int    `json:"udp_port"`
+	DataPort   int    `json:"data_port"`
 	ClientIP   string `json:"client_ip"`
 	ClientIPv6 string `json:"client_ip6,omitempty"`
 }

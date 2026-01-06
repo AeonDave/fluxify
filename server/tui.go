@@ -24,13 +24,25 @@ import (
 
 // runServerTUI launches the certificate management TUI (mouse-enabled).
 // hosts are the SAN entries to use when (re)generating server certs.
-func runServerTUI(pki common.PKIPaths, hosts []string, udpPort, ctrlPort int, iface string) {
+func runServerTUI(pki common.PKIPaths, hosts []string, udpPort, ctrlPort int, iface string, verbose bool) {
 	app := tview.NewApplication()
 	app.EnableMouse(true)
 
+	mouseEnabled := true
+
 	status := tview.NewTextView().SetDynamicColors(true).SetText("Ready")
-	status.SetBorder(true).SetTitle("Status")
+	status.SetBorder(true).SetTitle("Status (F2: toggle mouse)")
 	status.SetWrap(true)
+
+	setMouseEnabled := func(enabled bool) {
+		mouseEnabled = enabled
+		app.EnableMouse(enabled)
+		if enabled {
+			setStatus(status, "Ready (mouse enabled)")
+		} else {
+			setStatus(status, "Ready (mouse disabled - you can now select/copy text)")
+		}
+	}
 
 	styleBtn := func(b *tview.Button) {
 		b.SetBorder(false)
@@ -84,22 +96,16 @@ func runServerTUI(pki common.PKIPaths, hosts []string, udpPort, ctrlPort int, if
 				if err := common.EnsureBasePKI(pki, hosts, false); err != nil {
 					return err
 				}
-				datedCert, datedKey, _, _, err := common.GenerateDatedClientCert(pki, name, timeNow())
-				if err != nil {
-					return err
-				}
-				if err := removeClientBundles(pki.ClientsDir, clientBaseFromCertPath(datedCert)); err != nil {
-					return err
-				}
-				return writeClientBundle(pki, datedCert, datedKey)
+				_, err := common.GenerateClientBundle(pki, name)
+				return err
 			}, func(err error) {
 				if err == nil {
 					refreshAndRenderWithButtons(name)
 				}
 			})
 		}
-		if clientHasCert(pki, name) {
-			confirmOverwrite(pages, fmt.Sprintf("Regenerate client %s? This replaces existing cert.", name), doGenerate)
+		if clientHasBundle(pki, name) {
+			confirmOverwrite(pages, fmt.Sprintf("Regenerate client %s? This replaces existing bundle.", name), doGenerate)
 			return
 		}
 		doGenerate()
@@ -130,7 +136,7 @@ func runServerTUI(pki common.PKIPaths, hosts []string, udpPort, ctrlPort int, if
 					return
 				}
 				runAsync(app, status, "Regenerating CA/Server", func() error {
-					if err := clearClientCerts(pki.ClientsDir); err != nil {
+					if err := clearClientBundles(pki.ClientsDir); err != nil {
 						return err
 					}
 					return common.EnsureBasePKI(pki, hosts, true)
@@ -150,9 +156,10 @@ func runServerTUI(pki common.PKIPaths, hosts []string, udpPort, ctrlPort int, if
 		if !isSelectable(name) {
 			return
 		}
-		confirmOverwrite(pages, fmt.Sprintf("Regenerate client %s? This replaces existing cert.", name), func() {
+		confirmOverwrite(pages, fmt.Sprintf("Regenerate client %s? This replaces existing bundle.", name), func() {
 			runAsync(app, status, fmt.Sprintf("Regenerating %s", name), func() error {
-				return regenerateClientCert(pki, name)
+				_, err := common.GenerateClientBundle(pki, name)
+				return err
 			}, func(err error) {
 				if err == nil {
 					refreshAndRenderWithButtons(name)
@@ -168,9 +175,9 @@ func runServerTUI(pki common.PKIPaths, hosts []string, udpPort, ctrlPort int, if
 		if !isSelectable(name) {
 			return
 		}
-		confirmOverwrite(pages, fmt.Sprintf("Delete client %s certs? This removes files from disk.", name), func() {
+		confirmOverwrite(pages, fmt.Sprintf("Delete client %s bundle? This removes files from disk.", name), func() {
 			runAsync(app, status, fmt.Sprintf("Deleting %s", name), func() error {
-				return deleteClientCerts(pki, name)
+				return deleteClientBundle(pki, name)
 			}, func(err error) {
 				if err == nil {
 					refreshAndRenderWithButtons("")
@@ -252,6 +259,10 @@ func runServerTUI(pki common.PKIPaths, hosts []string, udpPort, ctrlPort int, if
 			app.Stop()
 			return nil
 		}
+		if event.Key() == tcell.KeyF2 {
+			setMouseEnabled(!mouseEnabled)
+			return nil
+		}
 		return event
 	})
 
@@ -294,18 +305,13 @@ func serverCertSANs(certPath string) (string, string) {
 	return formatCertSANs(crt)
 }
 
-func setStatus(tv *tview.TextView, msg string) {
-	tv.SetText(msg)
-}
-
-func updateDetails(tv *tview.TextView, msg string) {
-	tv.SetText(msg)
-}
+func setStatus(tv *tview.TextView, msg string)     { tv.SetText(msg) }
+func updateDetails(tv *tview.TextView, msg string) { tv.SetText(msg) }
 
 func refreshClients(list *tview.List, pki common.PKIPaths) int {
 	_ = os.MkdirAll(pki.ClientsDir, 0o700)
 	list.Clear()
-	entries, err := listClientCerts(pki)
+	entries, err := listClientBundles(pki)
 	if err != nil {
 		list.AddItem(fmt.Sprintf("<error: %v>", err), "", 0, nil)
 		return 0
@@ -336,17 +342,11 @@ func selectAndRender(list *tview.List, details *tview.TextView, pki common.PKIPa
 		updateDetails(details, "<no details>")
 		return
 	}
-	var body string
-	if txt, err := renderCertDetails(pki, main); err == nil {
-		body = txt
-	} else {
-		if alt, altErr := renderAnyCertDetails(pki, main); altErr == nil {
-			body = alt
-		} else {
-			body = fmt.Sprintf("[red]%v", err)
-		}
+	if txt, err := renderBundleDetails(pki, main); err == nil {
+		updateDetails(details, txt)
+		return
 	}
-	updateDetails(details, body)
+	updateDetails(details, "[red]failed to parse bundle")
 }
 
 type clientEntry struct {
@@ -354,7 +354,7 @@ type clientEntry struct {
 	warn string
 }
 
-func listClientCerts(pki common.PKIPaths) ([]clientEntry, error) {
+func listClientBundles(pki common.PKIPaths) ([]clientEntry, error) {
 	entries := make([]clientEntry, 0)
 	seen := make(map[string]struct{})
 	err := filepath.WalkDir(pki.ClientsDir, func(path string, d fs.DirEntry, err error) error {
@@ -365,17 +365,13 @@ func listClientCerts(pki common.PKIPaths) ([]clientEntry, error) {
 			return nil
 		}
 		name := d.Name()
-		if strings.HasSuffix(name, "-key.pem") {
+		if !strings.HasSuffix(name, ".bundle") {
 			return nil
 		}
-		if !strings.HasSuffix(name, ".pem") {
-			return nil
-		}
-		base := ""
-		if m := datedCertRe.FindStringSubmatch(name); len(m) == 2 {
+		base := strings.TrimSuffix(name, ".bundle")
+		// remove possible date suffix (legacy)
+		if m := datedBundleRe.FindStringSubmatch(base); len(m) == 2 {
 			base = m[1]
-		} else {
-			base = strings.TrimSuffix(name, ".pem")
 		}
 		seen[base] = struct{}{}
 		return nil
@@ -390,82 +386,35 @@ func listClientCerts(pki common.PKIPaths) ([]clientEntry, error) {
 	sort.Strings(names)
 	for _, name := range names {
 		warn := ""
-		certPath, keyPath, err := common.FindLatestDatedClientCert(pki, name)
-		if err == nil {
-			if _, err := os.Stat(certPath); err != nil {
-				warn = fmt.Sprintf("cert missing: %v", err)
-			}
-			if _, err := os.Stat(keyPath); err != nil {
-				if warn != "" {
-					warn += "; "
-				}
-				warn += fmt.Sprintf("key missing: %v", err)
-			}
+		// We expect <name>.bundle
+		p := filepath.Join(pki.ClientsDir, name+".bundle")
+		if _, err := os.Stat(p); err != nil {
+			warn = fmt.Sprintf("missing: %v", err)
 		}
 		entries = append(entries, clientEntry{name: name, warn: warn})
 	}
 	return entries, nil
 }
 
-// clientCertPair resolves latest cert/key for a client name.
-func clientCertPair(pki common.PKIPaths, name string) (cert, key string, err error) {
-	return common.FindLatestDatedClientCert(pki, name)
-}
-
-// renderCertDetails loads certificate info for display.
-func renderCertDetails(pki common.PKIPaths, name string) (string, error) {
-	certPath, _, err := clientCertPair(pki, name)
+func renderBundleDetails(pki common.PKIPaths, name string) (string, error) {
+	p := filepath.Join(pki.ClientsDir, name+".bundle")
+	// Bundle is gzip+PEM, use loader to validate and obtain cert chain.
+	tlsCfg, err := common.LoadClientBundle(p)
 	if err != nil {
 		return "", err
 	}
-	b, err := os.ReadFile(certPath)
-	if err != nil {
-		return "", err
+	if len(tlsCfg.Certificates) == 0 || len(tlsCfg.Certificates[0].Certificate) == 0 {
+		return "", fmt.Errorf("bundle has no certificate")
 	}
-	bl, _ := pem.Decode(b)
-	if bl == nil {
-		return "", fmt.Errorf("invalid pem")
-	}
-	crt, err := x509.ParseCertificate(bl.Bytes)
+	crt, err := x509.ParseCertificate(tlsCfg.Certificates[0].Certificate[0])
 	if err != nil {
 		return "", err
 	}
 	gen := crt.NotBefore.UTC().Format(time.RFC3339)
 	exp := crt.NotAfter.UTC().Format(time.RFC3339)
-	subject := crt.Subject.CommonName
 	sanDNS, sanIPs := formatCertSANs(crt)
-	return fmt.Sprintf("Client: [white]%s\nCN: [white]%s\nGenerated: [white]%s\nExpires: [white]%s\nIssuer: [white]%s\nSAN DNS: [white]%s\nSAN IP: [white]%s", name, subject, gen, exp, crt.Issuer.CommonName, sanDNS, sanIPs), nil
-}
-
-// renderAnyCertDetails tries any cert on disk for the client (non-dated fallback) to aid debugging.
-func renderAnyCertDetails(pki common.PKIPaths, name string) (string, error) {
-	pattern := filepath.Join(pki.ClientsDir, fmt.Sprintf("%s*.pem", name))
-	matches, err := filepath.Glob(pattern)
-	if err != nil {
-		return "", err
-	}
-	for _, certPath := range matches {
-		if strings.HasSuffix(certPath, "-key.pem") {
-			continue
-		}
-		b, err := os.ReadFile(certPath)
-		if err != nil {
-			continue
-		}
-		bl, _ := pem.Decode(b)
-		if bl == nil {
-			continue
-		}
-		crt, err := x509.ParseCertificate(bl.Bytes)
-		if err != nil {
-			continue
-		}
-		gen := crt.NotBefore.UTC().Format(time.RFC3339)
-		exp := crt.NotAfter.UTC().Format(time.RFC3339)
-		sanDNS, sanIPs := formatCertSANs(crt)
-		return fmt.Sprintf("Client: [white]%s\nCN: [white]%s\nGenerated: [white]%s\nExpires: [white]%s\nIssuer: [white]%s\nSAN DNS: [white]%s\nSAN IP: [white]%s\n[gray](from %s)", name, crt.Subject.CommonName, gen, exp, crt.Issuer.CommonName, sanDNS, sanIPs, filepath.Base(certPath)), nil
-	}
-	return "", fmt.Errorf("no parsable cert for %s", name)
+	return fmt.Sprintf("Client: [white]%s\nCN: [white]%s\nGenerated: [white]%s\nExpires: [white]%s\nIssuer: [white]%s\nSAN DNS: [white]%s\nSAN IP: [white]%s",
+		name, crt.Subject.CommonName, gen, exp, crt.Issuer.CommonName, sanDNS, sanIPs), nil
 }
 
 func formatCertSANs(crt *x509.Certificate) (string, string) {
@@ -484,8 +433,7 @@ func formatCertSANs(crt *x509.Certificate) (string, string) {
 	return dns, ips
 }
 
-// clearClientCerts removes all files in the clients directory.
-func clearClientCerts(dir string) error {
+func clearClientBundles(dir string) error {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -498,14 +446,10 @@ func clearClientCerts(dir string) error {
 	return nil
 }
 
-var datedCertRe = regexp.MustCompile(`^(.+)-\d{8}-\d{6}\.pem$`)
+var datedBundleRe = regexp.MustCompile(`^(.+)-\d{8}-\d{6}$`)
 
-// timeNow allows tests to stub time.
-var timeNow = func() time.Time {
-	return time.Now()
-}
+var timeNow = func() time.Time { return time.Now() }
 
-// runAsync executes work in a goroutine and updates the status with a spinner until completion.
 func runAsync(app *tview.Application, status *tview.TextView, label string, work func() error, onDone func(err error)) {
 	frames := []rune{'|', '/', '-', '\\'}
 	stop := make(chan struct{})
@@ -541,46 +485,14 @@ func runAsync(app *tview.Application, status *tview.TextView, label string, work
 	}()
 }
 
-func regenerateClientCert(pki common.PKIPaths, name string) error {
-	datedCert, datedKey, _, _, err := common.GenerateDatedClientCert(pki, name, timeNow())
-	if err != nil {
-		return err
-	}
-	if err := removeClientBundles(pki.ClientsDir, clientBaseFromCertPath(datedCert)); err != nil {
-		return err
-	}
-	return writeClientBundle(pki, datedCert, datedKey)
-}
-
-func deleteClientCerts(pki common.PKIPaths, name string) error {
-	matches, err := filepath.Glob(filepath.Join(pki.ClientsDir, fmt.Sprintf("%s-*.pem", name)))
-	if err != nil {
-		return err
-	}
-	for _, m := range matches {
-		_ = os.Remove(m)
-		_ = os.Remove(strings.TrimSuffix(m, ".pem") + "-key.pem")
-	}
-	if err := removeClientBundles(pki.ClientsDir, name); err != nil {
-		return err
-	}
-	return nil
-}
-
-func clientHasCert(pki common.PKIPaths, name string) bool {
-	pattern := filepath.Join(pki.ClientsDir, fmt.Sprintf("%s-*.pem", name))
-	matches, _ := filepath.Glob(pattern)
-	for _, m := range matches {
-		if strings.HasSuffix(m, "-key.pem") {
-			continue
-		}
-		key := strings.TrimSuffix(m, ".pem") + "-key.pem"
-		if _, err := os.Stat(key); err == nil {
-			return true
-		}
-	}
-	_, _, err := common.FindLatestDatedClientCert(pki, name)
+func clientHasBundle(pki common.PKIPaths, name string) bool {
+	_, err := os.Stat(filepath.Join(pki.ClientsDir, name+".bundle"))
 	return err == nil
+}
+
+func deleteClientBundle(pki common.PKIPaths, name string) error {
+	_ = os.Remove(filepath.Join(pki.ClientsDir, name+".bundle"))
+	return nil
 }
 
 func selectByName(list *tview.List, name string) {
@@ -604,57 +516,4 @@ func confirmOverwrite(pages *tview.Pages, text string, onConfirm func()) {
 			}
 		})
 	pages.AddPage("confirmOverwrite", modal, true, true)
-}
-
-func writeClientBundle(pki common.PKIPaths, certPath, keyPath string) error {
-	read := func(src string) ([]byte, error) {
-		b, err := os.ReadFile(src)
-		if err != nil {
-			return nil, err
-		}
-		return b, nil
-	}
-	caBytes, err := read(pki.CACert)
-	if err != nil {
-		return fmt.Errorf("read CA: %w", err)
-	}
-	certBytes, err := read(certPath)
-	if err != nil {
-		return err
-	}
-	keyBytes, err := read(keyPath)
-	if err != nil {
-		return err
-	}
-	payload := make([]byte, 0, len(caBytes)+len(certBytes)+len(keyBytes)+2)
-	payload = append(payload, caBytes...)
-	payload = append(payload, '\n')
-	payload = append(payload, certBytes...)
-	payload = append(payload, '\n')
-	payload = append(payload, keyBytes...)
-	bundlePath := strings.TrimSuffix(certPath, ".pem") + ".bundle"
-	return os.WriteFile(bundlePath, payload, 0o600)
-}
-
-func clientBaseFromCertPath(certPath string) string {
-	base := filepath.Base(certPath)
-	if m := datedCertRe.FindStringSubmatch(base); len(m) == 2 {
-		return m[1]
-	}
-	return strings.TrimSuffix(base, filepath.Ext(base))
-}
-
-func removeClientBundles(dir, name string) error {
-	if name == "" {
-		return nil
-	}
-	matches, err := filepath.Glob(filepath.Join(dir, fmt.Sprintf("%s-*.bundle", name)))
-	if err != nil {
-		return err
-	}
-	for _, m := range matches {
-		_ = os.Remove(m)
-	}
-	_ = os.Remove(filepath.Join(dir, fmt.Sprintf("%s.bundle", name)))
-	return nil
 }
