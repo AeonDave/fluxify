@@ -41,6 +41,19 @@ type DataPlaneHeader struct {
 	Flags     uint8
 }
 
+func DataPlaneTypeName(t uint8) string {
+	switch t {
+	case DPTypeIP:
+		return "IP"
+	case DPTypeHeartbeat:
+		return "Heartbeat"
+	case DPTypeHandshake:
+		return "Handshake"
+	default:
+		return "Unknown"
+	}
+}
+
 func (h *DataPlaneHeader) MarshalTo(dst []byte) ([]byte, error) {
 	if cap(dst) < DataPlaneHdrSize {
 		dst = make([]byte, DataPlaneHdrSize)

@@ -4,6 +4,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -98,8 +99,8 @@ func NewServer(port, ctrlPort int, iface string, pki common.PKIPaths, verbose bo
 		sessions:       make(map[uint32]*serverSession),
 		ipToSession:    make(map[string]*serverSession),
 		clientSessions: make(map[string]*serverSession),
-		tunWriteCh:     make(chan []byte, 512),
-		outboundCh:     make(chan *outboundJob, 512),
+		tunWriteCh:     make(chan []byte, 4096),
+		outboundCh:     make(chan *outboundJob, 4096),
 		reorderSize:    rsize,
 		reorderFlush:   rflush,
 	}
@@ -179,8 +180,11 @@ func (s *Server) Start() error {
 
 	s.logDebug("QUIC: creating multipath config (MaxPaths=5, AutoPaths=true, Scheduler=LowLatency)")
 	qc := &quic.Config{
-		EnableDatagrams: true,
-		MaxPaths:        5,
+		EnableDatagrams:   true,
+		InitialPacketSize: 1500, // Match Ethernet MTU; allows datagrams up to ~1400 bytes
+		MaxIdleTimeout:    60 * time.Second,
+		KeepAlivePeriod:   15 * time.Second,
+		MaxPaths:          5,
 		MultipathController: quic.NewDefaultMultipathController(
 			quic.NewLowLatencyScheduler(),
 		),
@@ -209,9 +213,9 @@ func (s *Server) Start() error {
 	go s.tunReadLoop()
 
 	numReaders := runtime.NumCPU()
-	s.logDebug("Starting QUIC accept loop with %d reader workers...", numReaders)
+	s.logDebug("Starting QUIC accept loop...")
 	s.wg.Add(1)
-	go s.acceptLoop(numReaders)
+	go s.acceptLoop()
 
 	s.logDebug("Starting %d outbound workers...", numReaders)
 	for i := 0; i < numReaders; i++ {
@@ -227,7 +231,7 @@ func (s *Server) Start() error {
 	return nil
 }
 
-func (s *Server) acceptLoop(numReaders int) {
+func (s *Server) acceptLoop() {
 	defer s.wg.Done()
 	s.logDebug("acceptLoop: started")
 	for s.running.Load() {
@@ -238,11 +242,9 @@ func (s *Server) acceptLoop(numReaders int) {
 			}
 			return
 		}
-		s.logDebug("acceptLoop: new QUIC connection from %s, starting %d readers", conn.RemoteAddr(), numReaders)
-		for i := 0; i < numReaders; i++ {
-			s.wg.Add(1)
-			go s.quicReadLoop(conn)
-		}
+		s.logDebug("acceptLoop: new QUIC connection from %s", conn.RemoteAddr())
+		s.wg.Add(1)
+		go s.quicReadLoop(conn)
 	}
 	s.logDebug("acceptLoop: stopped")
 }
@@ -266,7 +268,7 @@ func (s *Server) quicReadLoop(conn *quic.Conn) {
 			s.logDebug("quicReadLoop: unknown session ID: %d", h.SessionID)
 			continue
 		}
-		s.logDebug("quicReadLoop: received %s datagram (session=%d, seq=%d, len=%d)", h.Type, h.SessionID, h.SeqNum, len(payload))
+		s.logDebug("quicReadLoop: received datagram type=%d(%s) (session=%d, seq=%d, len=%d)", h.Type, common.DataPlaneTypeName(h.Type), h.SessionID, h.SeqNum, len(payload))
 		s.handleDatagram(conn, sess, h, payload)
 	}
 }
@@ -290,32 +292,14 @@ func (s *Server) handleDatagram(conn *quic.Conn, sess *serverSession, h common.D
 		// echo back
 		head := common.DataPlaneHeader{Version: common.DataPlaneVersion, Type: common.DPTypeHeartbeat, SessionID: sess.id, SeqNum: 0, Flags: 0}
 		dg, _ := common.BuildDataPlaneDatagram(nil, head, payload)
-		_ = conn.SendDatagram(dg)
+		if err := conn.SendDatagram(dg); err != nil {
+			s.logDebug("handleDatagram: heartbeat echo FAILED: %v", err)
+		} else {
+			s.logDebug("handleDatagram: heartbeat echoed len=%d", len(dg))
+		}
 	case common.DPTypeIP:
 		data := payload
-		if (h.Flags & common.DPFlagCompression) != 0 {
-			s.logDebug("handleDatagram: decompressing packet (compressed_size=%d)", len(payload))
-			outBuf := common.GetBuffer()
-			dec, err := common.DecompressPayloadInto(outBuf, payload, common.MaxPacketSize)
-			if err != nil {
-				common.PutBuffer(outBuf)
-				return
-			}
-			data = dec
-			// Copy into pooled buffer for reorder buffer storage
-			storageBuf := common.GetBuffer()
-			copy(storageBuf, data)
-			common.PutBuffer(outBuf)
-			ordered := sess.reorderBuf.Insert(h.SeqNum, storageBuf[:len(data)])
-			for _, pkt := range ordered {
-				select {
-				case s.tunWriteCh <- pkt:
-				default:
-					common.PutBuffer(pkt)
-				}
-			}
-			return
-		}
+		// Compression disabled - ignore flag, just use raw payload
 		if !common.IsIPPacket(data) {
 			return
 		}
@@ -386,7 +370,7 @@ func (s *Server) outboundWorker() {
 		if chosen != nil {
 			s.logDebug("QUIC send: %d bytes", len(job.data))
 			job.sess.touch()
-			_ = job.sess.sendDatagram(chosen, common.DPTypeIP, job.data, true)
+			_ = job.sess.sendDatagram(chosen, common.DPTypeIP, job.data)
 		}
 		common.PutBuffer(job.data)
 	}
@@ -491,6 +475,11 @@ func (s *Server) handleControl(conn net.Conn) {
 	reqData, err := io.ReadAll(peer)
 	if err != nil {
 		s.logDebug("handleControl: failed to read request: %v", err)
+		return
+	}
+	if len(bytes.TrimSpace(reqData)) == 0 {
+		// A client may connect and complete the TLS handshake as a connectivity probe
+		// (e.g. diagnostics), then close without sending a control request.
 		return
 	}
 	var req common.ControlRequest

@@ -198,23 +198,15 @@ func (s *serverSession) isIdle() bool {
 	return time.Duration(time.Now().UnixNano()-s.lastSeen.Load()) > sessionIdleTimeout
 }
 
-func (s *serverSession) sendDatagram(conn *serverConn, ptype uint8, payload []byte, compress bool) error {
+func (s *serverSession) sendDatagram(conn *serverConn, ptype uint8, payload []byte) error {
 	if conn == nil || conn.conn == nil {
 		return nil
 	}
-	finalPayload := payload
-	flags := uint8(0)
-	if compress {
-		if c, err := common.CompressPayload(payload); err == nil && len(c) < len(payload) {
-			finalPayload = c
-			flags |= common.DPFlagCompression
-		}
-	}
 	seq := s.nextSeqSend.Add(1)
-	head := common.DataPlaneHeader{Version: common.DataPlaneVersion, Type: ptype, SessionID: s.id, SeqNum: seq, Flags: flags}
+	head := common.DataPlaneHeader{Version: common.DataPlaneVersion, Type: ptype, SessionID: s.id, SeqNum: seq, Flags: 0}
 	buf := common.GetBuffer()
 	defer common.PutBuffer(buf)
-	dg, err := common.BuildDataPlaneDatagram(buf, head, finalPayload)
+	dg, err := common.BuildDataPlaneDatagram(buf, head, payload)
 	if err != nil {
 		return err
 	}

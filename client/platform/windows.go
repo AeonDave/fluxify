@@ -28,12 +28,12 @@ type Uplink struct {
 }
 
 func GatewayForIface(r Runner, iface string) (string, error) {
-	vlogf("GatewayForIface(%s): checking gateway...", iface)
+	vvlogf("GatewayForIface(%s): checking gateway...", iface)
 	if gw, err := gatewayViaPowerShell(r, iface, false); err == nil && gw != "" {
-		vlogf("GatewayForIface(%s): found via PowerShell: %s", iface, gw)
+		vvlogf("GatewayForIface(%s): found via PowerShell: %s", iface, gw)
 		return gw, nil
 	} else {
-		vlogf("GatewayForIface(%s): PowerShell failed/empty (err=%v), falling back to route print", iface, err)
+		vvlogf("GatewayForIface(%s): PowerShell failed/empty (err=%v), falling back to route print", iface, err)
 	}
 	ifaceIP, err := getInterfaceIP(iface, false)
 	if err != nil {
@@ -50,11 +50,11 @@ func GatewayForIface(r Runner, iface string) (string, error) {
 			continue
 		}
 		if f[0] == "0.0.0.0" && f[1] == "0.0.0.0" && f[3] == ifaceIP.String() {
-			vlogf("GatewayForIface(%s): found via route print: %s", iface, f[2])
+			vvlogf("GatewayForIface(%s): found via route print: %s", iface, f[2])
 			return f[2], nil
 		}
 	}
-	vlogf("GatewayForIface(%s): no default gateway found in route print for IP %s", iface, ifaceIP)
+	vvlogf("GatewayForIface(%s): no default gateway found in route print for IP %s", iface, ifaceIP)
 	return "", nil
 }
 
@@ -196,9 +196,7 @@ func parsePingRTT(out string) time.Duration {
 
 func parsePingMillis(s string) time.Duration {
 	s = strings.TrimSpace(s)
-	if strings.HasPrefix(s, "<") {
-		s = strings.TrimPrefix(s, "<")
-	}
+	s = strings.TrimPrefix(s, "<")
 	if idx := strings.Index(s, "ms"); idx != -1 {
 		s = s[:idx]
 	}

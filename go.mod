@@ -3,7 +3,7 @@ module fluxify
 go 1.24.0
 
 require (
-	github.com/AeonDave/mp-quic-go v0.1.2
+	github.com/AeonDave/mp-quic-go v0.1.3
 	github.com/gdamore/tcell/v2 v2.13.5
 	github.com/rivo/tview v0.42.0
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8

@@ -28,40 +28,40 @@ type Uplink struct {
 }
 
 func GatewayForIface(r Runner, iface string) (string, error) {
-	vlogf("GatewayForIface(%s): checking...", iface)
+	vvlogf("GatewayForIface(%s): checking...", iface)
 	out, err := r.OutputSafe("ip", "route", "get", "8.8.8.8", "oif", iface)
 	if err != nil {
-		vlogf("GatewayForIface(%s): ip route get failed: %v", iface, err)
+		vvlogf("GatewayForIface(%s): ip route get failed: %v", iface, err)
 		return "", err
 	}
 	fields := strings.Fields(string(out))
 	for i := 0; i < len(fields)-1; i++ {
 		if fields[i] == "via" {
 			gw := fields[i+1]
-			vlogf("GatewayForIface(%s): found gw %s", iface, gw)
+			vvlogf("GatewayForIface(%s): found gw %s", iface, gw)
 			return gw, nil
 		}
 	}
-	vlogf("GatewayForIface(%s): no 'via' field in output", iface)
+	vvlogf("GatewayForIface(%s): no 'via' field in output", iface)
 	return "", nil
 }
 
 func GatewayForIface6(r Runner, iface string) (string, error) {
-	vlogf("GatewayForIface6(%s): checking...", iface)
+	vvlogf("GatewayForIface6(%s): checking...", iface)
 	out, err := r.OutputSafe("ip", "-6", "route", "get", "2001:4860:4860::8888", "oif", iface)
 	if err != nil {
-		vlogf("GatewayForIface6(%s): ip route get failed: %v", iface, err)
+		vvlogf("GatewayForIface6(%s): ip route get failed: %v", iface, err)
 		return "", err
 	}
 	fields := strings.Fields(string(out))
 	for i := 0; i < len(fields)-1; i++ {
 		if fields[i] == "via" {
 			gw := fields[i+1]
-			vlogf("GatewayForIface6(%s): found gw %s", iface, gw)
+			vvlogf("GatewayForIface6(%s): found gw %s", iface, gw)
 			return gw, nil
 		}
 	}
-	vlogf("GatewayForIface6(%s): no 'via' field in output", iface)
+	vvlogf("GatewayForIface6(%s): no 'via' field in output", iface)
 	return "", nil
 }
 

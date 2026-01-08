@@ -165,8 +165,12 @@ type ifaceDNSBackup struct {
 
 func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 	cfg.Ifaces = sanitizeIfaces(cfg.Ifaces, true)
-	if len(cfg.Ifaces) < 2 {
-		return nil, nil, fmt.Errorf("need at least 2 usable interfaces for bonding")
+	if len(cfg.Ifaces) < 1 {
+		return nil, nil, fmt.Errorf("need at least 1 usable interface")
+	}
+	// Allow single-interface mode for testing (multipath disabled)
+	if len(cfg.Ifaces) == 1 {
+		vlogf("bonding: WARNING - single interface mode, multipath disabled")
 	}
 	if runtime.GOOS == "windows" && !common.IsRoot() {
 		return nil, nil, fmt.Errorf("run the client as administrator on windows to create the TUN interface")
@@ -179,6 +183,7 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		certInfo = "(auto)"
 	}
 	vlogf("bonding: starting with cert=%s server=%s pki=%s", certInfo, cfg.Server, cfg.PKI)
+	vlogf("bonding: selected interfaces: %v", cfg.Ifaces)
 	ctrlHost, ctrlPort, err := parseServerAddr(cfg.Server, cfg.Ctrl)
 	if err != nil {
 		return nil, nil, err
@@ -251,21 +256,60 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		vlogf("bonding: using custom MTU %d", mtu)
 	}
 
-	// Probe PMTUD if requested
-	if cfg.ProbePMTUD && ctrlHost != "" {
+	// Conservative sizing budgets.
+	//
+	// We need the underlay to carry: IP+UDP headers + QUIC packet (which contains a DATAGRAM frame)
+	// where the DATAGRAM payload is: DataPlaneHdr (11) + inner IP packet (<= TUN MTU).
+	//
+	// The previous logic subtracted a single "overhead" value from the probed MTU, but it didn't
+	// include IP+UDP headers or the dataplane header, which can easily push us over the real wire MTU
+	// and manifest as high loss / stalls on Windows.
+	const (
+		maxIPUDPOverhead         = 48 // IPv6(40)+UDP(8); worst-case safe even if underlay is IPv4
+		datagramFrameOverhead    = 4  // type + varint length (worst-case budget)
+		quicPacketOverheadBudget = 48 // short header + packet number + AEAD tag + misc (budget)
+	)
+
+	// Dynamic MTU adaptation: always probe if MTU not fixed by user
+	// If user specifically requested probing, or if in auto mode (MTU=0)
+	if (cfg.ProbePMTUD || cfg.MTU == 0) && ctrlHost != "" {
 		vlogf("bonding: probing path MTU to %s...", ctrlHost)
-		probeResult := common.ProbePMTUD(ctrlHost, mtu, 5*time.Second)
-		if probeResult.Success {
-			log.Printf("PMTUD: %s", common.FormatPMTUDResult(probeResult))
+		// Use AutoProbe to find the actual working wire MTU
+		// Keep this short: if ICMP is blocked, probing will never succeed.
+		probeTimeout := 1 * time.Second
+		wireMTU, result := common.AutoProbePMTUD(ctrlHost, probeTimeout)
+
+		if result.Success {
+			vlogf("PMTUD: path supports wire MTU %d", wireMTU)
+			// Calculate max safe TUN MTU.
+			// Ensure: max wire packet size >= IP+UDP + QUIC packet size.
+			// QUIC packet must fit a DATAGRAM with DataPlaneHdr + inner IP packet.
+			safeTunMTU := wireMTU - maxIPUDPOverhead - quicPacketOverheadBudget - datagramFrameOverhead - common.DataPlaneHdrSize
+
+			// Start with conservative defaults if calculation yields weird results
+			if safeTunMTU < 1000 {
+				safeTunMTU = 1000
+			}
+
+			if cfg.MTU == 0 {
+				log.Printf("PMTUD: auto-configured TUN MTU %d (wire %d - headers/overhead budget %d)", safeTunMTU, wireMTU, maxIPUDPOverhead+quicPacketOverheadBudget+datagramFrameOverhead+common.DataPlaneHdrSize)
+				mtu = safeTunMTU
+			} else if cfg.MTU > safeTunMTU {
+				log.Printf("WARNING: configured MTU %d + overhead > wire MTU %d. Packet loss likely.", cfg.MTU, wireMTU)
+			}
 		} else {
-			log.Printf("WARNING: %s", common.FormatPMTUDResult(probeResult))
-			if probeResult.SuggestMTU > 0 && cfg.MTU == 0 {
-				// Auto-reduce MTU if not explicitly set
-				log.Printf("PMTUD: auto-reducing MTU from %d to %d", mtu, probeResult.SuggestMTU)
-				mtu = probeResult.SuggestMTU
+			log.Printf("PMTUD: all probes failed, defaulting to conservative MTU")
+			if cfg.MTU == 0 {
+				// Standard safe fallback when ICMP is blocked.
+				// 1200 is universally safe (well below 1280 IPv6 minimum after all overhead).
+				mtu = 1200
 			}
 		}
 	}
+
+	// Update the config with the final determined MTU so that dialQUICMultipath sees it
+	cfg.MTU = mtu
+	state.cfg.MTU = mtu // Ensure state has the updated config!
 
 	vlogf("bonding: configuring TUN with %s/24 (IPv4) and %s (IPv6), MTU=%d", clientIP, ipv6CIDR, mtu)
 	if err := common.ConfigureTUN(common.TUNConfig{IfaceName: tun.Name(), CIDR: clientIP + "/24", IPv6CIDR: ipv6CIDR, MTU: mtu}); err != nil {
@@ -292,9 +336,10 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		state.ifaceDNS = applyIfaceDNS(cfg.Ifaces, dns4, dns6)
 	}
 
-	// Configure VPN routing: save old default route, add host route for server, set default via TUN
+	// Configure VPN routing: save old default route, add host routes for server via ALL interfaces, set default via TUN
+	vlogf("bonding: dialing QUIC multipath with %d interfaces: %v", len(cfg.Ifaces), cfg.Ifaces)
 	vlogf("bonding: configuring VPN routes")
-	oldRoute, oldVia, oldDev, err := common.GetDefaultRoute()
+	oldRoute, _, _, err := common.GetDefaultRoute()
 	if err != nil {
 		log.Printf("bonding: warning: could not get default route: %v", err)
 	}
@@ -303,13 +348,23 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		oldRoute6, oldVia6, oldDev6, _ = common.GetDefaultRoute6()
 	}
 
-	// Add host route for VPN server so traffic to server goes via original gateway
+	// Add host routes for VPN server via ALL bonding interfaces (required for multipath)
 	serverIP, _, _ := net.SplitHostPort(serverAddr)
-	if serverIP != "" && oldVia != "" && oldDev != "" {
-		if err := common.EnsureHostRoute(serverIP, oldVia, oldDev); err != nil {
-			log.Printf("bonding: warning: could not add host route for server: %v", err)
-		} else {
-			vlogf("bonding: added host route for %s via %s/%s", serverIP, oldVia, oldDev)
+	var addedHostRoutes []string
+	if serverIP != "" {
+		for _, iface := range cfg.Ifaces {
+			gw, err := platform.GatewayForIface(bondingRunner{}, iface)
+			if err != nil || gw == "" {
+				vvlogf("bonding: skipping host route for %s (no gateway: %v)", iface, err)
+				continue
+			}
+			// Use AddHostRoute (doesn't delete existing) so we can have multiple routes
+			if err := common.AddHostRoute(serverIP, gw, iface); err != nil {
+				vlogf("bonding: warning: could not add host route for server via %s/%s: %v", gw, iface, err)
+			} else {
+				vlogf("bonding: added host route for %s via %s/%s", serverIP, gw, iface)
+				addedHostRoutes = append(addedHostRoutes, iface)
+			}
 		}
 	}
 
@@ -393,6 +448,10 @@ func startBondingClientCore(cfg clientConfig) (*clientState, func(), error) {
 		}
 		state.closeAllConns()
 		state.wg.Wait()
+		// Final cleanup: flush DNS cache to ensure interfaces reconnect properly
+		if runtime.GOOS == "windows" {
+			_ = common.RunPrivileged("ipconfig", "/flushdns")
+		}
 	}
 	return state, stop, nil
 }
@@ -1130,7 +1189,12 @@ func (c *clientState) mpquicReadLoop(cc *clientConn) {
 			cc.alive.Store(true)
 			c.serverAlive.Store(true)
 			backoff = bondingDialBackoff
-			vlogf("bonding: QUIC multipath connected")
+			// Log path count from multipath controller
+			numPaths := 0
+			if mpCtrl != nil {
+				numPaths = len(mpCtrl.GetAvailablePaths())
+			}
+			vlogf("bonding: QUIC multipath connected (paths=%d)", numPaths)
 			qc = conn
 
 			// Give QUIC time to stabilize before receiving
@@ -1156,43 +1220,40 @@ func (c *clientState) mpquicReadLoop(cc *clientConn) {
 			continue
 		}
 
+		vlogf("bonding: received raw datagram len=%d", len(dat))
+
 		// Parse DataPlane datagram
 		h, payload, err := common.ParseDataPlaneDatagram(dat)
 		if err != nil {
 			vlogf("bonding: parse datagram error: %v", err)
 			continue
 		}
+		vvlogf("bonding: received datagram type=%d len=%d flags=0x%x seq=%d", h.Type, len(payload), h.Flags, h.SeqNum)
 
 		cc.bytesRecv.Add(uint64(len(payload)))
 		cc.lastRecv.Store(time.Now().UnixNano())
 
 		switch h.Type {
 		case common.DPTypeIP:
-			// Decompress if needed
-			if h.Flags&common.DPFlagCompression != 0 {
-				decompressed, err := common.DecompressPayload(payload, common.MTU*2)
-				if err != nil {
-					vlogf("bonding: decompress error: %v", err)
-					continue
-				}
-				payload = decompressed
-			}
-			vlogf("bonding: received IP packet seq=%d len=%d", h.SeqNum, len(payload))
+			// Compression disabled - use raw payload directly
+			vvlogf("bonding: received IP packet seq=%d len=%d", h.SeqNum, len(payload))
 			// Insert into reorder buffer and deliver in-order packets
 			ordered := c.inReorder.Insert(h.SeqNum, payload)
 			for _, p := range ordered {
-				vlogf("bonding: writing to TUN len=%d", len(p))
+				vvlogf("bonding: writing to TUN len=%d", len(p))
 				c.enqueueTunWrite(p)
 			}
 
 		case common.DPTypeHeartbeat:
 			var hb common.HeartbeatPayload
 			if err := hb.Unmarshal(payload); err != nil {
+				vlogf("bonding: heartbeat unmarshal error: %v", err)
 				continue
 			}
 			rtt := common.CalcRTT(hb.SendTime)
 			c.updateConnRTT(cc, rtt)
 			cc.hbRecv.Add(1)
+			vlogf("bonding: heartbeat received RTT=%v total=%d", rtt, cc.hbRecv.Load())
 		}
 	}
 }
@@ -1220,6 +1281,9 @@ func (c *clientState) heartbeatLoop(cc *clientConn) {
 			}
 			if err := qc.SendDatagram(dg); err == nil {
 				cc.hbSent.Add(1)
+				vlogf("bonding: heartbeat sent total=%d", cc.hbSent.Load())
+			} else {
+				vlogf("bonding: heartbeat send error: %v", err)
 			}
 		}
 	}
@@ -1234,8 +1298,14 @@ func dialQUICMultipath(ctx context.Context, addr string, cfg clientConfig) (*qui
 	tlsCfg = tlsCfg.Clone()
 	tlsCfg.NextProtos = []string{"fluxify-quic"}
 
-	// Configure multipath controller with low latency scheduler
+	// Configure multipath controller with LowLatency scheduler.
+	// LowLatencyScheduler uses the fastest path (lowest RTT), which is safer with asymmetric setups.
+	// NOTE: RoundRobinScheduler causes issues with path/ACK synchronization, disabled for now.
 	mpCtrl := quic.NewDefaultMultipathController(quic.NewLowLatencyScheduler())
+	// NOTE: Packet duplication is DISABLED - it causes PROTOCOL_VIOLATION errors
+	// "received an ACK for skipped packet number" when multipath sends duplicate ACKs
+	// mpCtrl.EnablePacketDuplication(true)
+	// mpCtrl.SetDuplicationParameters(true, 10)
 	maxPaths := len(cfg.Ifaces)
 	if maxPaths < 2 {
 		maxPaths = 2
@@ -1255,25 +1325,122 @@ func dialQUICMultipath(ctx context.Context, addr string, cfg clientConfig) (*qui
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("collect local addrs: %w", err)
 	}
+	// Log at verbose level (not very-verbose) so multipath setup is visible in normal -v runs
+	vlogf("bonding: multipath local addresses=%v (ifaces=%v, ipv4=%v)", localAddrs, cfg.Ifaces, wantV4)
+
+	// Choose a conservative QUIC InitialPacketSize.
+	// This value is also used by mp-quic-go as the initial path MTU estimate.
+	// If it's too SMALL, SendDatagram can fail with "DATAGRAM frame too large".
+	// If it's too LARGE, some paths (esp. Wi-Fi / ISP) may drop packets.
+	//
+	// We need to fit: DataPlaneHdr (11) + inner IP packet (<= MTU) as QUIC DATAGRAM payload.
+	// Budget some space for the DATAGRAM frame encoding and QUIC header/encryption overhead.
+	//
+	// NOTE: InitialPacketSize is the UDP payload size (QUIC packet size), i.e. it does NOT include
+	// IP+UDP headers. For IPv6 underlay, the minimum MTU is 1280, so max UDP payload is 1232.
+	const (
+		datagramFrameOverhead    = 4  // type + varint length budget
+		quicPacketOverheadBudget = 48 // short header + packet number + AEAD tag + misc (budget)
+		ipv6MinUDPPayload        = 1232
+	)
+	initialPacketSize := uint16(1500)
+	if cfg.MTU > 0 {
+		required := cfg.MTU + common.DataPlaneHdrSize + datagramFrameOverhead + quicPacketOverheadBudget
+		if required < 1500 {
+			initialPacketSize = uint16(required)
+		}
+		if initialPacketSize < 1200 {
+			initialPacketSize = 1200
+		}
+	}
+	if !wantV4 && initialPacketSize > ipv6MinUDPPayload {
+		initialPacketSize = ipv6MinUDPPayload
+	}
+
+	vlogf("bonding: QUIC InitialPacketSize=%d (cfg.MTU=%d)", initialPacketSize, cfg.MTU)
+
+	// On Windows, multipath doesn't work reliably (neither MultiSocketManager nor MultipathAutoPaths).
+	// Force single-path mode on Windows until we find a working solution.
+	forceSinglePath := len(localAddrs) <= 1
+	if runtime.GOOS == "windows" && len(localAddrs) > 1 {
+		vlogf("bonding: WARNING - Windows multipath not yet supported, using first interface only")
+		localAddrs = localAddrs[:1] // Use only the first interface
+		forceSinglePath = true
+	}
+
+	if forceSinglePath {
+		vlogf("bonding: using SINGLE PATH mode (simpler socket handling)")
+	} else {
+		vlogf("bonding: using MULTIPATH mode with %d interfaces", len(localAddrs))
+	}
+
+	// In single-path mode, set MultipathAutoAddrs to nil to avoid any multipath logic
+	var autoAddrs []net.IP
+	if !forceSinglePath {
+		autoAddrs = localAddrs
+	}
 
 	qc := &quic.Config{
 		EnableDatagrams:        true,
-		MaxPaths:               maxPaths,
-		MultipathController:    mpCtrl,
-		MultipathAutoPaths:     true,
-		MultipathAutoAdvertise: len(localAddrs) > 0,
-		MultipathAutoAddrs:     localAddrs,
+		InitialPacketSize:      initialPacketSize,
+		MaxIdleTimeout:         2 * time.Minute,
+		KeepAlivePeriod:        5 * time.Second,
+		MaxPaths:               1,   // Force single path when forceSinglePath
+		MultipathController:    nil, // No multipath controller in single-path mode
+		MultipathAutoPaths:     false,
+		MultipathAutoAdvertise: false,
+		MultipathAutoAddrs:     nil,
+	}
+	if !forceSinglePath {
+		qc.MaxPaths = maxPaths
+		qc.MultipathController = mpCtrl
+		qc.MultipathAutoPaths = true
+		qc.MultipathAutoAdvertise = len(localAddrs) > 0
+		qc.MultipathAutoAddrs = autoAddrs
 	}
 
 	// Base socket determines the local port; the manager binds additional sockets to the same port.
-	baseIP := net.IPv4zero
-	if !wantV4 {
-		baseIP = net.IPv6unspecified
+	// On Windows, using network "udp" may create a dual-stack socket that is shown as [::]
+	// even when we intend IPv4. Force the address family to keep multipath socket/path bookkeeping
+	// consistent.
+	baseNetwork := "udp6"
+	baseIP := net.IPv6unspecified
+	if wantV4 {
+		baseNetwork = "udp4"
+		baseIP = net.IPv4zero.To4()
 	}
-	base, err := net.ListenUDP("udp", &net.UDPAddr{IP: baseIP, Port: 0})
+	base, err := net.ListenUDP(baseNetwork, &net.UDPAddr{IP: baseIP, Port: 0})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("listen udp base: %w", err)
 	}
+	vvlogf("bonding: QUIC base UDP local=%s", base.LocalAddr())
+
+	// For single-path mode, use the base socket directly without MultiSocketManager
+	// This simplifies the receive path and may fix issues with socket/path mismatches
+	if forceSinglePath {
+		vlogf("bonding: using direct UDP socket (no MultiSocketManager)")
+
+		// On Windows, bind to specific IP to ensure responses come back on the right socket
+		if runtime.GOOS == "windows" && len(localAddrs) > 0 {
+			_ = base.Close() // close the 0.0.0.0 socket
+			specificAddr := &net.UDPAddr{IP: localAddrs[0], Port: 0}
+			base, err = net.ListenUDP(baseNetwork, specificAddr)
+			if err != nil {
+				return nil, nil, nil, fmt.Errorf("listen udp specific: %w", err)
+			}
+			vlogf("bonding: bound to specific IP %s", base.LocalAddr())
+		}
+
+		conn, err := quic.Dial(ctx, base, ua, tlsCfg, qc)
+		if err != nil {
+			_ = base.Close()
+			return nil, nil, nil, fmt.Errorf("quic dial: %w", err)
+		}
+		vlogf("bonding: QUIC connected local=%s remote=%s", conn.LocalAddr(), conn.RemoteAddr())
+		return conn, base, mpCtrl, nil
+	}
+
+	// Multipath mode (Linux only for now - Windows uses single-path above)
 	basePort := 0
 	if la, ok := base.LocalAddr().(*net.UDPAddr); ok {
 		basePort = la.Port
@@ -1297,6 +1464,7 @@ func dialQUICMultipath(ctx context.Context, addr string, cfg clientConfig) (*qui
 		_ = mgr.Close()
 		return nil, nil, nil, fmt.Errorf("quic dial: %w", err)
 	}
+	vvlogf("bonding: QUIC connected local=%s remote=%s", conn.LocalAddr(), conn.RemoteAddr())
 
 	return conn, mgr, mpCtrl, nil
 }
@@ -1361,6 +1529,10 @@ func (c *clientState) workerLoop(workCh <-chan []byte) {
 
 // processAndSend builds and sends a datagram via QUIC
 func (c *clientState) processAndSend(data []byte) {
+	if c.ctx.Err() != nil {
+		common.PutBuffer(data)
+		return
+	}
 	cc := c.pickBestConn()
 	if cc == nil {
 		common.PutBuffer(data)
@@ -1376,31 +1548,29 @@ func (c *clientState) processAndSend(data []byte) {
 	}
 
 	seq := c.nextSeqSend.Add(1)
-	flags := uint8(0)
-	payload := data
-
-	// Best-effort compression (only if it reduces size).
-	if compressed, err := common.CompressPayload(payload); err == nil && len(compressed) < len(payload) {
-		payload = compressed
-		flags |= common.DPFlagCompression
-	}
 
 	head := common.DataPlaneHeader{
 		Version:   common.DataPlaneVersion,
 		Type:      common.DPTypeIP,
 		SessionID: c.sessionID,
 		SeqNum:    seq,
-		Flags:     flags,
+		Flags:     0, // No compression
 	}
 
-	dgram, err := common.BuildDataPlaneDatagram(nil, head, payload)
+	dgram, err := common.BuildDataPlaneDatagram(nil, head, data)
 	if err != nil {
 		common.PutBuffer(data)
 		return
 	}
 
 	if err := qc.SendDatagram(dgram); err != nil {
-		vlogf("bonding: send datagram error: %v", err)
+		// During shutdown / reconnects it's normal for queued packets to fail sending.
+		// Don't spam logs for expected close-related errors.
+		if c.ctx.Err() == nil && c.serverAlive.Load() {
+			vlogf("bonding: send datagram error: %v", err)
+		} else {
+			vvlogf("bonding: send datagram error (suppressed): %v", err)
+		}
 	} else {
 		cc.bytesSent.Add(uint64(len(data)))
 	}

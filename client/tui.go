@@ -806,16 +806,18 @@ func runTUI(initial clientConfig) {
 
 // tuiState holds UI selections and logic.
 type tuiState struct {
-	mode     string
-	server   string
-	cert     string
-	pki      string
-	ctrl     int
-	dns4     []string
-	dns6     []string
-	choices  []ifaceChoice
-	selected map[string]bool
-	running  func()
+	mode       string
+	server     string
+	cert       string
+	pki        string
+	ctrl       int
+	dns4       []string
+	dns6       []string
+	mtu        int
+	probePMTUD bool
+	choices    []ifaceChoice
+	selected   map[string]bool
+	running    func()
 
 	ifaceIPs map[string]string
 	extIP    map[string]string
@@ -826,20 +828,22 @@ type tuiState struct {
 
 func newTUIState(initial clientConfig) *tuiState {
 	st := &tuiState{
-		mode:     initial.Mode,
-		server:   initial.Server,
-		cert:     initial.Cert,
-		pki:      initial.PKI,
-		ctrl:     initial.Ctrl,
-		dns4:     initial.DNS4,
-		dns6:     initial.DNS6,
-		selected: make(map[string]bool),
-		ifaceIPs: make(map[string]string),
-		choices:  make([]ifaceChoice, 0),
-		extIP:    make(map[string]string),
-		extErr:   make(map[string]string),
-		extAt:    make(map[string]time.Time),
-		extBusy:  make(map[string]bool),
+		mode:       initial.Mode,
+		server:     initial.Server,
+		cert:       initial.Cert,
+		pki:        initial.PKI,
+		ctrl:       initial.Ctrl,
+		dns4:       initial.DNS4,
+		dns6:       initial.DNS6,
+		mtu:        initial.MTU,
+		probePMTUD: initial.ProbePMTUD,
+		selected:   make(map[string]bool),
+		ifaceIPs:   make(map[string]string),
+		choices:    make([]ifaceChoice, 0),
+		extIP:      make(map[string]string),
+		extErr:     make(map[string]string),
+		extAt:      make(map[string]time.Time),
+		extBusy:    make(map[string]bool),
 	}
 	for _, name := range initial.Ifaces {
 		st.selected[name] = true
@@ -880,7 +884,7 @@ func (s *tuiState) canStart() bool {
 }
 
 func scanInterfaces() ([]ifaceChoice, map[string]string) {
-	vlogf("scanInterfaces: starting")
+	vvlogf("scanInterfaces: starting")
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		log.Printf("scanInterfaces: list interfaces failed: %v", err)
@@ -907,7 +911,7 @@ func scanInterfaces() ([]ifaceChoice, map[string]string) {
 		gw := ""
 		gw6 := ""
 		if up && !loopback {
-			vlogf("scanInterfaces: checking %s", iface.Name)
+			vvlogf("scanInterfaces: checking %s", iface.Name)
 			gw, _ = platform.GatewayForIface(tuiRunner{}, iface.Name)
 			gw6, _ = platform.GatewayForIface6(tuiRunner{}, iface.Name)
 		}
@@ -931,7 +935,7 @@ func scanInterfaces() ([]ifaceChoice, map[string]string) {
 		}
 	}
 	sort.Slice(choices, func(i, j int) bool { return choices[i].Name < choices[j].Name })
-	vlogf("scanInterfaces: found %d candidates", len(choices))
+	vvlogf("scanInterfaces: found %d candidates", len(choices))
 	return choices, ips
 }
 
@@ -1107,6 +1111,9 @@ func runDiagnostics(cfg clientConfig) (diagReport, error) {
 	lines := []string{"[yellow]PPP Fluxify Diagnostics PPP[white]"}
 	lines = append(lines, fmt.Sprintf("Time: %s", time.Now().Format("2006-01-02 15:04:05")))
 	lines = append(lines, fmt.Sprintf("OS: %s/%s", runtime.GOOS, runtime.GOARCH))
+	if cfg.Mode != "" {
+		lines = append(lines, fmt.Sprintf("Mode: %s", cfg.Mode))
+	}
 	lines = append(lines, "")
 
 	// System Information
@@ -1170,9 +1177,16 @@ func runDiagnostics(cfg clientConfig) (diagReport, error) {
 		return diagReport{summary: "invalid server", details: strings.Join(lines, "\n"), err: err}, err
 	}
 	addr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+	dataPortHint := 8000
+	if cfg.Ctrl != 0 && cfg.Ctrl != port {
+		// Keep hint stable; actual dataplane port is negotiated by control-plane.
+		dataPortHint = 8000
+	}
+	dataAddrHint := net.JoinHostPort(host, fmt.Sprintf("%d", dataPortHint))
 
 	lines = append(lines, "[cyan] Server Connectivity [white]")
 	lines = append(lines, fmt.Sprintf("  Target: %s", addr))
+	lines = append(lines, fmt.Sprintf("  Data-plane (hint): %s (actual port from session)", dataAddrHint))
 
 	// DNS resolution
 	if ip := net.ParseIP(host); ip == nil {
@@ -1277,12 +1291,18 @@ func runDiagnostics(cfg clientConfig) (diagReport, error) {
 	// Path MTU probe
 	lines = append(lines, "")
 	lines = append(lines, "[cyan] Path MTU Probe [white]")
-	pmtuResult := common.ProbePMTUD(host, 1400, 3*time.Second)
+	probeMTU := 1400
+	if cfg.MTU > 0 {
+		probeMTU = cfg.MTU
+	}
+	pmtuResult := common.ProbePMTUD(host, probeMTU, 3*time.Second)
 	if pmtuResult.Success {
 		lines = append(lines, fmt.Sprintf("  [green]%s[white]", common.FormatPMTUDResult(pmtuResult)))
 	} else {
 		lines = append(lines, fmt.Sprintf("  [yellow]%s[white]", common.FormatPMTUDResult(pmtuResult)))
-		if pmtuResult.SuggestMTU > 0 {
+		// Only suggest MTU change when user explicitly set a too-high MTU.
+		// If MTU is unset (auto mode), bonding will auto-adjust at runtime.
+		if pmtuResult.SuggestMTU > 0 && cfg.MTU > 0 && cfg.MTU > pmtuResult.SuggestMTU {
 			lines = append(lines, fmt.Sprintf("  [yellow]Suggestion: use -mtu=%d[white]", pmtuResult.SuggestMTU))
 		}
 	}
@@ -1295,7 +1315,7 @@ func runDiagnostics(cfg clientConfig) (diagReport, error) {
 	// Performance recommendations
 	lines = append(lines, "")
 	lines = append(lines, "[cyan] Recommendations [white]")
-	recommendations := collectRecommendations(tcpLatency, pmtuResult)
+	recommendations := collectRecommendations(tcpLatency, pmtuResult, cfg.MTU)
 	if len(recommendations) == 0 {
 		lines = append(lines, "  [green]No issues detected[white]")
 	} else {
@@ -1323,7 +1343,7 @@ func tlsVersionName(version uint16) string {
 	}
 }
 
-func collectRecommendations(tcpLatency time.Duration, pmtu common.PMTUDResult) []string {
+func collectRecommendations(tcpLatency time.Duration, pmtu common.PMTUDResult, currentMTU int) []string {
 	var recs []string
 
 	if tcpLatency > 200*time.Millisecond {
@@ -1331,8 +1351,15 @@ func collectRecommendations(tcpLatency time.Duration, pmtu common.PMTUDResult) [
 			tcpLatency.Round(time.Millisecond), (tcpLatency+30*time.Millisecond).Round(10*time.Millisecond)))
 	}
 
+	// MTU recommendations:
+	// - If currentMTU is unset (0), bonding uses auto MTU adaptation at runtime.
+	// - If user set a too-high MTU, suggest lowering it.
 	if !pmtu.Success && pmtu.SuggestMTU > 0 {
-		recs = append(recs, fmt.Sprintf("[yellow]MTU issues detected: use -mtu=%d or -probe-pmtud[white]", pmtu.SuggestMTU))
+		if currentMTU == 0 {
+			recs = append(recs, fmt.Sprintf("[yellow]MTU issues detected: leave MTU unset (auto) or override with -mtu=%d[white]", pmtu.SuggestMTU))
+		} else if currentMTU > pmtu.SuggestMTU {
+			recs = append(recs, fmt.Sprintf("[yellow]MTU issues detected: use -mtu=%d (or lower)[white]", pmtu.SuggestMTU))
+		}
 	}
 
 	if runtime.GOOS == "linux" {
@@ -1475,15 +1502,17 @@ func (s *tuiState) buildConfig() clientConfig {
 	}
 	server := s.server
 	return clientConfig{
-		Server: server,
-		Ifaces: ifaces,
-		IPs:    ips,
-		Mode:   s.mode,
-		PKI:    s.pki,
-		Cert:   s.cert,
-		Ctrl:   s.ctrl,
-		DNS4:   s.dns4,
-		DNS6:   s.dns6,
+		Server:     server,
+		Ifaces:     ifaces,
+		IPs:        ips,
+		Mode:       s.mode,
+		PKI:        s.pki,
+		Cert:       s.cert,
+		Ctrl:       s.ctrl,
+		DNS4:       s.dns4,
+		DNS6:       s.dns6,
+		MTU:        s.mtu,
+		ProbePMTUD: s.probePMTUD,
 		// Defaults: allow reorder for server->client striping.
 		ReorderBufferSize:   128,
 		ReorderFlushTimeout: 50 * time.Millisecond,
@@ -1534,7 +1563,7 @@ type tuiLogWriter struct {
 func (w *tuiLogWriter) Write(p []byte) (n int, err error) {
 	msg := string(p)
 	// Write to file as well for debugging
-	if verboseLogging {
+	if verboseEnabled() {
 		if exe, err := os.Executable(); err == nil {
 			logFile := filepath.Join(filepath.Dir(exe), "client_debug.log")
 			f, _ := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -1656,7 +1685,7 @@ func showUsageInUsage(view *tview.TextView, st *tuiState, starting bool) {
 }
 
 func appendDiagnosticsLog(details string) {
-	if !verboseLogging {
+	if !verboseEnabled() {
 		return
 	}
 	exe, err := os.Executable()

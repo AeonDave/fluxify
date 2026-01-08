@@ -86,10 +86,17 @@ func main() {
 	mtuOverride := flag.Int("mtu", 0, "TUN MTU override (0=auto/default 1400, or specify e.g. 1280, 1350)")
 	probePMTUD := flag.Bool("probe-pmtud", false, "probe path MTU at startup and warn if default MTU may cause blackhole")
 	verbose := flag.Bool("v", false, "enable verbose logs")
+	veryVerbose := flag.Bool("vv", false, "enable very verbose logs (debug; includes per-packet and interface-scan logs)")
 	telemetryPath := flag.String("telemetry", "", "write MP-QUIC telemetry to file (JSON lines, snapshot every 5s)")
 	flag.Parse()
-	setVerboseLogging(*verbose)
-	platform.SetVerbose(*verbose)
+	level := 0
+	if *veryVerbose {
+		level = 2
+	} else if *verbose {
+		level = 1
+	}
+	setVerboseLoggingLevel(level)
+	platform.SetVerboseLevel(level)
 
 	exitIf(*bondingFlag && *loadBalanceFlag, "-b and -l are mutually exclusive")
 
@@ -117,7 +124,8 @@ func main() {
 	// If -pki was explicitly provided, don't let stored config override it.
 	pkiFromCLI := *pkiDir != ""
 	certFromCLI := *certPath != ""
-	initialCfg = mergeWithStoredConfig(initialCfg, pkiFromCLI, certFromCLI)
+	ifacesFromCLI := *ifacesStr != ""
+	initialCfg = mergeWithStoredConfig(initialCfg, pkiFromCLI, certFromCLI, ifacesFromCLI)
 	if *loadBalanceFlag {
 		initialCfg.Mode = modeLoadBalance
 	} else if *bondingFlag {
@@ -143,7 +151,13 @@ func main() {
 	}
 
 	cfg := initialCfg
-	exitIf(len(cfg.Ifaces) < 2, "need at least 2 interfaces (found %d)", len(cfg.Ifaces))
+	// For bonding mode, normally require 2+ interfaces, but allow single interface for testing
+	if len(cfg.Ifaces) < 1 {
+		exitIf(true, "need at least 1 interface (found %d)", len(cfg.Ifaces))
+	}
+	if len(cfg.Ifaces) == 1 {
+		log.Printf("WARNING: single interface mode - multipath disabled for testing")
+	}
 	exitIf(cfg.Mode == modeBonding && cfg.Server == "", "server is required in bonding mode")
 	if cfg.Mode == modeBonding && cfg.Cert == "" {
 		path, err := common.DetectClientBundlePath(cfg.PKI)
@@ -181,7 +195,7 @@ func main() {
 	log.Printf("stopped")
 }
 
-func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI, certFromCLI bool) clientConfig {
+func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI, certFromCLI, ifacesFromCLI bool) clientConfig {
 	storedClient := ""
 	if stored, err := loadStoredConfig(); err == nil {
 		if stored.Server != "" {
@@ -190,7 +204,8 @@ func mergeWithStoredConfig(cfg clientConfig, pkiFromCLI, certFromCLI bool) clien
 		if stored.Mode != "" {
 			cfg.Mode = stored.Mode
 		}
-		if len(stored.Ifaces) > 0 {
+		// Only use stored interfaces if CLI didn't explicitly provide them
+		if len(stored.Ifaces) > 0 && !ifacesFromCLI {
 			cfg.Ifaces = stored.Ifaces
 		}
 		if stored.Cert != "" && !certFromCLI {
@@ -381,6 +396,7 @@ func startClient(cfg clientConfig) (func(), error) {
 }
 
 func startClientWithStats(cfg clientConfig, statsView *tview.TextView, app *tview.Application) (func(), error) {
+	logBuildProvenance()
 	if cfg.Mode == modeLoadBalance {
 		return startLocalBalancerWithStats(cfg, statsView, app)
 	}
