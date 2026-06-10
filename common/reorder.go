@@ -2,8 +2,18 @@ package common
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// ReorderStats is a snapshot of a ReorderBuffer's counters.
+type ReorderStats struct {
+	Buffered  uint64 // packets parked because they arrived out of order
+	Reordered uint64 // parked packets later delivered in order
+	Dropped   uint64 // old/duplicate packets discarded
+	Flushes   uint64 // timeout flushes that released packets
+	MaxDepth  uint32 // maximum simultaneously parked packets
+}
 
 // ReorderBuffer holds out-of-order packets and delivers them in sequence.
 type ReorderBuffer struct {
@@ -14,6 +24,12 @@ type ReorderBuffer struct {
 	timer        *time.Timer       // flush timer
 	flushCh      chan struct{}     // signal to flush
 	flushTimeout time.Duration
+
+	statBuffered  atomic.Uint64
+	statReordered atomic.Uint64
+	statDropped   atomic.Uint64
+	statFlushes   atomic.Uint64
+	statMaxDepth  atomic.Uint32
 }
 
 // NewReorderBuffer creates a new buffer for packet reordering.
@@ -40,6 +56,7 @@ func (rb *ReorderBuffer) Insert(seq uint32, data []byte) [][]byte {
 
 	// Ignore old/duplicate packets (seq < nextExpected)
 	if seq < rb.nextExpected {
+		rb.statDropped.Add(1)
 		PutBuffer(data)
 		return nil
 	}
@@ -53,6 +70,7 @@ func (rb *ReorderBuffer) Insert(seq uint32, data []byte) [][]byte {
 		for {
 			if pkt, ok := rb.packets[rb.nextExpected]; ok {
 				result = append(result, pkt)
+				rb.statReordered.Add(1)
 				delete(rb.packets, rb.nextExpected)
 				rb.nextExpected++
 			} else {
@@ -73,11 +91,16 @@ func (rb *ReorderBuffer) Insert(seq uint32, data []byte) [][]byte {
 	if seq > rb.nextExpected {
 		// Don't store if already exists (duplicate)
 		if _, exists := rb.packets[seq]; exists {
+			rb.statDropped.Add(1)
 			PutBuffer(data)
 			return nil
 		}
 
 		rb.packets[seq] = data
+		rb.statBuffered.Add(1)
+		if depth := uint32(len(rb.packets)); depth > rb.statMaxDepth.Load() {
+			rb.statMaxDepth.Store(depth)
+		}
 
 		// Start flush timer if this is the first buffered packet
 		if len(rb.packets) == 1 {
@@ -161,7 +184,38 @@ func (rb *ReorderBuffer) FlushTimeout() [][]byte {
 		rb.timer = nil
 	}
 
+	if len(result) > 0 {
+		rb.statFlushes.Add(1)
+		rb.statReordered.Add(uint64(len(result)))
+	}
 	return result
+}
+
+// Stats returns a snapshot of the buffer's counters.
+func (rb *ReorderBuffer) Stats() ReorderStats {
+	return ReorderStats{
+		Buffered:  rb.statBuffered.Load(),
+		Reordered: rb.statReordered.Load(),
+		Dropped:   rb.statDropped.Load(),
+		Flushes:   rb.statFlushes.Load(),
+		MaxDepth:  rb.statMaxDepth.Load(),
+	}
+}
+
+// Reset drops all buffered packets and rewinds the expected sequence to the
+// beginning, e.g. after a session refresh restarts the sender's numbering.
+func (rb *ReorderBuffer) Reset() {
+	rb.mu.Lock()
+	defer rb.mu.Unlock()
+	if rb.timer != nil {
+		rb.timer.Stop()
+		rb.timer = nil
+	}
+	for _, pkt := range rb.packets {
+		PutBuffer(pkt)
+	}
+	rb.packets = make(map[uint32][]byte)
+	rb.nextExpected = 1
 }
 
 // Close cleans up resources.

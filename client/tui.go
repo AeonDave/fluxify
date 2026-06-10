@@ -717,6 +717,10 @@ func runTUI(initial clientConfig) {
 		}
 		stop(true)
 	}
+	// Let the system tray's Quit item drive the same graceful teardown.
+	registerTrayShutdown(func() {
+		app.QueueUpdateDraw(requestQuit)
+	})
 
 	startBtn.SetSelectedFunc(start)
 	stopBtn.SetSelectedFunc(func() { stop(false) })

@@ -24,7 +24,7 @@ func main() {
 	regen := flag.Bool("regen", false, "Regenerate CA and server certs")
 	hosts := flag.String("hosts", "", "Server SANs (comma-separated, auto-detect if empty)")
 	tuiMode := flag.Bool("tui", false, "Start certificate management TUI")
-	rsize := flag.Int("reorder-buffer-size", 128, "Inbound reorder buffer size")
+	rsize := flag.Int("reorder-buffer-size", 512, "Inbound reorder buffer size (packets)")
 	rflush := flag.Duration("reorder-flush-timeout", 50*time.Millisecond, "Reorder flush timeout")
 	mssClamp := flag.String("mss-clamp", "off", "TCP MSS clamp (off|pmtu|fixed:N)")
 	metricsEvery := flag.Duration("metrics-every", 0, "Periodic metrics logging interval (0 to disable)")

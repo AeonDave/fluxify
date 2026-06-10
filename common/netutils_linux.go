@@ -4,6 +4,7 @@
 package common
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os/exec"
@@ -11,26 +12,32 @@ import (
 	"syscall"
 )
 
-// NewBoundUDPDialer returns a net.Dialer that binds to a specific interface name (Linux) or local IP.
-// iface can be empty to skip binding. localIP can be empty to let OS choose.
-func NewBoundUDPDialer(iface, localIP string) (*net.Dialer, error) {
-	d := &net.Dialer{}
-	if localIP != "" {
-		la, err := net.ResolveUDPAddr("udp", net.JoinHostPort(localIP, "0"))
-		if err != nil {
-			return nil, err
-		}
-		d.LocalAddr = la
-	}
-
+// ListenUDPBound creates an unconnected UDP socket bound to localIP and, when
+// iface is non-empty, to the interface itself (SO_BINDTODEVICE) so the kernel
+// restricts route lookup and egress to that device. network must be "udp4" or
+// "udp6". Suitable as the underlying socket for a QUIC transport.
+func ListenUDPBound(network string, localIP net.IP, iface string) (*net.UDPConn, error) {
+	var lc net.ListenConfig
 	if iface != "" {
-		d.Control = func(network, address string, c syscall.RawConn) error {
-			return c.Control(func(fd uintptr) {
-				_ = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface)
-			})
+		lc.Control = func(_, _ string, c syscall.RawConn) error {
+			var serr error
+			if err := c.Control(func(fd uintptr) {
+				serr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface)
+			}); err != nil {
+				return err
+			}
+			return serr
 		}
 	}
-	return d, nil
+	addr := ":0"
+	if localIP != nil {
+		addr = net.JoinHostPort(localIP.String(), "0")
+	}
+	pc, err := lc.ListenPacket(context.Background(), network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return pc.(*net.UDPConn), nil
 }
 
 // EnsurePolicyRouting installs per-interface policy routing (Linux only). Best-effort, idempotent-ish.
@@ -186,6 +193,27 @@ func EnsureHostRoute(ip, via, dev string) error {
 // AddHostRoute adds a host route via the given gateway/device (Linux only).
 func AddHostRoute(ip, via, dev string) error {
 	return EnsureHostRoute(ip, via, dev)
+}
+
+// AddHostRouteMetric installs a host route with an explicit metric so multiple
+// routes to the same destination (one per uplink) can coexist (Linux only).
+func AddHostRouteMetric(ip, via, dev string, metric int) error {
+	if ip == "" || dev == "" {
+		return fmt.Errorf("ip and dev required")
+	}
+	args := []string{"route", "replace", ip, "dev", dev, "metric", fmt.Sprint(metric)}
+	if via != "" {
+		args = []string{"route", "replace", ip, "via", via, "dev", dev, "metric", fmt.Sprint(metric)}
+	}
+	return RunPrivileged("ip", args...)
+}
+
+// DeleteHostRoutes removes every route to the given host (all metrics/uplinks).
+func DeleteHostRoutes(ip string) error {
+	if ip == "" {
+		return nil
+	}
+	return RunPrivileged("ip", "route", "flush", ip)
 }
 
 // DeleteHostRoute removes a host route if present (best-effort, Linux only).

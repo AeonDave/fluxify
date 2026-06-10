@@ -7,11 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
-
-	quic "github.com/AeonDave/mp-quic-go"
 )
 
-func TestStartTelemetryLogger_RejectsNonBondingMode(t *testing.T) {
+func TestStartTelemetryLoggerRejectsNonBondingMode(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -27,7 +25,7 @@ func TestStartTelemetryLogger_RejectsNonBondingMode(t *testing.T) {
 	}
 }
 
-func TestStartTelemetryLogger_EmptyPathIsNoOp(t *testing.T) {
+func TestStartTelemetryLoggerEmptyPathIsNoOp(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -39,7 +37,7 @@ func TestStartTelemetryLogger_EmptyPathIsNoOp(t *testing.T) {
 	stop()
 }
 
-func TestStartTelemetryLogger_WritesSnapshot(t *testing.T) {
+func TestStartTelemetryLoggerWritesSnapshot(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -56,7 +54,7 @@ func TestStartTelemetryLogger_WritesSnapshot(t *testing.T) {
 	}
 	defer stop()
 
-	// Wait for initial snapshot + one tick
+	// Wait for the initial snapshot.
 	time.Sleep(300 * time.Millisecond)
 
 	data, err := os.ReadFile(tmpfile)
@@ -82,53 +80,45 @@ func TestStartTelemetryLogger_WritesSnapshot(t *testing.T) {
 	}
 }
 
-func TestBuildTelemetrySnapshot_WithMPPathStats(t *testing.T) {
+func TestBuildTelemetrySnapshotAggregatesPaths(t *testing.T) {
 	state := &clientState{
-		mode:         modeBonding,
-		sessionID:    999,
-		mpController: nil, // no paths
+		mode:      modeBonding,
+		sessionID: 999,
 	}
 	state.serverAlive.Store(true)
-	cc := &clientConn{}
-	cc.bytesSent.Store(1000)
-	cc.bytesRecv.Store(2000)
-	cc.hbSent.Store(10)
-	cc.hbRecv.Store(9)
-	state.conns = []*clientConn{cc}
+	p0 := testPath("eth0", 1)
+	p0.alive.Store(true)
+	p0.bytesSent.Store(1000)
+	p0.bytesRecv.Store(2000)
+	p0.hbSent.Store(10)
+	p0.hbRecv.Store(9)
+	p1 := testPath("wlan0", 1)
+	p1.bytesSent.Store(500)
+	state.paths = []*pathConn{p0, p1}
 
 	snap := buildTelemetrySnapshot(state)
 	if snap.SessionID != 999 {
 		t.Errorf("expected session 999, got %d", snap.SessionID)
 	}
-	if snap.Aggregate.TxBytes != 1000 {
-		t.Errorf("expected tx 1000, got %d", snap.Aggregate.TxBytes)
+	if snap.Aggregate.TxBytes != 1500 {
+		t.Errorf("expected tx 1500, got %d", snap.Aggregate.TxBytes)
 	}
 	if snap.Aggregate.RxBytes != 2000 {
 		t.Errorf("expected rx 2000, got %d", snap.Aggregate.RxBytes)
 	}
+	if snap.Aggregate.ActivePaths != 1 {
+		t.Errorf("expected 1 active path, got %d", snap.Aggregate.ActivePaths)
+	}
 	if snap.Aggregate.HBLossPct < 9 || snap.Aggregate.HBLossPct > 11 {
 		t.Errorf("expected ~10%% loss, got %.2f%%", snap.Aggregate.HBLossPct)
 	}
-	if len(snap.MPPaths) != 0 {
-		t.Errorf("expected no paths (nil controller), got %d", len(snap.MPPaths))
+	if len(snap.Paths) != 2 {
+		t.Fatalf("expected 2 paths, got %d", len(snap.Paths))
 	}
-}
-
-func TestBuildTelemetrySnapshot_WithFakeController(t *testing.T) {
-	// Create a fake DefaultMultipathController that returns some stats
-	ctrl := quic.NewDefaultMultipathController(quic.NewLowLatencyScheduler())
-	state := &clientState{
-		mode:         modeBonding,
-		sessionID:    111,
-		mpController: ctrl,
+	if snap.Paths[0].Iface != "eth0" || !snap.Paths[0].Alive {
+		t.Errorf("unexpected path[0]: %+v", snap.Paths[0])
 	}
-	state.serverAlive.Store(true)
-	cc := &clientConn{}
-	state.conns = []*clientConn{cc}
-
-	snap := buildTelemetrySnapshot(state)
-	// With no paths registered, GetStatistics returns empty map
-	if len(snap.MPPaths) != 0 {
-		t.Logf("got %d paths (expected 0 without real paths)", len(snap.MPPaths))
+	if snap.Paths[1].Iface != "wlan0" || snap.Paths[1].Alive {
+		t.Errorf("unexpected path[1]: %+v", snap.Paths[1])
 	}
 }

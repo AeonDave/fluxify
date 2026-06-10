@@ -39,7 +39,7 @@ func TestDataPlaneHeader_Validation(t *testing.T) {
 				Type:      DPTypeIP,
 				SessionID: 1,
 				SeqNum:    2,
-				Flags:     DPFlagCompression,
+				Flags:     uint8(1),
 			},
 			wantErr: false,
 		},
@@ -85,7 +85,7 @@ func TestBuildDataPlaneDatagram_WithPayload(t *testing.T) {
 		Type:      DPTypeIP,
 		SessionID: 999,
 		SeqNum:    111,
-		Flags:     DPFlagCompression,
+		Flags:     uint8(1),
 	}
 	payload := []byte("test payload")
 

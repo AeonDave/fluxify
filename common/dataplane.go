@@ -11,9 +11,10 @@ import (
 // by the transport (TLS 1.3), therefore we do NOT include any AEAD metadata.
 //
 // We still keep a compact header to:
-// - demultiplex sessions on the server (multi-user)
-// - support optional gzip compression flag
-// - keep SeqNum for debugging/metrics (QUIC already reorders streams; datagrams are unordered)
+//   - demultiplex sessions on the server (multi-user)
+//   - carry the global SeqNum that the receiver's reorder buffer uses to
+//     restore ordering across paths (datagrams are unordered by design,
+//     and striping interleaves paths with different latencies)
 //
 // Layout (network byte order):
 //
@@ -21,16 +22,15 @@ import (
 //	[1]    Type    (1 byte)
 //	[2:6]  SessionID (uint32)
 //	[6:10] SeqNum    (uint32)
-//	[10]   Flags     (1 byte)  (bit0: gzip)
+//	[10]   Flags     (1 byte)  (reserved)
 //
 // Total: 11 bytes
 const (
-	DataPlaneVersion  = 1
-	DataPlaneHdrSize  = 11
-	DPTypeIP          = 1
-	DPTypeHeartbeat   = 2
-	DPTypeHandshake   = 3 // optional / keepalive
-	DPFlagCompression = 1 << 0
+	DataPlaneVersion = 1
+	DataPlaneHdrSize = 11
+	DPTypeIP         = 1
+	DPTypeHeartbeat  = 2
+	DPTypeHandshake  = 3 // path announcement / keepalive
 )
 
 type DataPlaneHeader struct {

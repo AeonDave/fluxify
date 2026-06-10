@@ -4,6 +4,7 @@
 package common
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os/exec"
@@ -20,17 +21,12 @@ const (
 	ipv6UnicastIf = 31
 )
 
-// NewBoundUDPDialer binds optionally to a local IP and/or interface using Windows-specific socket options.
-// iface binding uses IP_UNICAST_IF / IPV6_UNICAST_IF; localIP is respected for both IPv4/IPv6.
-func NewBoundUDPDialer(iface, localIP string) (*net.Dialer, error) {
-	d := &net.Dialer{}
-	if localIP != "" {
-		la, err := net.ResolveUDPAddr("udp", net.JoinHostPort(localIP, "0"))
-		if err != nil {
-			return nil, err
-		}
-		d.LocalAddr = la
-	}
+// ListenUDPBound creates an unconnected UDP socket bound to localIP and, when
+// iface is non-empty, pinned to the interface via IP_UNICAST_IF /
+// IPV6_UNICAST_IF so unicast egress uses that adapter. network must be "udp4"
+// or "udp6". Suitable as the underlying socket for a QUIC transport.
+func ListenUDPBound(network string, localIP net.IP, iface string) (*net.UDPConn, error) {
+	var lc net.ListenConfig
 	if iface != "" {
 		ifi, err := net.InterfaceByName(iface)
 		if err != nil {
@@ -40,7 +36,7 @@ func NewBoundUDPDialer(iface, localIP string) (*net.Dialer, error) {
 			return nil, fmt.Errorf("interface %s has zero index", iface)
 		}
 		idx := uint32(ifi.Index)
-		d.Control = func(network, address string, c syscall.RawConn) error {
+		lc.Control = func(network, _ string, c syscall.RawConn) error {
 			return c.Control(func(fd uintptr) {
 				switch {
 				case strings.HasPrefix(network, "udp4"):
@@ -52,7 +48,15 @@ func NewBoundUDPDialer(iface, localIP string) (*net.Dialer, error) {
 			})
 		}
 	}
-	return d, nil
+	addr := ":0"
+	if localIP != nil {
+		addr = net.JoinHostPort(localIP.String(), "0")
+	}
+	pc, err := lc.ListenPacket(context.Background(), network, addr)
+	if err != nil {
+		return nil, err
+	}
+	return pc.(*net.UDPConn), nil
 }
 
 // EnsurePolicyRouting is not available on Windows; return nil to keep behavior no-op unless implemented in the future.
@@ -279,6 +283,36 @@ func DeleteHostRoute(ip string) error {
 		return nil
 	}
 	return exec.Command("route", "delete", ip).Run()
+}
+
+// AddHostRouteMetric installs a host route with an explicit metric so multiple
+// routes to the same destination (one per uplink) can coexist.
+func AddHostRouteMetric(ip, via, dev string, metric int) error {
+	if ip == "" || dev == "" {
+		return fmt.Errorf("ip and dev required")
+	}
+	ifIdx, err := interfaceIndex(dev)
+	if err != nil {
+		return err
+	}
+	if via == "" {
+		if ip4, _ := interfaceIPv4(dev); ip4 != nil {
+			via = ip4.String()
+		} else {
+			via = "0.0.0.0"
+		}
+	}
+	if metric < 1 {
+		metric = 1
+	}
+	args := []string{"add", ip, "mask", "255.255.255.255", via, "if", strconv.Itoa(ifIdx), "metric", strconv.Itoa(metric)}
+	return exec.Command("route", args...).Run()
+}
+
+// DeleteHostRoutes removes every route to the given host (all uplinks).
+// On Windows "route delete" already removes all matching entries.
+func DeleteHostRoutes(ip string) error {
+	return DeleteHostRoute(ip)
 }
 
 // Helpers

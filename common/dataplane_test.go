@@ -11,7 +11,7 @@ func TestDataPlaneDatagramRoundTrip(t *testing.T) {
 		Type:      DPTypeIP,
 		SessionID: 42,
 		SeqNum:    7,
-		Flags:     DPFlagCompression,
+		Flags:     uint8(1),
 	}
 	payload := []byte("hello")
 	dg, err := BuildDataPlaneDatagram(nil, h, payload)

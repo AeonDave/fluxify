@@ -8,77 +8,142 @@ import (
 	"sync/atomic"
 	"time"
 
-	quic "github.com/AeonDave/mp-quic-go"
+	quic "github.com/quic-go/quic-go"
 	"github.com/rivo/tview"
 
 	"fluxify/client/platform"
+	"fluxify/common"
 )
 
 const (
 	modeBonding     = "bonding"
 	modeLoadBalance = "load-balance"
 	controlTimeout  = 10 * time.Second
+
+	// sendQueueLen is the per-path backlog (packets). Combined with the QUIC
+	// datagram queue it bounds the queueing delay the scheduler can build up
+	// on a single path.
+	sendQueueLen = 256
+	// tunQueueLen is the inbound TUN write queue (packets).
+	tunQueueLen = 512
+	// statsInterval is how often per-path rate/RTT estimates are refreshed.
+	statsInterval = 100 * time.Millisecond
+	// heartbeatEvery is the per-path heartbeat period (liveness + RTT/jitter).
+	heartbeatEvery = 2 * time.Second
 )
 
-type clientConn struct {
-	// MP-QUIC connection (replaces udp)
-	quicConn   *quic.Conn
-	packetConn net.PacketConn
-	addr       string // server address as string
-	iface      string
-	localIP    string
+// pathConn is one bonded uplink: a dedicated QUIC connection over a UDP
+// socket bound to a single physical interface. The connection inside comes
+// and goes (redials); the pathConn itself lives for the whole session.
+type pathConn struct {
+	iface   string
+	localIP string // optional explicit source IP ("" = auto-discover)
+
+	mu   sync.Mutex
+	conn *quic.Conn
+	udp  *net.UDPConn
+
+	// sendCh carries ready-to-send datagrams (pooled buffers). The path
+	// sender drains it at whatever rate the QUIC congestion controller
+	// allows; its occupancy is the backlog the scheduler keys on.
+	sendCh chan []byte
+	queued atomic.Int64 // bytes accepted but not yet handed to QUIC
+
+	rate    *common.RateEstimator
+	rttNano atomic.Int64 // smoothed RTT from QUIC connection stats
+
 	alive      atomic.Bool
-	ifaceUp    atomic.Bool
 	bytesSent  atomic.Uint64
 	bytesRecv  atomic.Uint64
-	rttNano    atomic.Int64
-	jitterNano atomic.Int64
 	hbSent     atomic.Uint64
 	hbRecv     atomic.Uint64
-	lastRecv   atomic.Int64
-	lastConn   atomic.Int64
-	mu         sync.Mutex
+	lastHbRTT  atomic.Int64 // last heartbeat RTT sample (jitter input)
+	jitterNano atomic.Int64
+	lastRecv   atomic.Int64 // unix nanos of last inbound datagram
+}
+
+func newPathConn(iface, localIP string) *pathConn {
+	return &pathConn{
+		iface:   iface,
+		localIP: localIP,
+		sendCh:  make(chan []byte, sendQueueLen),
+		rate:    common.NewRateEstimator(common.DefaultInitialRateBps, common.DefaultRateTau),
+	}
+}
+
+func (p *pathConn) currentConn() *quic.Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.conn
+}
+
+func (p *pathConn) setConn(conn *quic.Conn, udp *net.UDPConn) {
+	p.mu.Lock()
+	p.conn = conn
+	p.udp = udp
+	p.mu.Unlock()
+}
+
+// closeConn tears down the current QUIC connection and socket (if any),
+// unblocking the receive loop so the path lifecycle can redial.
+func (p *pathConn) closeConn(reason string) {
+	p.mu.Lock()
+	conn, udp := p.conn, p.udp
+	p.conn, p.udp = nil, nil
+	p.mu.Unlock()
+	if conn != nil {
+		_ = conn.CloseWithError(0, reason)
+	}
+	if udp != nil {
+		_ = udp.Close()
+	}
+}
+
+// metrics snapshots the scheduler inputs for this path.
+func (p *pathConn) metrics() common.PathMetrics {
+	return common.PathMetrics{
+		QueuedBytes: p.queued.Load(),
+		RateBps:     p.rate.Rate(),
+		RTT:         time.Duration(p.rttNano.Load()),
+		Alive:       p.alive.Load(),
+	}
 }
 
 type clientState struct {
-	serverAddr   string // server address for QUIC connection
-	sessionID    uint32
-	clientIP     string
-	clientIPv6   string
-	conns        []*clientConn
-	connMu       sync.RWMutex
-	nextSeqSend  atomic.Uint32
-	nextConnRR   atomic.Uint32
-	tun          platform.TunDevice
-	tunWriteCh   chan []byte
-	mode         string
-	ctx          context.Context
-	cancel       context.CancelFunc
-	wg           sync.WaitGroup
-	revertRoute  func()
-	revertDNS    func()
-	ifaceDNS     []ifaceDNSBackup
-	statsView    *tview.TextView // for dynamic updates
-	ctrlAddr     string
-	cfg          clientConfig
-	sessMu       sync.RWMutex
-	serverAlive  atomic.Bool
-	reconnectOn  atomic.Bool
-	ipv6Enabled  bool
-	rateMu       sync.Mutex
-	rateByConn   map[*clientConn]*ifaceRate
-	mpController *quic.DefaultMultipathController // MP-QUIC path controller
+	serverAddr string
+	sessionID  uint32
+	clientIP   string
+	clientIPv6 string
+
+	paths   []*pathConn // fixed at startup, one per selected interface
+	nextSeq atomic.Uint32
+
+	tun        platform.TunDevice
+	tunWriteCh chan []byte
+	mode       string
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+
+	revertRoute func()
+	revertDNS   func()
+	ifaceDNS    []ifaceDNSBackup
+
+	statsView *tview.TextView // for dynamic TUI updates
+	ctrlAddr  string
+	cfg       clientConfig
+	sessMu    sync.RWMutex
+
+	serverAlive atomic.Bool
+	reconnectOn atomic.Bool
+	ipv6Enabled bool
+
+	rateMu     sync.Mutex
+	rateByPath map[*pathConn]*ifaceRate
 
 	// Inbound reorder (server -> client) for packet-level striping.
-	inReorder      *reorderBuffer
-	stopInReorder  chan struct{}
-	inReorderStats struct {
-		packetsBuffered  atomic.Uint64
-		packetsReordered atomic.Uint64
-		packetsDropped   atomic.Uint64
-		flushes          atomic.Uint64
-		maxDepth         atomic.Uint32
-	}
+	inReorder *common.ReorderBuffer
+	tunDrops  atomic.Uint64 // packets dropped because the TUN write queue was full
 }
 
 type clientConfig struct {
@@ -163,20 +228,4 @@ func stabilityScore(lossPct, jitterMs, rttMs float64) float64 {
 		return 100
 	}
 	return score
-}
-
-// GetMPPathStats returns MP-QUIC path statistics if the controller is set.
-func (c *clientState) GetMPPathStats() map[quic.PathID]quic.PathStatistics {
-	if c.mpController == nil {
-		return nil
-	}
-	return c.mpController.GetStatistics()
-}
-
-// pickIndex picks element i modulo len(list) or empty string.
-func pickIndex(list []string, i int) string {
-	if len(list) == 0 {
-		return ""
-	}
-	return list[i%len(list)]
 }

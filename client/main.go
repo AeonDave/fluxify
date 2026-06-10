@@ -15,6 +15,7 @@ import (
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -87,7 +88,8 @@ func main() {
 	probePMTUD := flag.Bool("probe-pmtud", false, "probe path MTU at startup and warn if default MTU may cause blackhole")
 	verbose := flag.Bool("v", false, "enable verbose logs")
 	veryVerbose := flag.Bool("vv", false, "enable very verbose logs (debug; includes per-packet and interface-scan logs)")
-	telemetryPath := flag.String("telemetry", "", "write MP-QUIC telemetry to file (JSON lines, snapshot every 5s)")
+	telemetryPath := flag.String("telemetry", "", "write per-path telemetry to file (JSON lines, snapshot every 5s)")
+	noTray := flag.Bool("no-tray", false, "disable the system tray icon (Windows only)")
 	flag.Parse()
 	level := 0
 	if *veryVerbose {
@@ -145,6 +147,19 @@ func main() {
 	}
 
 	autoMode := *loadBalanceFlag || *bondingFlag
+	run := func() { runClientFlow(initialCfg, autoMode, exitIf) }
+	if runtime.GOOS == "windows" && !*noTray {
+		// Host the whole client inside the system tray event loop so the
+		// notification-area icon reflects the bonding state.
+		runWithTray(run)
+		return
+	}
+	run()
+}
+
+// runClientFlow runs either the TUI or the headless bonding/load-balance
+// flow, blocking until shutdown (signal, TUI quit, or tray Quit).
+func runClientFlow(initialCfg clientConfig, autoMode bool, exitIf func(bool, string, ...interface{})) {
 	if !autoMode {
 		runTUIHook(initialCfg)
 		return
@@ -188,7 +203,13 @@ func main() {
 
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
-	<-sigc
+	shutdown := make(chan struct{})
+	var shutdownOnce sync.Once
+	registerTrayShutdown(func() { shutdownOnce.Do(func() { close(shutdown) }) })
+	select {
+	case <-sigc:
+	case <-shutdown:
+	}
 	if stop != nil {
 		stop()
 	}

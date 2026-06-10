@@ -6,27 +6,27 @@ import (
 	"testing"
 )
 
-func TestNewBoundUDPDialerNoBind(t *testing.T) {
-	d, err := NewBoundUDPDialer("", "")
+func TestListenUDPBoundNoIface(t *testing.T) {
+	conn, err := ListenUDPBound("udp4", net.ParseIP("127.0.0.1"), "")
 	if err != nil {
-		t.Fatalf("dialer error: %v", err)
+		t.Fatalf("listen error: %v", err)
 	}
-	if d.LocalAddr != nil {
-		t.Fatalf("expected nil LocalAddr, got %v", d.LocalAddr)
+	defer func() { _ = conn.Close() }()
+	addr, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || addr.IP.String() != "127.0.0.1" {
+		t.Fatalf("unexpected local addr: %v", conn.LocalAddr())
+	}
+	if addr.Port == 0 {
+		t.Fatalf("expected ephemeral port assigned")
 	}
 }
 
-func TestNewBoundUDPDialerLocalIP(t *testing.T) {
-	d, err := NewBoundUDPDialer("", "127.0.0.1")
+func TestListenUDPBoundAnyAddr(t *testing.T) {
+	conn, err := ListenUDPBound("udp4", nil, "")
 	if err != nil {
-		t.Fatalf("dialer error: %v", err)
+		t.Fatalf("listen error: %v", err)
 	}
-	if d.LocalAddr == nil {
-		t.Fatalf("expected LocalAddr set")
-	}
-	if addr, ok := d.LocalAddr.(*net.UDPAddr); !ok || addr.IP.String() != "127.0.0.1" {
-		t.Fatalf("unexpected LocalAddr: %v", d.LocalAddr)
-	}
+	_ = conn.Close()
 }
 
 func TestEnsurePolicyRoutingNonLinux(t *testing.T) {

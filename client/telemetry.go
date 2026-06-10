@@ -6,10 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"time"
-
-	quic "github.com/AeonDave/mp-quic-go"
 
 	"fluxify/common"
 )
@@ -30,19 +27,25 @@ type telemetryReorder struct {
 	Dropped   uint64 `json:"dropped"`
 	Flushes   uint64 `json:"flushes"`
 	MaxDepth  uint32 `json:"max_depth"`
+	TunDrops  uint64 `json:"tun_drops"`
 }
 
-type telemetryMPPath struct {
-	PathID      int     `json:"path_id"`
+type telemetryPath struct {
+	Iface       string  `json:"iface"`
 	Local       string  `json:"local,omitempty"`
 	Remote      string  `json:"remote,omitempty"`
+	Alive       bool    `json:"alive"`
 	RTTMs       float64 `json:"rtt_ms"`
-	CWND        uint64  `json:"cwnd"`
-	InFlight    uint64  `json:"in_flight"`
+	JitterMs    float64 `json:"jitter_ms"`
+	RateBps     float64 `json:"rate_bps"`
+	QueuedBytes int64   `json:"queued_bytes"`
 	BytesSent   uint64  `json:"bytes_sent"`
+	BytesRecv   uint64  `json:"bytes_recv"`
 	PacketsSent uint64  `json:"packets_sent"`
 	PacketsLost uint64  `json:"packets_lost"`
 	LossPct     float64 `json:"loss_pct"`
+	HBSent      uint64  `json:"hb_sent"`
+	HBRecv      uint64  `json:"hb_recv"`
 }
 
 type telemetrySnapshot struct {
@@ -51,7 +54,7 @@ type telemetrySnapshot struct {
 	SessionID uint32             `json:"session_id"`
 	Aggregate telemetryAggregate `json:"aggregate"`
 	Reorder   telemetryReorder   `json:"reorder"`
-	MPPaths   []telemetryMPPath  `json:"mp_paths,omitempty"`
+	Paths     []telemetryPath    `json:"paths,omitempty"`
 }
 
 func startTelemetryLogger(ctx context.Context, state *clientState, path string) (func(), error) {
@@ -104,15 +107,40 @@ func startTelemetryLogger(ctx context.Context, state *clientState, path string) 
 
 func buildTelemetrySnapshot(state *clientState) telemetrySnapshot {
 	var tx, rx, hbSent, hbRecv uint64
-	state.connMu.RLock()
-	if len(state.conns) > 0 {
-		cc := state.conns[0]
-		tx = cc.bytesSent.Load()
-		rx = cc.bytesRecv.Load()
-		hbSent = cc.hbSent.Load()
-		hbRecv = cc.hbRecv.Load()
+	active := 0
+	paths := make([]telemetryPath, 0, len(state.paths))
+	for _, pc := range state.paths {
+		tp := telemetryPath{
+			Iface:       pc.iface,
+			Alive:       pc.alive.Load(),
+			RTTMs:       float64(time.Duration(pc.rttNano.Load())) / float64(time.Millisecond),
+			JitterMs:    float64(time.Duration(pc.jitterNano.Load())) / float64(time.Millisecond),
+			RateBps:     pc.rate.Rate(),
+			QueuedBytes: pc.queued.Load(),
+			BytesSent:   pc.bytesSent.Load(),
+			BytesRecv:   pc.bytesRecv.Load(),
+			HBSent:      pc.hbSent.Load(),
+			HBRecv:      pc.hbRecv.Load(),
+		}
+		if conn := pc.currentConn(); conn != nil {
+			tp.Local = conn.LocalAddr().String()
+			tp.Remote = conn.RemoteAddr().String()
+			st := conn.ConnectionStats()
+			tp.PacketsSent = st.PacketsSent
+			tp.PacketsLost = st.PacketsLost
+			if st.PacketsSent > 0 {
+				tp.LossPct = float64(st.PacketsLost) * 100 / float64(st.PacketsSent)
+			}
+		}
+		tx += tp.BytesSent
+		rx += tp.BytesRecv
+		hbSent += tp.HBSent
+		hbRecv += tp.HBRecv
+		if tp.Alive {
+			active++
+		}
+		paths = append(paths, tp)
 	}
-	state.connMu.RUnlock()
 
 	hbLossPct := 0.0
 	if hbSent >= 3 {
@@ -122,68 +150,32 @@ func buildTelemetrySnapshot(state *clientState) telemetrySnapshot {
 		hbLossPct = float64(hbSent-hbRecv) * 100 / float64(hbSent)
 	}
 
-	mpStats := state.GetMPPathStats()
-	paths := make([]telemetryMPPath, 0, len(mpStats))
-	if len(mpStats) > 0 {
-		ids := make([]quic.PathID, 0, len(mpStats))
-		for id := range mpStats {
-			ids = append(ids, id)
-		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		for _, id := range ids {
-			ps := mpStats[id]
-			local := ""
-			remote := ""
-			if state.mpController != nil {
-				if info, ok := state.mpController.PathInfoForID(id); ok {
-					if info.LocalAddr != nil {
-						local = info.LocalAddr.String()
-					}
-					if info.RemoteAddr != nil {
-						remote = info.RemoteAddr.String()
-					}
-				}
-			}
-			lossPct := 0.0
-			if ps.PacketsSent > 0 {
-				lossPct = float64(ps.PacketsLost) * 100 / float64(ps.PacketsSent)
-			}
-			paths = append(paths, telemetryMPPath{
-				PathID:      int(ps.PathID),
-				Local:       local,
-				Remote:      remote,
-				RTTMs:       float64(ps.SmoothedRTT) / float64(time.Millisecond),
-				CWND:        uint64(ps.CongestionWindow),
-				InFlight:    uint64(ps.BytesInFlight),
-				BytesSent:   uint64(ps.BytesSent),
-				PacketsSent: ps.PacketsSent,
-				PacketsLost: ps.PacketsLost,
-				LossPct:     lossPct,
-			})
-		}
+	var rs common.ReorderStats
+	if state.inReorder != nil {
+		rs = state.inReorder.Stats()
 	}
-
-	snap := telemetrySnapshot{
+	sessID, _ := state.sessionSnapshot()
+	return telemetrySnapshot{
 		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
 		Mode:      state.mode,
-		SessionID: state.sessionID,
+		SessionID: sessID,
 		Aggregate: telemetryAggregate{
 			TxBytes:     tx,
 			RxBytes:     rx,
-			ActivePaths: len(paths),
+			ActivePaths: active,
 			HBSent:      hbSent,
 			HBRecv:      hbRecv,
 			HBLossPct:   hbLossPct,
 			ServerAlive: state.serverAlive.Load(),
 		},
 		Reorder: telemetryReorder{
-			Buffered:  state.inReorderStats.packetsBuffered.Load(),
-			Reordered: state.inReorderStats.packetsReordered.Load(),
-			Dropped:   state.inReorderStats.packetsDropped.Load(),
-			Flushes:   state.inReorderStats.flushes.Load(),
-			MaxDepth:  state.inReorderStats.maxDepth.Load(),
+			Buffered:  rs.Buffered,
+			Reordered: rs.Reordered,
+			Dropped:   rs.Dropped,
+			Flushes:   rs.Flushes,
+			MaxDepth:  rs.MaxDepth,
+			TunDrops:  state.tunDrops.Load(),
 		},
-		MPPaths: paths,
+		Paths: paths,
 	}
-	return snap
 }

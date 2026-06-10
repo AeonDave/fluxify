@@ -65,12 +65,12 @@ func logBuildProvenance() {
 		log.Printf("build: main=%s %s", bi.Main.Path, bi.Main.Version)
 	}
 
-	const mpquic = "github.com/AeonDave/mp-quic-go"
+	const quicgo = "github.com/quic-go/quic-go"
 	for _, dep := range bi.Deps {
 		if dep == nil {
 			continue
 		}
-		if dep.Path != mpquic {
+		if dep.Path != quicgo {
 			continue
 		}
 		if dep.Replace != nil {
@@ -81,5 +81,5 @@ func logBuildProvenance() {
 		return
 	}
 
-	log.Printf("build: dep=%s (not found in build info)", mpquic)
+	log.Printf("build: dep=%s (not found in build info)", quicgo)
 }

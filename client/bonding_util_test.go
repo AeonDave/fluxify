@@ -1,7 +1,7 @@
 package main
 
 import (
-	"strings"
+	"net"
 	"testing"
 )
 
@@ -17,52 +17,28 @@ func TestAddIPv6CIDR(t *testing.T) {
 	}
 }
 
-func TestCollectLocalAddrs_UsesProvidedIPsV4(t *testing.T) {
-	ifaces := []string{"eth0", "wlan0"}
-	ips := []string{"192.168.1.10", "10.0.0.5"}
-	addrs, err := collectLocalAddrs(ifaces, ips, true)
-	if err != nil {
-		t.Fatalf("collectLocalAddrs: %v", err)
+func TestIsUsableLocalIP(t *testing.T) {
+	cases := []struct {
+		ip     string
+		wantV4 bool
+		ok     bool
+	}{
+		{"192.168.1.10", true, true},
+		{"10.0.0.5", true, true},
+		{"127.0.0.1", true, false},     // loopback
+		{"169.254.1.1", true, false},   // link-local
+		{"fd00::2", true, false},       // v6 when v4 wanted
+		{"fd00::2", false, true},       // ULA ok for v6
+		{"fe80::1", false, false},      // link-local v6
+		{"192.168.1.10", false, false}, // v4 when v6 wanted
+		{"2001:db8::1", false, true},   // global v6
 	}
-	if len(addrs) != 2 {
-		t.Fatalf("expected 2 addrs, got %d", len(addrs))
+	for _, tc := range cases {
+		if got := isUsableLocalIP(net.ParseIP(tc.ip), tc.wantV4); got != tc.ok {
+			t.Errorf("isUsableLocalIP(%s, v4=%v) = %v, want %v", tc.ip, tc.wantV4, got, tc.ok)
+		}
 	}
-	if got := addrs[0].To4(); got == nil {
-		t.Fatalf("expected v4 addr[0], got %v", addrs[0])
+	if isUsableLocalIP(nil, true) {
+		t.Error("nil IP must not be usable")
 	}
-	if got := addrs[1].To4(); got == nil {
-		t.Fatalf("expected v4 addr[1], got %v", addrs[1])
-	}
-}
-
-func TestCollectLocalAddrs_RejectsIPv6WhenWantV4(t *testing.T) {
-	ifaces := []string{"eth0"}
-	ips := []string{"fd00::2"}
-	_, err := collectLocalAddrs(ifaces, ips, true)
-	if err == nil {
-		t.Fatalf("expected error")
-	}
-}
-
-func TestCollectLocalAddrs_DedupesProvidedIPs(t *testing.T) {
-	ifaces := []string{"eth0", "wlan0"}
-	ips := []string{"192.168.1.10", "192.168.1.10"}
-	addrs, err := collectLocalAddrs(ifaces, ips, true)
-	if err != nil {
-		t.Fatalf("collectLocalAddrs: %v", err)
-	}
-	if len(addrs) != 1 {
-		t.Fatalf("expected 1 deduped addr, got %d", len(addrs))
-	}
-}
-
-// testAddIPv6CIDR is a local helper for the test, replicating addIPv6CIDR logic
-func testAddIPv6CIDR(s string) string {
-	if s == "" {
-		return ""
-	}
-	if strings.Contains(s, "/") {
-		return s
-	}
-	return s + "/64"
 }

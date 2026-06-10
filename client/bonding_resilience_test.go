@@ -48,24 +48,11 @@ func TestSanitizeIfacesDropDownWhenNotAllowed(t *testing.T) {
 	}
 }
 
-func TestUpdateConnAliveTransitions(t *testing.T) {
-	cc := &clientConn{}
-	if !updateConnAlive(cc, true) {
-		t.Fatalf("expected first alive transition to return true")
-	}
-	if !cc.alive.Load() {
-		t.Fatalf("expected alive to be true after transition")
-	}
-	if updateConnAlive(cc, true) {
-		t.Fatalf("expected no transition when already alive")
-	}
-	if !updateConnAlive(cc, false) {
-		t.Fatalf("expected transition to false")
-	}
-	if cc.alive.Load() {
-		t.Fatalf("expected alive to be false after transition")
-	}
-	if updateConnAlive(cc, false) {
-		t.Fatalf("expected no transition when already down")
+func TestCloseConnIsIdempotent(t *testing.T) {
+	pc := testPath("eth0", 1)
+	pc.closeConn("test")
+	pc.closeConn("test") // no conn set: must not panic
+	if pc.currentConn() != nil {
+		t.Fatal("expected nil conn after close")
 	}
 }

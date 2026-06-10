@@ -1,5 +1,4 @@
 //go:build linux
-// +build linux
 
 package main
 
@@ -11,14 +10,13 @@ import (
 	"io"
 	"log"
 	"net"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/songgao/water"
 
-	quic "github.com/AeonDave/mp-quic-go"
+	quic "github.com/quic-go/quic-go"
 
 	"fluxify/common"
 )
@@ -27,6 +25,10 @@ const (
 	serverIPv4CIDR   = "10.8.0.1/24"
 	serverIPv6CIDR   = "fd00:8:0::1/64"
 	clientIPv6Prefix = "fd00:8:0::"
+
+	// serverStatsInterval is how often per-path rate/RTT estimates are
+	// refreshed for the downlink striping scheduler.
+	serverStatsInterval = 100 * time.Millisecond
 )
 
 type Server struct {
@@ -37,8 +39,8 @@ type Server struct {
 	verbose   bool
 
 	sessions       map[uint32]*serverSession
-	ipToSession    map[string]*serverSession // Map "10.8.0.x" or "fd00::x" -> Session
-	clientSessions map[string]*serverSession // Map "clientName" -> Session
+	ipToSession    map[string]*serverSession // "10.8.0.x" or "fd00::x" -> session
+	clientSessions map[string]*serverSession // client name -> session
 	sessMu         sync.RWMutex
 
 	nextIPOctet atomic.Uint32
@@ -47,8 +49,9 @@ type Server struct {
 	listener *quic.Listener
 
 	tunWriteCh chan []byte
-	outboundCh chan *outboundJob // packets from TUN to be sent to clients
 
+	ctx     context.Context
+	cancel  context.CancelFunc
 	wg      sync.WaitGroup
 	running atomic.Bool
 
@@ -56,6 +59,31 @@ type Server struct {
 	reorderFlush time.Duration
 
 	mssClamp mssClampConfig
+}
+
+func NewServer(port, ctrlPort int, iface string, pki common.PKIPaths, verbose bool, rsize int, rflush time.Duration) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Server{
+		port:           port,
+		ctrlPort:       ctrlPort,
+		ifaceName:      iface,
+		pki:            pki,
+		verbose:        verbose,
+		sessions:       make(map[uint32]*serverSession),
+		ipToSession:    make(map[string]*serverSession),
+		clientSessions: make(map[string]*serverSession),
+		tunWriteCh:     make(chan []byte, 4096),
+		ctx:            ctx,
+		cancel:         cancel,
+		reorderSize:    rsize,
+		reorderFlush:   rflush,
+	}
+}
+
+func (s *Server) logDebug(format string, v ...interface{}) {
+	if s.verbose {
+		log.Printf("[DEBUG] "+format, v...)
+	}
 }
 
 func (s *Server) metricsLoop(every time.Duration) {
@@ -84,34 +112,6 @@ func (s *Server) logMetricsOnce() {
 	}
 }
 
-type outboundJob struct {
-	sess *serverSession
-	data []byte
-}
-
-func NewServer(port, ctrlPort int, iface string, pki common.PKIPaths, verbose bool, rsize int, rflush time.Duration) *Server {
-	return &Server{
-		port:           port,
-		ctrlPort:       ctrlPort,
-		ifaceName:      iface,
-		pki:            pki,
-		verbose:        verbose,
-		sessions:       make(map[uint32]*serverSession),
-		ipToSession:    make(map[string]*serverSession),
-		clientSessions: make(map[string]*serverSession),
-		tunWriteCh:     make(chan []byte, 4096),
-		outboundCh:     make(chan *outboundJob, 4096),
-		reorderSize:    rsize,
-		reorderFlush:   rflush,
-	}
-}
-
-func (s *Server) logDebug(format string, v ...interface{}) {
-	if s.verbose {
-		log.Printf("[DEBUG] "+format, v...)
-	}
-}
-
 func (s *Server) Start() error {
 	s.running.Store(true)
 	s.logDebug("Starting server (port=%d, ctrl=%d)", s.port, s.ctrlPort)
@@ -129,67 +129,48 @@ func (s *Server) Start() error {
 	}
 	s.tun = tun
 	log.Printf("TUN initialized: %s", tun.Name())
-	s.logDebug("TUN: device %s created successfully", tun.Name())
 
 	s.logDebug("TUN: configuring IP addresses (v4=%s, v6=%s, MTU=%d)", serverIPv4CIDR, serverIPv6CIDR, common.MTU)
 	if err := common.ConfigureTUN(common.TUNConfig{IfaceName: tun.Name(), CIDR: serverIPv4CIDR, IPv6CIDR: serverIPv6CIDR, MTU: common.MTU}); err != nil {
 		return fmt.Errorf("configure tun: %v", err)
 	}
-	// Best-effort: networking rules. These operations require root.
+	// Best-effort networking rules; these require root.
 	s.logDebug("iptables: configuring forwarding and NAT rules...")
 	if err := enableForwarding(execRunner{}); err != nil {
 		log.Printf("enable forwarding: %v", err)
-	} else {
-		s.logDebug("iptables: IP forwarding enabled")
 	}
 	if err := ensureNatRule(execRunner{}); err != nil {
 		log.Printf("ensure nat v4: %v", err)
-	} else {
-		s.logDebug("iptables: IPv4 NAT rule configured")
 	}
 	if err := ensureNatRule6(execRunner{}); err != nil {
 		log.Printf("ensure nat v6: %v", err)
-	} else {
-		s.logDebug("iptables: IPv6 NAT rule configured")
 	}
 	if err := ensureForwardRules(execRunner{}, tun.Name()); err != nil {
 		log.Printf("ensure forward v4: %v", err)
-	} else {
-		s.logDebug("iptables: IPv4 forward rules configured for %s", tun.Name())
 	}
 	if err := ensureForwardRules6(execRunner{}, tun.Name()); err != nil {
 		log.Printf("ensure forward v6: %v", err)
-	} else {
-		s.logDebug("iptables: IPv6 forward rules configured for %s", tun.Name())
 	}
 	if err := ensureMSSClampRules(execRunner{}, tun.Name(), s.mssClamp); err != nil {
 		log.Printf("mss clamp: %v", err)
-	} else {
-		s.logDebug("iptables: MSS clamp rules configured")
 	}
 
-	// Setup QUIC (multipath-capable)
+	// QUIC data plane.
 	s.logDebug("QUIC: loading TLS config from PKI (dir=%s)", s.pki.Dir)
 	tlsCfg, err := common.ServerTLSConfig(s.pki)
 	if err != nil {
 		return fmt.Errorf("quic tls config: %v", err)
 	}
-	s.logDebug("QUIC: TLS config loaded (NextProtos=[fluxify-quic])")
 	tlsCfg = tlsCfg.Clone()
 	tlsCfg.NextProtos = []string{"fluxify-quic"}
 
-	s.logDebug("QUIC: creating multipath config (MaxPaths=5, AutoPaths=true, Scheduler=LowLatency)")
+	// InitialPacketSize stays at the safe default (1280); RFC 8899 path MTU
+	// discovery raises the packet (and thus max datagram) size within the
+	// first seconds of each connection.
 	qc := &quic.Config{
-		EnableDatagrams:   true,
-		InitialPacketSize: 1500, // Match Ethernet MTU; allows datagrams up to ~1400 bytes
-		MaxIdleTimeout:    60 * time.Second,
-		KeepAlivePeriod:   15 * time.Second,
-		MaxPaths:          5,
-		MultipathController: quic.NewDefaultMultipathController(
-			quic.NewLowLatencyScheduler(),
-		),
-		MultipathAutoPaths:     true,
-		MultipathAutoAdvertise: true,
+		EnableDatagrams: true,
+		MaxIdleTimeout:  60 * time.Second,
+		KeepAlivePeriod: 15 * time.Second,
 	}
 
 	s.logDebug("QUIC: binding to port %d...", s.port)
@@ -199,31 +180,15 @@ func (s *Server) Start() error {
 	}
 	s.listener = ln
 	log.Printf("QUIC listening on :%d", s.port)
-	s.logDebug("QUIC: listener initialized successfully")
 
-	s.logDebug("Starting control server goroutine...")
 	go s.controlServer()
 
-	s.logDebug("Starting TUN write loop...")
-	s.wg.Add(1)
+	s.wg.Add(4)
 	go s.tunWriteLoop()
-
-	s.logDebug("Starting TUN read loop...")
-	s.wg.Add(1)
 	go s.tunReadLoop()
-
-	numReaders := runtime.NumCPU()
-	s.logDebug("Starting QUIC accept loop...")
-	s.wg.Add(1)
 	go s.acceptLoop()
+	go s.statsLoop()
 
-	s.logDebug("Starting %d outbound workers...", numReaders)
-	for i := 0; i < numReaders; i++ {
-		s.wg.Add(1)
-		go s.outboundWorker()
-	}
-
-	s.logDebug("Starting session cleanup loop...")
 	s.wg.Add(1)
 	go s.cleanupLoop()
 
@@ -231,82 +196,85 @@ func (s *Server) Start() error {
 	return nil
 }
 
+// ============================================================================
+// QUIC data plane: one read loop per client connection (= per path)
+// ============================================================================
+
 func (s *Server) acceptLoop() {
 	defer s.wg.Done()
-	s.logDebug("acceptLoop: started")
 	for s.running.Load() {
-		conn, err := s.listener.Accept(context.Background())
+		conn, err := s.listener.Accept(s.ctx)
 		if err != nil {
-			if s.running.Load() {
+			if s.running.Load() && s.ctx.Err() == nil {
 				log.Printf("quic accept error: %v", err)
 			}
 			return
 		}
 		s.logDebug("acceptLoop: new QUIC connection from %s", conn.RemoteAddr())
 		s.wg.Add(1)
-		go s.quicReadLoop(conn)
+		go s.connLoop(conn)
 	}
-	s.logDebug("acceptLoop: stopped")
 }
 
-func (s *Server) quicReadLoop(conn *quic.Conn) {
+// connLoop pumps inbound datagrams from one client connection. The first
+// datagram (normally the client's handshake announcement) binds the
+// connection to its session, making the path available for downlink striping.
+func (s *Server) connLoop(conn *quic.Conn) {
 	defer s.wg.Done()
-	for s.running.Load() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		dat, err := conn.ReceiveDatagram(ctx)
-		cancel()
+	var sess *serverSession
+	defer func() {
+		if sess != nil {
+			sess.removeConn(conn)
+		}
+		_ = conn.CloseWithError(0, "closed")
+		s.logDebug("connLoop: connection from %s closed", conn.RemoteAddr())
+	}()
+	for {
+		dat, err := conn.ReceiveDatagram(s.ctx)
 		if err != nil {
-			continue
+			return
 		}
 		h, payload, err := common.ParseDataPlaneDatagram(dat)
 		if err != nil {
-			s.logDebug("quicReadLoop: failed to parse datagram: %v", err)
+			s.logDebug("connLoop: failed to parse datagram: %v", err)
 			continue
 		}
-		sess := s.getSession(h.SessionID)
-		if sess == nil {
-			s.logDebug("quicReadLoop: unknown session ID: %d", h.SessionID)
-			continue
+		if sess == nil || sess.id != h.SessionID {
+			if sess != nil {
+				sess.removeConn(conn)
+			}
+			sess = s.getSession(h.SessionID)
+			if sess == nil {
+				s.logDebug("connLoop: unknown session ID: %d", h.SessionID)
+				continue
+			}
+			sc := sess.connFor(conn)
+			s.logDebug("connLoop: %s joined session %d (paths=%d)", sc.addr, sess.id, len(sess.conns))
 		}
-		s.logDebug("quicReadLoop: received datagram type=%d(%s) (session=%d, seq=%d, len=%d)", h.Type, common.DataPlaneTypeName(h.Type), h.SessionID, h.SeqNum, len(payload))
-		s.handleDatagram(conn, sess, h, payload)
+		s.handleDatagram(sess, sess.connFor(conn), h, payload)
 	}
 }
 
-func (s *Server) handleDatagram(conn *quic.Conn, sess *serverSession, h common.DataPlaneHeader, payload []byte) {
+func (s *Server) handleDatagram(sess *serverSession, sc *serverConn, h common.DataPlaneHeader, payload []byte) {
 	sess.touch()
-
-	sc := sess.updateOrAddConn(conn)
+	sc.touch()
 	sc.bytesRecv.Add(uint64(len(payload)))
 
 	switch h.Type {
 	case common.DPTypeHandshake:
-		// keep-alive
+		// Path announcement: ack it so the client sees the path as live.
+		s.enqueueControl(sess, sc, common.DPTypeHandshake, nil)
 	case common.DPTypeHeartbeat:
-		var hb common.HeartbeatPayload
-		if err := hb.Unmarshal(payload); err == nil {
-			rtt := common.CalcRTT(hb.SendTime)
-			updateServerConnRTT(sc, rtt)
-			s.logDebug("handleDatagram: heartbeat from session %d, RTT=%v", sess.id, rtt)
-		}
-		// echo back
-		head := common.DataPlaneHeader{Version: common.DataPlaneVersion, Type: common.DPTypeHeartbeat, SessionID: sess.id, SeqNum: 0, Flags: 0}
-		dg, _ := common.BuildDataPlaneDatagram(nil, head, payload)
-		if err := conn.SendDatagram(dg); err != nil {
-			s.logDebug("handleDatagram: heartbeat echo FAILED: %v", err)
-		} else {
-			s.logDebug("handleDatagram: heartbeat echoed len=%d", len(dg))
-		}
+		sc.hbRecv.Add(1)
+		// Echo so the client can measure round-trip time on this path.
+		s.enqueueControl(sess, sc, common.DPTypeHeartbeat, payload)
 	case common.DPTypeIP:
-		data := payload
-		// Compression disabled - ignore flag, just use raw payload
-		if !common.IsIPPacket(data) {
+		if !common.IsIPPacket(payload) {
 			return
 		}
-		storageBuf := common.GetBuffer()
-		copy(storageBuf, data)
-		ordered := sess.reorderBuf.Insert(h.SeqNum, storageBuf[:len(data)])
-		for _, pkt := range ordered {
+		buf := common.GetBuffer()
+		n := copy(buf, payload)
+		for _, pkt := range sess.reorderBuf.Insert(h.SeqNum, buf[:n]) {
 			select {
 			case s.tunWriteCh <- pkt:
 			default:
@@ -316,10 +284,26 @@ func (s *Server) handleDatagram(conn *quic.Conn, sess *serverSession, h common.D
 	}
 }
 
+// enqueueControl sends a control datagram (heartbeat echo / handshake ack)
+// back on the specific path it arrived on.
+func (s *Server) enqueueControl(sess *serverSession, sc *serverConn, ptype uint8, payload []byte) {
+	buf := common.GetBuffer()
+	head := common.DataPlaneHeader{Version: common.DataPlaneVersion, Type: ptype, SessionID: sess.id}
+	dg, err := common.BuildDataPlaneDatagram(buf, head, payload)
+	if err != nil {
+		common.PutBuffer(buf)
+		return
+	}
+	sc.enqueue(dg)
+}
+
+// ============================================================================
+// TUN I/O
+// ============================================================================
+
 func (s *Server) tunWriteLoop() {
 	defer s.wg.Done()
 	for data := range s.tunWriteCh {
-		s.logDebug("TUN write: %d bytes", len(data))
 		if _, err := s.tun.Write(data); err != nil {
 			log.Printf("tun write error: %v", err)
 		}
@@ -327,13 +311,16 @@ func (s *Server) tunWriteLoop() {
 	}
 }
 
+// tunReadLoop reads downlink packets and stripes each one across the owning
+// session's paths. It reads at an offset so the session can stamp the
+// dataplane header in place (no extra copy).
 func (s *Server) tunReadLoop() {
 	defer s.wg.Done()
-	defer close(s.outboundCh)
+	defer close(s.tunWriteCh)
 
 	for s.running.Load() {
 		buf := common.GetBuffer()
-		n, err := s.tun.Read(buf)
+		n, err := s.tun.Read(buf[common.DataPlaneHdrSize:])
 		if err != nil {
 			if s.running.Load() {
 				log.Printf("tun read error: %v", err)
@@ -342,39 +329,48 @@ func (s *Server) tunReadLoop() {
 			continue
 		}
 
-		pkt := buf[:n]
+		pkt := buf[common.DataPlaneHdrSize : common.DataPlaneHdrSize+n]
 		dstIP := extractDstIP(pkt)
-		s.logDebug("TUN read: %d bytes dest=%s", n, dstIP)
 		if len(dstIP) == 0 {
 			common.PutBuffer(buf)
 			continue
 		}
 
 		sess := s.lookupSessionByIP(dstIP)
-		if sess != nil {
-			select {
-			case s.outboundCh <- &outboundJob{sess: sess, data: buf[:n]}:
-			default:
-				common.PutBuffer(buf)
-			}
-		} else {
+		if sess == nil {
 			common.PutBuffer(buf)
+			continue
+		}
+		sess.dispatch(buf[:common.DataPlaneHdrSize+n])
+	}
+}
+
+// statsLoop refreshes per-path rate/RTT estimates for every session.
+func (s *Server) statsLoop() {
+	defer s.wg.Done()
+	t := time.NewTicker(serverStatsInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case now := <-t.C:
+			s.sessMu.RLock()
+			sessions := make([]*serverSession, 0, len(s.sessions))
+			for _, sess := range s.sessions {
+				sessions = append(sessions, sess)
+			}
+			s.sessMu.RUnlock()
+			for _, sess := range sessions {
+				sess.updateStats(now)
+			}
 		}
 	}
 }
 
-func (s *Server) outboundWorker() {
-	defer s.wg.Done()
-	for job := range s.outboundCh {
-		chosen := job.sess.pickBestConn()
-		if chosen != nil {
-			s.logDebug("QUIC send: %d bytes", len(job.data))
-			job.sess.touch()
-			_ = job.sess.sendDatagram(chosen, common.DPTypeIP, job.data)
-		}
-		common.PutBuffer(job.data)
-	}
-}
+// ============================================================================
+// Session registry
+// ============================================================================
 
 func (s *Server) getSession(id uint32) *serverSession {
 	s.sessMu.RLock()
@@ -426,6 +422,10 @@ func extractDstIP(pkt []byte) net.IP {
 	return nil
 }
 
+// ============================================================================
+// Control plane
+// ============================================================================
+
 func (s *Server) controlServer() {
 	s.logDebug("controlServer: loading TLS config...")
 	tlsCfg, err := common.ServerTLSConfig(s.pki)
@@ -440,7 +440,6 @@ func (s *Server) controlServer() {
 		return
 	}
 	log.Printf("control TLS listening on :%d", s.ctrlPort)
-	s.logDebug("controlServer: ready to accept connections")
 
 	for s.running.Load() {
 		conn, err := ln.Accept()
@@ -453,7 +452,6 @@ func (s *Server) controlServer() {
 		s.logDebug("controlServer: accepted connection from %s", conn.RemoteAddr())
 		go s.handleControl(conn)
 	}
-	s.logDebug("controlServer: stopped")
 }
 
 func (s *Server) handleControl(conn net.Conn) {
@@ -478,8 +476,8 @@ func (s *Server) handleControl(conn net.Conn) {
 		return
 	}
 	if len(bytes.TrimSpace(reqData)) == 0 {
-		// A client may connect and complete the TLS handshake as a connectivity probe
-		// (e.g. diagnostics), then close without sending a control request.
+		// A client may connect and complete the TLS handshake as a
+		// connectivity probe, then close without sending a request.
 		return
 	}
 	var req common.ControlRequest
@@ -495,6 +493,7 @@ func (s *Server) handleControl(conn net.Conn) {
 	sessID := uint32(time.Now().UnixNano())
 	var clientIP, clientIPv6 net.IP
 
+	var replaced *serverSession
 	s.sessMu.Lock()
 	if old, ok := s.clientSessions[req.ClientName]; ok {
 		clientIP = old.clientIP
@@ -508,12 +507,16 @@ func (s *Server) handleControl(conn net.Conn) {
 		if old.clientIPv6 != nil {
 			delete(s.ipToSession, old.clientIPv6.String())
 		}
+		replaced = old
 		log.Printf("Replaced session for %s (old_id=%d) reusing IP=%s", req.ClientName, old.id, clientIP)
 	} else {
 		clientIP, clientIPv6 = s.assignClientIPs()
 		s.logDebug("handleControl: assigned new IPs for client (v4=%s, v6=%s)", clientIP, clientIPv6)
 	}
 	s.sessMu.Unlock()
+	if replaced != nil {
+		replaced.Close()
+	}
 
 	sess := newServerSession(sessID, req.ClientName, clientIP, clientIPv6, s.reorderSize, s.reorderFlush)
 	s.registerSession(sess)
@@ -542,49 +545,49 @@ func (s *Server) assignClientIPs() (net.IP, net.IP) {
 	return v4, v6
 }
 
+// ============================================================================
+// Housekeeping
+// ============================================================================
+
 func (s *Server) cleanupLoop() {
 	defer s.wg.Done()
-	s.logDebug("cleanupLoop: started (interval=10s)")
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for s.running.Load() {
 		select {
+		case <-s.ctx.Done():
+			return
 		case <-ticker.C:
 			s.pruneSessions()
 		}
 	}
-	s.logDebug("cleanupLoop: stopped")
 }
 
 func (s *Server) pruneSessions() {
 	s.sessMu.Lock()
-	defer s.sessMu.Unlock()
-
-	var pruned, active int
+	var closing []*serverSession
 	for id, sess := range s.sessions {
-		if sess.isIdle() {
-			pruned++
-			log.Printf("Session idle/expired: %s (id=%d) IP=%s", sess.name, id, sess.clientIP)
-			s.logDebug("pruneSessions: removing idle session %d (client=%s)", id, sess.name)
-			sess.Close()
-			delete(s.sessions, id)
-			if sess.name != "" {
-				delete(s.clientSessions, sess.name)
-			}
-			if sess.clientIP != nil {
-				delete(s.ipToSession, sess.clientIP.String())
-			}
-			if sess.clientIPv6 != nil {
-				delete(s.ipToSession, sess.clientIPv6.String())
-			}
-		} else {
-			active++
+		if !sess.isIdle() {
 			sess.pruneStaleConns()
+			continue
+		}
+		log.Printf("Session idle/expired: %s (id=%d) IP=%s", sess.name, id, sess.clientIP)
+		closing = append(closing, sess)
+		delete(s.sessions, id)
+		if sess.name != "" {
+			delete(s.clientSessions, sess.name)
+		}
+		if sess.clientIP != nil {
+			delete(s.ipToSession, sess.clientIP.String())
+		}
+		if sess.clientIPv6 != nil {
+			delete(s.ipToSession, sess.clientIPv6.String())
 		}
 	}
-	if pruned > 0 || active > 0 {
-		s.logDebug("pruneSessions: checked %d sessions (active=%d, pruned=%d)", len(s.sessions)+pruned, active, pruned)
+	s.sessMu.Unlock()
+	for _, sess := range closing {
+		sess.Close()
 	}
 }
 
@@ -594,13 +597,11 @@ func (s *Server) reorderFlushHandler(sess *serverSession) {
 		case <-sess.stopReorder:
 			return
 		case <-sess.reorderBuf.FlushCh():
-			pkts := sess.reorderBuf.FlushTimeout()
-			for _, pkt := range pkts {
+			for _, pkt := range sess.reorderBuf.FlushTimeout() {
 				select {
 				case s.tunWriteCh <- pkt:
 				default:
 					common.PutBuffer(pkt)
-					sess.reorderStats.packetsDropped.Add(1)
 				}
 			}
 		}
